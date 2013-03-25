@@ -59,7 +59,6 @@ for sym in symbols:
     shares[sym] = 0
 
 for times in timestamps:
-    #date = datetime.datetime(int(year), int(month), int(day), 16, 0)
     stock_portfolio = 0
     for sym in shares:
         stock_portfolio += shares[sym] * close.xs(times)[sym]
