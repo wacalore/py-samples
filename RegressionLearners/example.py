@@ -46,7 +46,6 @@ def testgendata(fname):
         for point in Xtestset: 
             y = learner.query(point)
             results.append(y)
-#            print y
         etime = time.time()
         print ("Average Time per Instance: %s" %((etime-stime)/float(set_length)))
 
@@ -80,9 +79,9 @@ def testgendata(fname):
     title = "%s.pdf" %(fname)
  
     savefig(title, format='pdf')
-#    for result, true_value in zip(results, Ytestset):
-#        rmse_sum += distances.append(numpy.sqrt(numpy.sum((entry-point)**2))) 
     
 home = expanduser('~')
+
+# The below data sets are borrowed from the QSTK library: http://quantsoftware.wiki.org
 testgendata("%s/QSTK/Examples/KNN/data-classification-prob.csv" %(home))
 testgendata("%s/QSTK/Examples/KNN/data-ripple-prob.csv" %(home))
