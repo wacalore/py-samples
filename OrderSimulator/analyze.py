@@ -16,12 +16,10 @@ endday = dt.datetime(2011,12,31)
 timeofday=dt.timedelta(hours=16)
 timestamps = du.getNYSEdays(startday,endday,timeofday)
 
-#def main(argv):
 
 benchmark = []
 if len(sys.argv) == 3:
     values_file = str(sys.argv[1]).strip()
-  #  benchmark = benchmark.append(str(sys.argv[2]).strip())
     benchmark.append(str(sys.argv[2]))
 else:
     print "Insufficient arguments"
@@ -43,21 +41,24 @@ endday = dt.datetime(int(times[len(times)-1][0]), int(times[len(times)-1][1]), i
 timeofday = dt.timedelta(hours=16)
 timestamps = du.getNYSEdays(startday,endday,timeofday)
 
-#endday = dt.datetime(int
 dataobj = da.DataAccess('Yahoo')
 close = dataobj.get_data(timestamps, benchmark, "close")
 close = pd.DataFrame.fillna(close, method='ffill')
 close = pd.DataFrame.fillna(close, method='backfill')
+
 factor = values[0] / close.values[0]
 pricedata = np.array([factor * y for y in close.values])
 valuesdata = np.array(values)
 
 bench_returns = (pricedata[1:,:]/pricedata[0:-1,:]) - 1 
 port_returns = (valuesdata[1:]/valuesdata[0:-1]) - 1
+
 bench_treturn = pricedata[len(pricedata)-1]/pricedata[0]
 port_treturn = valuesdata[len(valuesdata)-1]/valuesdata[0]
+
 sd_bench_returns = np.std(bench_returns)
 sd_port_returns = np.std(port_returns)
+
 bench_sharpe = sqrt(len(timestamps))* np.mean(bench_returns)/sd_bench_returns  
 port_sharpe = sqrt(len(timestamps)) * np.mean(port_returns)/sd_port_returns
 
@@ -67,7 +68,7 @@ print("\nPortfolio Total Return: %s\nPortfolio Return SD: %s\nPortfolio Sharpe R
 values_frame = pd.DataFrame(np.array(values), index=close.index)
 mod_close = pd.DataFrame(np.array(pricedata), index=close.index)
 
-plt.figure(1)                # the first figure
+plt.figure(1)       
 xlim(startday, endday)
 plt.plot(close.index, mod_close, label=benchmark[0])
 plt.plot(close.index, values_frame, color='red', label="Portfolio")
