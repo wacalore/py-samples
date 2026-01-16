@@ -120,6 +120,37 @@ sharpesVec:{[W;mu;C;rf]
     vols:sqrt[annFactor] * sqrt vars;      // nIter annualized vols
     (rets - rf) % vols}
 
+// Vectorized CER: E[r] - 0.5*lambda*Var[r] for all portfolios
+cersVec:{[W;mu;C;lambda]
+    rets:annFactor * sum each W *\: mu;
+    vars:annFactor * portVarsVec[W;C];
+    rets - 0.5 * lambda * vars}
+
+// Vectorized portfolio returns matrix: nIter x T
+// W: nIter x n, R: n x T -> returns nIter x T matrix
+portRetsMatrix:{[W;R] .kdbtools.mm[W;R]}
+
+// Vectorized entropic risk for all portfolios
+// Returns nIter vector of entropic risks
+entropicRisksVec:{[W;R;theta]
+    PR:portRetsMatrix[W;R];               // nIter x T
+    (1 % theta) * log each avg each exp neg theta * PR}
+
+// Vectorized LPM (Lower Partial Moment) for all portfolios
+// Returns nIter vector of LPMs
+lpmsVec:{[W;R;order;mar]
+    PR:portRetsMatrix[W;R];               // nIter x T
+    shortfalls:mar - PR;                   // nIter x T
+    avg each (0f | shortfalls) xexp order}
+
+// Vectorized Kappa ratios for all portfolios
+kappasVec:{[W;R;order;mar]
+    PR:portRetsMatrix[W;R];
+    excessRets:(avg each PR) - mar;
+    lpms:lpmsVec[W;R;order;mar];
+    // Handle division by zero
+    excessRets % lpms xexp 1 % order}
+
 // -----------------------------------------------------------------------------
 // MAX SHARPE - VECTORIZED RANDOM SEARCH
 // -----------------------------------------------------------------------------
@@ -193,8 +224,8 @@ maxSharpeConstrained:{[R;rf;lo;hi;nIter]
     C:.kdbtools.covmat flip R;
     mu:avg each R;
 
-    loVec:$[0h = type lo; n#lo; lo];
-    hiVec:$[0h = type hi; n#hi; hi];
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
 
     W:randWeightMatrixConstrained[nIter;n;loVec;hiVec];
     sharpes:sharpesVec[W;mu;C;rf];
@@ -216,13 +247,149 @@ maxSharpeConstrained:{[R;rf;lo;hi;nIter]
 // ANALYTICAL gradient of Sharpe ratio (much faster than numerical)
 // Sharpe = (w'μ - rf) / sqrt(w'Cw)
 // ∂Sharpe/∂w = (μ*σ - (r-rf)*Cw/σ) / σ² = (μ - sharpe*Cw/σ) / σ
+// rf is annual, convert to daily for gradient computation
 sharpeGradAnalytical:{[mu;C;rf;w]
     Cw:.kdbtools.mm[C;w];
     variance:sum w * Cw;
     sigma:sqrt variance;
     ret:sum w * mu;
-    sharpe:(ret - rf) % sigma;
+    rfDaily:rf % annFactor;
+    sharpe:(ret - rfDaily) % sigma;
     (mu - sharpe * Cw % sigma) % sigma}
+
+// Compute Sharpe for weight vector (daily scale, for optimization)
+// rf is annual, convert to daily for comparison with daily returns
+sharpeRaw:{[mu;C;rf;w] (sum[w*mu] - rf % annFactor) % sqrt sum w * .kdbtools.mm[C;w]}
+
+// Project weights onto constraint set: sum=1, lo<=w<=hi
+// Uses iterative clipping (Dykstra-like projection)
+projectConstrained:{[lo;hi;w]
+    // First project to simplex (sum=1, w>=0)
+    w:projectSimplex w;
+    // Then iteratively enforce bounds while maintaining sum=1
+    iter:{[lo;hi;w]
+        w:lo | w & hi;           // Clip to bounds
+        slack:1 - sum w;         // How much we need to redistribute
+        if[abs[slack] < 1e-10; :w];
+        // Find assets that can absorb slack
+        canInc:w < hi;           // Can increase
+        canDec:w > lo;           // Can decrease
+        $[slack > 0;
+            // Need to add weight - distribute to assets below hi
+            [room:hi - w; room:room * canInc; w + slack * room % sum room];
+            // Need to remove weight - take from assets above lo
+            [room:w - lo; room:room * canDec; w + slack * room % sum room]]};
+    10 iter[lo;hi]/w}
+
+// SLSQP-style optimizer with backtracking line search
+// Matches scipy.optimize.minimize behavior
+maxSharpeSLSQP:{[R;rf;lo;hi;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    mu:avg each R;
+
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
+
+    // Pack parameters into dict to avoid 8-param limit
+    p:`mu`C`rf`lo`hi!(mu;C;rf;loVec;hiVec);
+
+    // Initialize with multiple starting points, keep best
+    starts:(n#1f%n;                              // Equal weight
+            loVec + (hiVec-loVec) * n?1f;        // Random in bounds
+            loVec + 0.5 * hiVec - loVec);        // Midpoint
+    starts:projectConstrained[loVec;hiVec] each starts;
+    startObjs:{[p;w] neg sharpeRaw[p`mu;p`C;p`rf;w]}[p] each starts;
+    w:starts startObjs?min startObjs;
+
+    // Optimization state
+    state:`w`obj`iter`converged!(w;min startObjs;0;0b);
+
+    // Single optimization step with backtracking line search
+    step:{[p;s]
+        if[s`converged; :s];
+
+        wCur:s`w;
+        objCur:s`obj;
+        mu:p`mu; C:p`C; rf:p`rf; lo:p`lo; hi:p`hi;
+
+        // Gradient (negative because we minimize negative Sharpe)
+        grad:neg sharpeGradAnalytical[mu;C;rf;wCur];
+
+        // Check convergence (gradient small)
+        gradNorm:sqrt sum grad*grad;
+        if[gradNorm < 1e-8; :`w`obj`iter`converged!(wCur;objCur;s`iter;1b)];
+
+        // Search direction (steepest descent)
+        dir:neg grad;
+
+        // Backtracking line search
+        alpha:1f;
+        wNew:projectConstrained[lo;hi;wCur + alpha * dir];
+        objNew:neg sharpeRaw[mu;C;rf;wNew];
+
+        // Armijo condition threshold
+        armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
+
+        cnt:0;
+        while[(objNew > armijoThresh) and (alpha > 1e-10) and (cnt < 20);
+            alpha:0.5 * alpha;
+            wNew:projectConstrained[lo;hi;wCur + alpha * dir];
+            objNew:neg sharpeRaw[mu;C;rf;wNew];
+            armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
+            cnt+:1];
+
+        // Update if improved, else mark converged
+        $[objNew < objCur;
+            `w`obj`iter`converged!(wNew;objNew;s[`iter]+1;0b);
+            `w`obj`iter`converged!(wCur;objCur;s`iter;1b)]};
+
+    // Run optimizer
+    state:nIter step[p]/state;
+    w:state`w;
+
+    `weights`sharpe`return`volatility`bounds`iterations`converged!(
+        w;
+        portSharpe[w;R;C;rf];
+        annFactor * sum w * mu;
+        sqrt[annFactor] * sqrt sum w * .kdbtools.mm[C;w];
+        `lo`hi!(loVec;hiVec);
+        state`iter;
+        state`converged)}
+
+// Unconstrained analytical solution (allows negative weights)
+// w* = C^-1 * (μ - rf) / sum(C^-1 * (μ - rf))
+maxSharpeAnalytical:{[R;rf]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    mu:avg each R;
+
+    // Solve C * w = (mu - rf/252) using LU decomposition approximation
+    // Since we don't have matrix inverse, use gradient descent on quadratic
+    excessMu:mu - rf % annFactor;
+
+    // Iteratively solve C*w = excessMu
+    w:n#1f%n;
+    solveStep:{[C;b;w]
+        Cw:.kdbtools.mm[C;w];
+        resid:b - Cw;
+        // Gradient of ||Cw - b||^2 is 2*C'*(Cw-b) = 2*C*(Cw-b) for symmetric C
+        grad:.kdbtools.mm[C;resid];
+        // Step size from exact line search on quadratic
+        Cg:.kdbtools.mm[C;grad];
+        alpha:(sum grad * resid) % sum grad * Cg;
+        w + alpha * grad};
+
+    w:500 solveStep[C;excessMu]/w;
+
+    // Normalize to sum to 1
+    w:w % sum w;
+
+    `weights`sharpe`return`volatility!(
+        w;
+        portSharpe[w;R;C;rf];
+        annFactor * sum w * mu;
+        sqrt[annFactor] * sqrt sum w * .kdbtools.mm[C;w])}
 
 // Numerical gradient (kept for comparison/fallback)
 sharpeGradNumerical:{[mu;C;rf;w;eps]
@@ -274,8 +441,8 @@ maxSharpeHillClimbConstrained:{[R;rf;lo;hi;nIter;lr]
     C:.kdbtools.covmat flip R;
     mu:avg each R;
 
-    loVec:$[0h = type lo; n#lo; lo];
-    hiVec:$[0h = type hi; n#hi; hi];
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
 
     // Start with clipped inverse volatility
     vars:{x[y;y]}[C] each til n;
@@ -348,8 +515,8 @@ maxSharpeHybridConstrained:{[R;rf;lo;hi;nRandom;nClimb;lr]
     C:.kdbtools.covmat flip R;
     mu:avg each R;
 
-    loVec:$[0h = type lo; n#lo; lo];
-    hiVec:$[0h = type hi; n#hi; hi];
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
 
     // Random search phase
     randResult:maxSharpeConstrained[R;rf;lo;hi;nRandom];
@@ -426,6 +593,284 @@ minVariance:{[R;nIter]
         portSharpe[w;R;C;0f];
         annFactor * portRet[w;R];
         sqrt[annFactor] * portVol[w;C])}
+
+// -----------------------------------------------------------------------------
+// ADVANCED RISK MEASURES
+// -----------------------------------------------------------------------------
+
+// Drawdown series from cumulative returns
+drawdowns:{[cumRets] cumRets - maxs cumRets}
+
+// Maximum drawdown
+maxDD:{[cumRets] min drawdowns cumRets}
+
+// Conditional Drawdown at Risk (average of worst alpha% drawdowns)
+CDaR:{[alpha;cumRets]
+    dd:drawdowns cumRets;
+    threshold:dd (floor alpha * count dd);  // Alpha quantile
+    avg dd where dd <= threshold}
+
+// Portfolio cumulative returns
+portCumRet:{[w;R] sums sum w * R}
+
+// Certainty Equivalent Return: E[r] - 0.5 * lambda * Var[r]
+CER:{[lambda;w;R;C]
+    ret:annFactor * sum w * avg each R;
+    pvar:annFactor * sum w * .kdbtools.mm[C;w];
+    ret - 0.5 * lambda * pvar}
+
+// Entropic risk measure: (1/theta) * log(E[exp(-theta * returns)])
+entropicRisk:{[theta;portRets]
+    (1 % theta) * log avg exp neg theta * portRets}
+
+// Lower Partial Moment of order n below MAR
+LPM:{[n;mar;rets]
+    shortfall:mar - rets;
+    avg (0f | shortfall) xexp n}
+
+// Kappa ratio: (E[r] - MAR) / LPM(n)^(1/n)
+kappa:{[n;mar;rets]
+    excessRet:(avg rets) - mar;
+    lpm:LPM[n;mar;rets];
+    excessRet % lpm xexp 1 % n}
+
+// -----------------------------------------------------------------------------
+// MIN CDAR OPTIMIZER
+// -----------------------------------------------------------------------------
+
+// Minimize Conditional Drawdown at Risk
+// alpha: confidence level (e.g., 0.05 for worst 5% of drawdowns)
+minCDaR:{[R;alpha;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+
+    // Generate random portfolios
+    W:randWeightMatrix[nIter;n];
+
+    // Compute CDaR for each portfolio
+    cdars:{[alpha;R;w] CDaR[alpha;portCumRet[w;R]]}[alpha;R] each W;
+
+    // Find minimum (least negative = best)
+    bestIdx:cdars?max cdars;
+    bestW:W bestIdx;
+
+    `weights`cdar`sharpe`return`volatility`maxDD!(
+        bestW;
+        cdars bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        maxDD portCumRet[bestW;R])}
+
+// Min CDaR with constraints
+minCDaRConstrained:{[R;alpha;lo;hi;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
+
+    W:randWeightMatrixConstrained[nIter;n;loVec;hiVec];
+    cdars:{[alpha;R;w] CDaR[alpha;portCumRet[w;R]]}[alpha;R] each W;
+
+    bestIdx:cdars?max cdars;
+    bestW:W bestIdx;
+
+    `weights`cdar`sharpe`return`volatility`maxDD`bounds!(
+        bestW;
+        cdars bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        maxDD portCumRet[bestW;R];
+        `lo`hi!(loVec;hiVec))}
+
+// -----------------------------------------------------------------------------
+// MAX CER (CERTAINTY EQUIVALENT RETURN) OPTIMIZER
+// -----------------------------------------------------------------------------
+
+// Maximize Certainty Equivalent Return (VECTORIZED)
+// lambda: risk aversion coefficient (higher = more risk averse)
+// Typical values: 1-10, where 2-4 is moderate
+maxCER:{[R;lambda;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    mu:avg each R;
+
+    W:randWeightMatrix[nIter;n];
+    cers:cersVec[W;mu;C;lambda];          // Vectorized!
+
+    bestIdx:cers?max cers;
+    bestW:W bestIdx;
+
+    `weights`cer`sharpe`return`volatility`lambda!(
+        bestW;
+        cers bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * mu;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        lambda)}
+
+// Max CER with gradient descent (analytical solution exists)
+maxCERAnalytical:{[R;lambda]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    mu:avg each R;
+
+    // Analytical: w* = (1/lambda) * C^-1 * mu (then normalize for long-only)
+    // Approximate with gradient ascent
+    w:n#1f%n;  // Equal weight start
+
+    step:{[mu;C;lambda;w]
+        // Gradient of CER: mu - lambda * C * w
+        grad:mu - lambda * .kdbtools.mm[C;w];
+        gNorm:grad % sqrt sum grad*grad;
+        wNew:w + 0.01 * gNorm;
+        wNew:0f | wNew;
+        wNew % sum wNew};
+
+    w:500 step[mu;C;lambda]/w;
+
+    `weights`cer`sharpe`return`volatility`lambda!(
+        w;
+        CER[lambda;w;R;C];
+        portSharpe[w;R;C;0f];
+        annFactor * sum w * mu;
+        sqrt[annFactor] * sqrt sum w * .kdbtools.mm[C;w];
+        lambda)}
+
+// Max CER with constraints (VECTORIZED)
+maxCERConstrained:{[R;lambda;lo;hi;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    mu:avg each R;
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
+
+    W:randWeightMatrixConstrained[nIter;n;loVec;hiVec];
+    cers:cersVec[W;mu;C;lambda];          // Vectorized!
+
+    bestIdx:cers?max cers;
+    bestW:W bestIdx;
+
+    `weights`cer`sharpe`return`volatility`lambda`bounds!(
+        bestW;
+        cers bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * mu;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        lambda;
+        `lo`hi!(loVec;hiVec))}
+
+// -----------------------------------------------------------------------------
+// MIN ENTROPIC RISK OPTIMIZER
+// -----------------------------------------------------------------------------
+
+// Minimize Entropic Risk Measure (VECTORIZED)
+// theta: risk aversion parameter (higher = more risk averse to tail losses)
+// Typical values: 1-20
+minEntropicRisk:{[R;theta;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+
+    W:randWeightMatrix[nIter;n];
+    eRisks:entropicRisksVec[W;R;theta];   // Vectorized!
+
+    // Minimize (find most negative = lowest risk)
+    bestIdx:eRisks?min eRisks;
+    bestW:W bestIdx;
+
+    `weights`entropicRisk`sharpe`return`volatility`theta!(
+        bestW;
+        eRisks bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        theta)}
+
+// Min Entropic Risk with constraints (VECTORIZED)
+minEntropicRiskConstrained:{[R;theta;lo;hi;nIter]
+    n:count R;
+    C:.kdbtools.covmat flip R;
+    loVec:$[0 > type lo; n#lo; lo];
+    hiVec:$[0 > type hi; n#hi; hi];
+
+    W:randWeightMatrixConstrained[nIter;n;loVec;hiVec];
+    eRisks:entropicRisksVec[W;R;theta];   // Vectorized!
+
+    bestIdx:eRisks?min eRisks;
+    bestW:W bestIdx;
+
+    `weights`entropicRisk`sharpe`return`volatility`theta`bounds!(
+        bestW;
+        eRisks bestIdx;
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        theta;
+        `lo`hi!(loVec;hiVec))}
+
+// -----------------------------------------------------------------------------
+// MAX KAPPA (GENERALIZED SHARPE) OPTIMIZER
+// -----------------------------------------------------------------------------
+
+// Maximize Kappa ratio (generalized Sharpe using LPM) - VECTORIZED
+// n: LPM order (1=shortfall prob, 2=semi-variance, 3=skewness-aware)
+// mar: Minimum Acceptable Return (daily, e.g., 0 or rf/252)
+maxKappa:{[R;order;mar;nIter]
+    nAssets:count R;
+    C:.kdbtools.covmat flip R;
+
+    W:randWeightMatrix[nIter;nAssets];
+    kappas:kappasVec[W;R;order;mar];      // Vectorized!
+    // Handle infinities (replace with large negative for argmax)
+    kappas:@[kappas;where kappas=0w;:;neg 0w];
+
+    // Find maximum
+    bestIdx:kappas?max kappas;
+    bestW:W bestIdx;
+
+    portRets:sum bestW * R;
+
+    `weights`kappa`lpm`sharpe`return`volatility`order`mar!(
+        bestW;
+        kappas bestIdx;
+        LPM[order;mar;portRets];
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        order;
+        mar)}
+
+// Max Kappa with constraints (VECTORIZED)
+maxKappaConstrained:{[R;order;mar;lo;hi;nIter]
+    nAssets:count R;
+    C:.kdbtools.covmat flip R;
+    loVec:$[0h = type lo; nAssets#lo; lo];
+    hiVec:$[0h = type hi; nAssets#hi; hi];
+
+    W:randWeightMatrixConstrained[nIter;nAssets;loVec;hiVec];
+    kappas:kappasVec[W;R;order;mar];      // Vectorized!
+    kappas:@[kappas;where kappas=0w;:;neg 0w];
+
+    bestIdx:kappas?max kappas;
+    bestW:W bestIdx;
+
+    portRets:sum bestW * R;
+
+    `weights`kappa`lpm`sharpe`return`volatility`order`mar`bounds!(
+        bestW;
+        kappas bestIdx;
+        LPM[order;mar;portRets];
+        portSharpe[bestW;R;C;0f];
+        annFactor * sum bestW * avg each R;
+        sqrt[annFactor] * sqrt sum bestW * .kdbtools.mm[C;bestW];
+        order;
+        mar;
+        `lo`hi!(loVec;hiVec))}
+
+// Sortino ratio is Kappa with order=2, mar=0
+maxSortino:{[R;nIter] maxKappa[R;2;0f;nIter]}
+maxSortinoConstrained:{[R;lo;hi;nIter] maxKappaConstrained[R;2;0f;lo;hi;nIter]}
 
 // -----------------------------------------------------------------------------
 // EXAMPLE AND DOCUMENTATION
@@ -523,7 +968,68 @@ example:{[]
     -1 "";
 
     // ---------------------------------------------------------------------
-    -1 "3. RESULT DICTIONARY KEYS";
+    -1 "3. ADVANCED RISK OPTIMIZERS";
+    -1 "";
+
+    // minCDaR - Minimize Conditional Drawdown at Risk
+    -1 "   minCDaR[R;alpha;nIter]";
+    -1 "   - alpha: confidence level (e.g., 0.05 = worst 5% of drawdowns)";
+    -1 "   - Minimizes expected drawdown in tail scenarios";
+    r8:minCDaR[R;0.05;10000];
+    -1 "   Result: CDaR=",string[r8`cdar],", MaxDD=",string[r8`maxDD];
+    -1 "            Sharpe=",string[r8`sharpe];
+    -1 "";
+
+    // maxCER - Maximize Certainty Equivalent Return
+    -1 "   maxCER[R;lambda;nIter]";
+    -1 "   - lambda: risk aversion (1-10, higher=more conservative)";
+    -1 "   - Balances return vs variance based on risk preference";
+    r9:maxCER[R;3;10000];
+    -1 "   Result: CER=",string[r9`cer],", Sharpe=",string[r9`sharpe];
+    -1 "";
+
+    // maxCERAnalytical - Faster gradient-based CER
+    -1 "   maxCERAnalytical[R;lambda]";
+    -1 "   - Gradient descent (faster, no nIter needed)";
+    r10:maxCERAnalytical[R;3];
+    -1 "   Result: CER=",string[r10`cer],", Sharpe=",string[r10`sharpe];
+    -1 "";
+
+    // minEntropicRisk - Minimize Entropic Risk
+    -1 "   minEntropicRisk[R;theta;nIter]";
+    -1 "   - theta: tail aversion (1-20, higher=more tail-averse)";
+    -1 "   - Penalizes large losses exponentially";
+    r11:minEntropicRisk[R;10;10000];
+    -1 "   Result: EntropicRisk=",string[r11`entropicRisk],", Sharpe=",string[r11`sharpe];
+    -1 "";
+
+    // maxKappa - Maximize Kappa (generalized Sharpe)
+    -1 "   maxKappa[R;order;mar;nIter]";
+    -1 "   - order: LPM order (2=semi-variance, 3=skewness-aware)";
+    -1 "   - mar: minimum acceptable return (e.g., 0 or rf/252)";
+    r12:maxKappa[R;2;0f;10000];
+    -1 "   Result: Kappa=",string[r12`kappa],", LPM=",string[r12`lpm];
+    -1 "            Sharpe=",string[r12`sharpe];
+    -1 "";
+
+    // maxSortino - Maximize Sortino ratio
+    -1 "   maxSortino[R;nIter]";
+    -1 "   - Sortino = Kappa with order=2, mar=0";
+    -1 "   - Only penalizes downside volatility";
+    r13:maxSortino[R;10000];
+    -1 "   Result: Sortino=",string[r13`kappa],", Sharpe=",string[r13`sharpe];
+    -1 "";
+
+    // Constrained example
+    -1 "   Constrained variants (add lo;hi before nIter):";
+    -1 "   minCDaRConstrained, maxCERConstrained, minEntropicRiskConstrained";
+    -1 "   maxKappaConstrained, maxSortinoConstrained";
+    r14:maxSortinoConstrained[R;0.05;0.4;10000];
+    -1 "   maxSortinoConstrained[R;0.05;0.4;10000]: Sortino=",string[r14`kappa];
+    -1 "";
+
+    // ---------------------------------------------------------------------
+    -1 "4. RESULT DICTIONARY KEYS";
     -1 "";
     -1 "   All functions return a dictionary with:";
     -1 "   - weights: portfolio weights (sum to 1)";
@@ -531,10 +1037,11 @@ example:{[]
     -1 "   - return: annualized expected return";
     -1 "   - volatility: annualized volatility";
     -1 "   - bounds: (constrained only) lo/hi weight limits";
+    -1 "   Advanced optimizers also return their objective (cdar, cer, etc.)";
     -1 "";
 
     // ---------------------------------------------------------------------
-    -1 "4. RECOMMENDED USAGE";
+    -1 "5. RECOMMENDED USAGE";
     -1 "";
     -1 "   For diversified portfolios:";
     -1 "     .optimizer.maxSharpeConstrained[R;rf;0.05;0.3;20000]";
@@ -542,15 +1049,21 @@ example:{[]
     -1 "   For robust optimization:";
     -1 "     .optimizer.maxSharpeHybridConstrained[R;rf;0.05;0.3;10000;500;0.02]";
     -1 "";
-    -1 "   For equal risk contribution:";
-    -1 "     .optimizer.riskParity[R;100;0.01]";
+    -1 "   For drawdown control:";
+    -1 "     .optimizer.minCDaRConstrained[R;0.05;0.05;0.3;10000]";
     -1 "";
-    -1 "   For minimum volatility:";
-    -1 "     .optimizer.minVariance[R;500]";
+    -1 "   For downside risk focus (Sortino):";
+    -1 "     .optimizer.maxSortinoConstrained[R;0.05;0.3;10000]";
+    -1 "";
+    -1 "   For tail risk aversion:";
+    -1 "     .optimizer.minEntropicRiskConstrained[R;10;0.05;0.3;10000]";
+    -1 "";
+    -1 "   For mean-variance with risk aversion:";
+    -1 "     .optimizer.maxCERAnalytical[R;3]  // fast gradient-based";
     -1 "";
 
     // ---------------------------------------------------------------------
-    -1 "5. WORKING WITH TABLES";
+    -1 "6. WORKING WITH TABLES";
     -1 "";
     -1 "   Most data comes as tables. Use these helpers to convert:";
     -1 "";
@@ -604,8 +1117,8 @@ example:{[]
     -1 "";
 
     // Return summary table
-    ([] func:`maxSharpe`maxSharpeConstrained`maxSharpeHillClimb`maxSharpeHybrid`maxMedianSharpe`riskParity`minVariance;
-       sharpe:r1[`sharpe],r2[`sharpe],r3[`sharpe],r4[`sharpe],r5[`sharpe],r6[`sharpe],r7[`sharpe])}
+    ([] func:`maxSharpe`maxSharpeConstrained`maxSharpeHillClimb`maxSharpeHybrid`maxMedianSharpe`riskParity`minVariance`minCDaR`maxCER`maxCERAnalytical`minEntropicRisk`maxKappa`maxSortino;
+       sharpe:r1[`sharpe],r2[`sharpe],r3[`sharpe],r4[`sharpe],r5[`sharpe],r6[`sharpe],r7[`sharpe],r8[`sharpe],r9[`sharpe],r10[`sharpe],r11[`sharpe],r12[`sharpe],r13[`sharpe])}
 
 // Show available functions
 help:{[]
@@ -621,28 +1134,52 @@ help:{[]
     -1 "SHARPE MAXIMIZATION:";
     -1 "  maxSharpe[R;rf;nIter]              - Random search";
     -1 "  maxSharpeConstrained[R;rf;lo;hi;n] - With weight bounds";
+    -1 "  maxSharpeSLSQP[R;rf;lo;hi;nIter]   - Gradient-based (like scipy)";
     -1 "  maxSharpeHillClimb[R;rf;nIter;lr]  - Gradient descent";
     -1 "  maxSharpeHybrid[R;rf;nR;nC;lr]     - Random + gradient";
     -1 "  maxMedianSharpe[R;rf;nIter]        - Median-based (robust)";
     -1 "";
-    -1 "CONSTRAINED VARIANTS:";
-    -1 "  maxSharpeHillClimbConstrained[R;rf;lo;hi;nIter;lr]";
-    -1 "  maxSharpeHybridConstrained[R;rf;lo;hi;nR;nC;lr]";
-    -1 "";
     -1 "RISK-BASED:";
     -1 "  riskParity[R;nIter;lr]             - Equal risk contribution";
     -1 "  minVariance[R;nIter]               - Minimum volatility";
+    -1 "";
+    -1 "ADVANCED RISK OPTIMIZERS:";
+    -1 "  minCDaR[R;alpha;nIter]             - Min Conditional Drawdown at Risk";
+    -1 "  maxCER[R;lambda;nIter]             - Max Certainty Equivalent Return";
+    -1 "  maxCERAnalytical[R;lambda]         - CER via gradient (faster)";
+    -1 "  minEntropicRisk[R;theta;nIter]     - Min Entropic Risk Measure";
+    -1 "  maxKappa[R;order;mar;nIter]        - Max Kappa (generalized Sharpe)";
+    -1 "  maxSortino[R;nIter]                - Max Sortino (Kappa order=2, mar=0)";
+    -1 "";
+    -1 "CONSTRAINED VARIANTS (add lo;hi before nIter):";
+    -1 "  minCDaRConstrained, maxCERConstrained, minEntropicRiskConstrained";
+    -1 "  maxKappaConstrained, maxSortinoConstrained";
+    -1 "  maxSharpeHillClimbConstrained, maxSharpeHybridConstrained";
+    -1 "";
+    -1 "RISK MEASURE HELPERS:";
+    -1 "  drawdowns[cumRets]                 - Drawdown series";
+    -1 "  maxDD[cumRets]                     - Maximum drawdown";
+    -1 "  CDaR[alpha;cumRets]                - Conditional Drawdown at Risk";
+    -1 "  CER[lambda;w;R;C]                  - Certainty Equivalent Return";
+    -1 "  entropicRisk[theta;portRets]       - Entropic risk measure";
+    -1 "  LPM[n;mar;rets]                    - Lower Partial Moment";
+    -1 "  kappa[n;mar;rets]                  - Kappa ratio";
     -1 "";
     -1 "UTILITIES:";
     -1 "  example[]                          - Run example with sample data";
     -1 "  help[]                             - Show this help";
     -1 "";
     -1 "PARAMETERS:";
-    -1 "  R     - Return matrix: n_assets rows x n_periods columns";
-    -1 "  rf    - Annual risk-free rate (e.g., 0.02 for 2%)";
-    -1 "  nIter - Number of iterations";
-    -1 "  lr    - Learning rate for gradient descent (0.01-0.05)";
-    -1 "  lo/hi - Min/max weight bounds (scalar or vector)";
+    -1 "  R      - Return matrix: n_assets rows x n_periods columns";
+    -1 "  rf     - Annual risk-free rate (e.g., 0.02 for 2%)";
+    -1 "  nIter  - Number of iterations";
+    -1 "  lr     - Learning rate for gradient descent (0.01-0.05)";
+    -1 "  lo/hi  - Min/max weight bounds (scalar or vector)";
+    -1 "  alpha  - CDaR confidence level (e.g., 0.05 for worst 5%)";
+    -1 "  lambda - Risk aversion for CER (1-10, higher=more conservative)";
+    -1 "  theta  - Entropic risk aversion (1-20, higher=more tail-averse)";
+    -1 "  order  - LPM order (2=semi-variance, 3=skewness-aware)";
+    -1 "  mar    - Minimum acceptable return (e.g., 0 or rf/252)";
     -1 "";
     -1 "Run .optimizer.example[] for a complete demonstration.";
     -1 "";}
@@ -650,7 +1187,7 @@ help:{[]
 \d .
 
 // Load message
--1 "Loaded .optimizer namespace v0.1.0";
--1 "Functions: maxSharpe, maxMedianSharpe, maxSharpeConstrained, maxSharpeHybrid";
--1 "          riskParity, minVariance";
+-1 "Loaded .optimizer namespace v0.2.0";
+-1 "Functions: maxSharpe, maxSharpeConstrained, maxSharpeSLSQP, maxSharpeHybrid, maxMedianSharpe";
+-1 "          riskParity, minVariance, minCDaR, maxCER, minEntropicRisk, maxKappa, maxSortino";
 -1 "Run .optimizer.help[] for usage or .optimizer.example[] for demo";
