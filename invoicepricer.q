@@ -1476,7 +1476,6 @@ dailyInvoiceSpread:{[baskets;prices;futures;curves;repoRate;freq;useLastDelivery
 
     // Handle optional useLastDelivery parameter (default to first delivery day)
     useLast:$[useLastDelivery~(::); 0b; useLastDelivery];
-    deliveryFn:$[useLast; .tsy.lastDeliveryDay; .tsy.firstDeliveryDay];
 
     // Get unique dates from prices
     dates:asc distinct prices`date;
@@ -1513,9 +1512,11 @@ dailyInvoiceSpread:{[baskets;prices;futures;curves;repoRate;freq;useLastDelivery
     // Pre-filter baskets by code
     basketsByCode:deliveryCodes!{[b;dc] select from b where deliveryCode=dc}[baskets;] each deliveryCodes;
 
-    // Pre-compute delivery dates by code
-    deliveryDateByCode:deliveryCodes!{[bc;dc;fn] fn first bc[dc]`deliveryMonth}[basketsByCode;;deliveryFn] each deliveryCodes;
+    // Pre-compute delivery dates by code (TU/FV use 3rd biz day for last delivery)
     contractByCode:deliveryCodes!{[bc;dc] first bc[dc]`contract}[basketsByCode;] each deliveryCodes;
+    deliveryDateByCode:$[useLast;
+        deliveryCodes!{[bc;cc;dc] .tsy.lastDeliveryDayForContract[cc dc; first bc[dc]`deliveryMonth]}[basketsByCode;contractByCode;] each deliveryCodes;
+        deliveryCodes!{[bc;dc] .tsy.firstDeliveryDay first bc[dc]`deliveryMonth}[basketsByCode;] each deliveryCodes];
     monthByCode:deliveryCodes!{[bc;dc] first bc[dc]`deliveryMonth}[basketsByCode;] each deliveryCodes;
 
     // Pack context
@@ -1613,7 +1614,6 @@ dailyOAS:{[baskets;prices;futures;curves;repoRate;vol;freq;useLastDelivery]
 
     // Handle optional useLastDelivery parameter
     useLast:$[useLastDelivery~(::); 0b; useLastDelivery];
-    deliveryFn:$[useLast; .tsy.lastDeliveryDay; .tsy.firstDeliveryDay];
 
     // Get unique dates from prices
     dates:asc distinct prices`date;
@@ -1650,9 +1650,11 @@ dailyOAS:{[baskets;prices;futures;curves;repoRate;vol;freq;useLastDelivery]
     // Pre-filter baskets by code
     basketsByCode:deliveryCodes!{[b;dc] select from b where deliveryCode=dc}[baskets;] each deliveryCodes;
 
-    // Pre-compute delivery dates by code
-    deliveryDateByCode:deliveryCodes!{[bc;dc;fn] fn first bc[dc]`deliveryMonth}[basketsByCode;;deliveryFn] each deliveryCodes;
+    // Pre-compute delivery dates by code (TU/FV use 3rd biz day for last delivery)
     contractByCode:deliveryCodes!{[bc;dc] first bc[dc]`contract}[basketsByCode;] each deliveryCodes;
+    deliveryDateByCode:$[useLast;
+        deliveryCodes!{[bc;cc;dc] .tsy.lastDeliveryDayForContract[cc dc; first bc[dc]`deliveryMonth]}[basketsByCode;contractByCode;] each deliveryCodes;
+        deliveryCodes!{[bc;dc] .tsy.firstDeliveryDay first bc[dc]`deliveryMonth}[basketsByCode;] each deliveryCodes];
     monthByCode:deliveryCodes!{[bc;dc] first bc[dc]`deliveryMonth}[basketsByCode;] each deliveryCodes;
 
     // Handle defaults
