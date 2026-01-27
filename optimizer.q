@@ -293,8 +293,52 @@ projectConstrained:{[lo;hi;w]
             [room:w - lo; room:room * canDec; w + slack * room % sum room]]};
     10 iter[lo;hi]/w}
 
-// SLSQP-style optimizer with backtracking line search
-// Matches scipy.optimize.minimize behavior
+// Backtracking line search for Sharpe optimization
+// p: `mu`C`rf`lo`hi dict
+// Returns (wNew;objNew) — improved point or original if no improvement
+sharpeLineSearch:{[p;wCur;objCur;dir;dirDeriv]
+    alpha:1f;
+    wNew:projectConstrained[p`lo;p`hi;wCur + alpha * dir];
+    objNew:neg sharpeRaw[p`mu;p`C;p`rf;wNew];
+    cnt:0;
+    while[(objNew > objCur + 1e-4 * alpha * dirDeriv) and (alpha > 1e-12) and (cnt < 30);
+        alpha:0.5 * alpha;
+        wNew:projectConstrained[p`lo;p`hi;wCur + alpha * dir];
+        objNew:neg sharpeRaw[p`mu;p`C;p`rf;wNew];
+        cnt+:1];
+    (wNew;objNew)}
+
+// L-BFGS two-loop recursion: compute search direction from gradient history
+// Returns H*q (approximate inverse-Hessian times gradient)
+// sHist/yHist: lists of (s_k, y_k) pairs, most recent last
+// q: current gradient
+lbfgsDir:{[sHist;yHist;q]
+    m:count sHist;
+    if[0=m; :q];   // No history — fall back to steepest descent
+    // Forward loop: compute alphas
+    alphas:m#0f;
+    r:q;
+    i:m-1;
+    while[i >= 0;
+        rho:1f % sum (yHist i) * sHist i;
+        a:rho * sum (sHist i) * r;
+        alphas[i]:a;
+        r:r - a * yHist i;
+        i-:1];
+    // Initial Hessian approximation: H0 = (s'y / y'y) * I
+    sk:last sHist; yk:last yHist;
+    gamma:(sum sk * yk) % sum yk * yk;
+    r:gamma * r;
+    // Backward loop
+    i:0;
+    while[i < m;
+        rho:1f % sum (yHist i) * sHist i;
+        b:rho * sum (yHist i) * r;
+        r:r + (alphas[i] - b) * sHist i;
+        i+:1];
+    r}
+
+// Max Sharpe via L-BFGS projected gradient with backtracking line search
 maxSharpeSLSQP:{[R;rf;lo;hi;nIter]
     n:count R;
     C:.kdbtools.covmat flip R;
@@ -303,61 +347,104 @@ maxSharpeSLSQP:{[R;rf;lo;hi;nIter]
     loVec:$[0 > type lo; n#lo; lo];
     hiVec:$[0 > type hi; n#hi; hi];
 
+    // Analytical tangency portfolio as starting point (project to bounds)
+    excessMu:mu - rf % annFactor;
+    tpw:n#0f;
+    // Solve C*w = excessMu via CG (50 iterations, cheap)
+    tpState:`w`r`p!(n#1f%n; excessMu - .kdbtools.mm[C;n#1f%n]; excessMu - .kdbtools.mm[C;n#1f%n]);
+    cgStep:{[C;s]
+        Ap:.kdbtools.mm[C;s`p];
+        alpha:(sum s[`r]*s`r) % sum s[`p]*Ap;
+        wNew:s[`w] + alpha * s`p;
+        rNew:s[`r] - alpha * Ap;
+        beta:(sum rNew*rNew) % sum s[`r]*s`r;
+        pNew:rNew + beta * s`p;
+        `w`r`p!(wNew;rNew;pNew)};
+    tpState:50 cgStep[C]/tpState;
+    tpw:tpState`w;
+    tpw:$[0 < sum tpw; tpw % sum tpw; n#1f%n];  // Normalize (handle all-negative case)
+
     // Pack parameters into dict to avoid 8-param limit
     p:`mu`C`rf`lo`hi!(mu;C;rf;loVec;hiVec);
 
     // Initialize with multiple starting points, keep best
     starts:(n#1f%n;                              // Equal weight
             loVec + (hiVec-loVec) * n?1f;        // Random in bounds
-            loVec + 0.5 * hiVec - loVec);        // Midpoint
+            loVec + 0.5 * hiVec - loVec;         // Midpoint
+            tpw);                                // Tangency portfolio
     starts:projectConstrained[loVec;hiVec] each starts;
     startObjs:{[p;w] neg sharpeRaw[p`mu;p`C;p`rf;w]}[p] each starts;
     w:starts startObjs?min startObjs;
 
-    // Optimization state
-    state:`w`obj`iter`converged!(w;min startObjs;0;0b);
+    // Optimization state (includes L-BFGS history)
+    grad0:neg sharpeGradAnalytical[mu;C;rf;w];
+    state:`w`obj`iter`converged`grad`sHist`yHist!(w;min startObjs;0;0b;grad0;();());
+    lbfgsMem:10;  // L-BFGS memory depth
 
-    // Single optimization step with backtracking line search
-    step:{[p;s]
+    // Single optimization step: L-BFGS with steepest descent fallback
+    step:{[p;lbfgsMem;s]
         if[s`converged; :s];
 
         wCur:s`w;
         objCur:s`obj;
-        mu:p`mu; C:p`C; rf:p`rf; lo:p`lo; hi:p`hi;
+        gradCur:s`grad;
+        mu:p`mu; C:p`C; rf:p`rf;
 
-        // Gradient (negative because we minimize negative Sharpe)
-        grad:neg sharpeGradAnalytical[mu;C;rf;wCur];
+        // Check convergence via projected gradient
+        // At bounds: only count gradient if it points into the interior
+        atLo:wCur <= (p`lo) + 1e-12;
+        atHi:wCur >= (p`hi) - 1e-12;
+        projGrad:gradCur;
+        // For minimizing -Sharpe: gradient pointing towards lower -Sharpe (i.e., grad < 0)
+        // At lower bound: only movable if grad < 0 (descent wants to increase w, which is feasible)
+        // At upper bound: only movable if grad > 0 (descent wants to decrease w, which is feasible)
+        projGrad:?[atLo and projGrad > 0; 0f; projGrad];
+        projGrad:?[atHi and projGrad < 0; 0f; projGrad];
+        pgNorm:sqrt sum projGrad*projGrad;
+        if[pgNorm < 1e-10; :s,enlist[`converged]!enlist 1b];
 
-        // Check convergence (gradient small)
-        gradNorm:sqrt sum grad*grad;
-        if[gradNorm < 1e-8; :`w`obj`iter`converged!(wCur;objCur;s`iter;1b)];
+        // Try L-BFGS direction first
+        rawDir:lbfgsDir[s`sHist;s`yHist;gradCur];
+        isDesc:(sum rawDir * gradCur) > 0;
+        lbfgsDir0:$[isDesc; neg rawDir; neg gradCur];  // Descent direction
+        dn:sqrt sum lbfgsDir0*lbfgsDir0;
+        if[dn < 1e-15; :s,enlist[`converged]!enlist 1b];
+        lbfgsDir0:lbfgsDir0 % dn;
+        dd:sum gradCur * lbfgsDir0;
 
-        // Search direction (steepest descent)
-        dir:neg grad;
+        res:sharpeLineSearch[p;wCur;objCur;lbfgsDir0;dd];
+        wNew:res 0; objNew:res 1;
 
-        // Backtracking line search
-        alpha:1f;
-        wNew:projectConstrained[lo;hi;wCur + alpha * dir];
-        objNew:neg sharpeRaw[mu;C;rf;wNew];
+        // If L-BFGS failed, fall back to normalized steepest descent
+        if[objNew >= objCur;
+            sdDir:neg gradCur;
+            sdNorm:sqrt sum sdDir*sdDir;
+            if[sdNorm > 1e-15;
+                sdDir:sdDir % sdNorm;
+                sdDD:sum gradCur * sdDir;
+                res:sharpeLineSearch[p;wCur;objCur;sdDir;sdDD];
+                wNew:res 0; objNew:res 1]];
 
-        // Armijo condition threshold
-        armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
+        // Converge if neither direction improved
+        wDiff:max abs wNew - wCur;
+        if[(objNew >= objCur) or (wDiff < 1e-12);
+            :s,enlist[`converged]!enlist 1b];
 
-        cnt:0;
-        while[(objNew > armijoThresh) and (alpha > 1e-10) and (cnt < 20);
-            alpha:0.5 * alpha;
-            wNew:projectConstrained[lo;hi;wCur + alpha * dir];
-            objNew:neg sharpeRaw[mu;C;rf;wNew];
-            armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
-            cnt+:1];
+        // Update L-BFGS history
+        gradNew:neg sharpeGradAnalytical[mu;C;rf;wNew];
+        sk:wNew - wCur;
+        yk:gradNew - gradCur;
+        syk:sum sk * yk;
+        sHist:s`sHist; yHist:s`yHist;
+        // Only update if curvature condition holds; reset history if violated
+        $[syk > 1e-10 * (sqrt sum sk*sk) * sqrt sum yk*yk;
+            [sHist:$[lbfgsMem <= count sHist; 1 _ sHist; sHist],enlist sk;
+             yHist:$[lbfgsMem <= count yHist; 1 _ yHist; yHist],enlist yk];
+            [sHist:(); yHist:()]];   // Reset on curvature failure
 
-        // Update if improved, else mark converged
-        $[objNew < objCur;
-            `w`obj`iter`converged!(wNew;objNew;s[`iter]+1;0b);
-            `w`obj`iter`converged!(wCur;objCur;s`iter;1b)]};
+        `w`obj`iter`converged`grad`sHist`yHist!(wNew;objNew;s[`iter]+1;0b;gradNew;sHist;yHist)};
 
-    // Run optimizer
-    state:nIter step[p]/state;
+    state:nIter step[p;lbfgsMem]/state;
     w:state`w;
 
     `weights`sharpe`return`volatility`bounds`iterations`converged!(
@@ -1388,43 +1475,82 @@ alphaTurnover:{[alphas]
         avg to
     } each alphas}
 
-// Gradient of objective: Sharpe - lamCorr*w'Corrw - lamTO*portfolioTO(w)
+// Objective: Sharpe × (1 - lamCorr × w'Corrw) - lamTO × portfolioTO
+// Correlation penalty is multiplicative on Sharpe — scale-invariant:
+//   lamCorr=0.3 means "sacrifice up to 30% of Sharpe for diversification"
+// Turnover penalty is additive on annualized Sharpe:
+//   lamTO=0.5 means "sacrifice 0.5 ann. Sharpe per unit of portfolio turnover"
 alphaGrad:{[p;w]
-    // Sharpe gradient
-    sg:sharpeGradAnalytical[p`mu;p`C;p`rf;w];
-    // Correlation penalty gradient: d/dw (w'Corrw) = 2*Corr*w
-    corrGrad:2 * p[`lamCorr] * .kdbtools.mm[p`Corr;w];
+    // Annualized Sharpe and its gradient
+    af:p`annFactor;
+    sharpe:sqrt[af] * sharpeRaw[p`mu;p`C;p`rf;w];
+    sg:sqrt[af] * sharpeGradAnalytical[p`mu;p`C;p`rf;w];
+    // Correlation concentration: w'Corr*w
+    corrConc:sum w * .kdbtools.mm[p`Corr;w];
+    // d/dw [Sharpe × (1 - lamCorr × w'Corrw)]
+    //   = gradSharpe × (1 - lamCorr × w'Corrw) - Sharpe × lamCorr × 2×Corr×w
+    corrFactor:1 - p[`lamCorr] * corrConc;
+    corrGrad:sharpe * p[`lamCorr] * 2 * .kdbtools.mm[p`Corr;w];
     // Portfolio turnover gradient (subgradient)
     toGrad:p[`lamTO] * portfolioTOGrad[p`deltaCtx;w];
-    // Combined: maximize Sharpe - penalties
-    sg - corrGrad - toGrad}
+    // Combined
+    (sg * corrFactor) - corrGrad - toGrad}
 
-// Objective value
 alphaObj:{[p;w]
-    sharpe:sharpeRaw[p`mu;p`C;p`rf;w];
-    corrPen:p[`lamCorr] * sum w * .kdbtools.mm[p`Corr;w];
+    af:p`annFactor;
+    sharpe:sqrt[af] * sharpeRaw[p`mu;p`C;p`rf;w];
+    corrConc:sum w * .kdbtools.mm[p`Corr;w];
     toPen:p[`lamTO] * portfolioTO[p`deltaCtx;w];
-    sharpe - corrPen - toPen}
+    (sharpe * 1 - p[`lamCorr] * corrConc) - toPen}
+
+// Backtracking line search for alpha objective (maximization formulated as minimization)
+// p: params dict, dir: descent direction for -objective, dirDeriv: grad·dir (negative)
+// Returns (wNew;objNew) where obj = neg alphaObj
+alphaLineSearch:{[p;lo;hi;wCur;objCur;dir;dirDeriv]
+    alpha:1f;
+    wNew:projectConstrained[lo;hi;wCur + alpha * dir];
+    objNew:neg alphaObj[p;wNew];
+    cnt:0;
+    while[(objNew > objCur + 1e-4 * alpha * dirDeriv) and (alpha > 1e-12) and (cnt < 30);
+        alpha:0.5 * alpha;
+        wNew:projectConstrained[lo;hi;wCur + alpha * dir];
+        objNew:neg alphaObj[p;wNew];
+        cnt+:1];
+    (wNew;objNew)}
 
 // One-shot alpha optimization
 // alphas: list of signal tables ([] time; ricRoot; sig; prevSig)
 // returns: ([] time; ricRoot; pxDiff)
 // cfg: dict with optional keys:
-//   rf      - annual risk-free rate (default 0)
-//   lamCorr - correlation penalty (default 0.1)
-//   lamTO   - turnover penalty (default 0.1)
-//   lo      - min weight (default 0)
-//   hi      - max weight (default 1)
-//   nIter   - gradient steps (default 500)
+//   rf        - annual risk-free rate (default 0)
+//   lamCorr   - correlation penalty (default 0.1)
+//   lamTO     - turnover penalty (default 0.1)
+//   lo        - min weight (default 0)
+//   hi        - max weight (default 1)
+//   nIter     - gradient steps (default 500)
+//   period    - function mapping time→period for return aggregation (default: none)
+//               e.g. {"d"$x} to aggregate intraday→daily, {`week$x} for weekly
+//   annFactor - annualization factor (default 252; set to 52 for weekly, etc.)
 optimizeAlphas:{[alphas;returns;cfg]
     // Defaults
     rf:$[`rf in key cfg; cfg`rf; 0f];
     lamCorr:$[`lamCorr in key cfg; cfg`lamCorr; 0.1];
     lamTO:$[`lamTO in key cfg; cfg`lamTO; 0.1];
     nIter:$[`nIter in key cfg; cfg`nIter; 500];
+    af:$[`annFactor in key cfg; cfg`annFactor; annFactor];
+    hasPeriod:`period in key cfg;
 
     // Compute alpha returns matrix
     arTable:alphaReturns[alphas;returns];
+
+    // Period aggregation: sum alpha returns within each period for Sharpe computation
+    // Turnover penalty still uses full-resolution signal deltas (deltaCtx below)
+    if[hasPeriod;
+        periodFn:cfg`period;
+        aCols:cols[arTable] except `time;
+        aggCols:aCols!({(sum;x)} each aCols);
+        arTable:?[arTable; (); enlist[`time]!enlist (periodFn;`time); aggCols]];
+
     R:fromTable delete time from arTable;
     n:count R;
 
@@ -1433,16 +1559,19 @@ optimizeAlphas:{[alphas;returns;cfg]
     lo:$[0>type lo; n#lo; lo];
     hi:$[0>type hi; n#hi; hi];
 
-    // Build delta matrix for portfolio-level turnover
+    // Build delta matrix for portfolio-level turnover (full resolution, not aggregated)
     deltaCtx:alphaDeltas alphas;
 
     // Run optimization
-    optimizeAlphasCore[R;deltaCtx;rf;lamCorr;lamTO;lo;hi;nIter]}
+    opts:`lo`hi`nIter`af!(lo;hi;nIter;af);
+    optimizeAlphasCore[R;deltaCtx;rf;lamCorr;lamTO;opts]}
 
 // Core optimizer (works on pre-computed data)
 // R: K rows × T cols (one row per alpha)
 // deltaCtx: from alphaDeltas — aligned signal change matrix
-optimizeAlphasCore:{[R;deltaCtx;rf;lamCorr;lamTO;lo;hi;nIter]
+// opts: `lo`hi`nIter`af dict
+optimizeAlphasCore:{[R;deltaCtx;rf;lamCorr;lamTO;opts]
+    lo:opts`lo; hi:opts`hi; nIter:opts`nIter; af:opts`af;
     n:count R;
     C:.kdbtools.covmat flip R;
     mu:avg each R;
@@ -1453,64 +1582,108 @@ optimizeAlphasCore:{[R;deltaCtx;rf;lamCorr;lamTO;lo;hi;nIter]
     zeroIdx:where 0=vols;
     if[0 < count zeroIdx; Corr:@[Corr;zeroIdx;:;(count[zeroIdx])#enlist n#0f]];
 
-    // Pack params
-    p:`mu`C`Corr`rf`deltaCtx`lamCorr`lamTO!(mu;C;Corr;rf;deltaCtx;lamCorr;lamTO);
+    // Pack params (includes annFactor for objective/gradient functions)
+    p:`mu`C`Corr`rf`deltaCtx`lamCorr`lamTO`annFactor!(mu;C;Corr;rf;deltaCtx;lamCorr;lamTO;af);
+
+    // Analytical tangency portfolio as starting point (ignores penalties)
+    excessMu:mu - rf % af;
+    tpState:`w`r`p!(n#1f%n; excessMu - .kdbtools.mm[C;n#1f%n]; excessMu - .kdbtools.mm[C;n#1f%n]);
+    cgStep:{[C;s]
+        Ap:.kdbtools.mm[C;s`p];
+        a:(sum s[`r]*s`r) % sum s[`p]*Ap;
+        wNew:s[`w] + a * s`p;
+        rNew:s[`r] - a * Ap;
+        beta:(sum rNew*rNew) % sum s[`r]*s`r;
+        pNew:rNew + beta * s`p;
+        `w`r`p!(wNew;rNew;pNew)};
+    tpState:50 cgStep[C]/tpState;
+    tpw:tpState`w;
+    tpw:$[0 < sum tpw; tpw % sum tpw; n#1f%n];
 
     // Initialize with multiple starting points, keep best
     starts:(n#1f%n;                              // Equal weight
             lo + (hi-lo) * n?1f;                 // Random in bounds
-            lo + 0.5 * hi - lo);                 // Midpoint
+            lo + 0.5 * hi - lo;                  // Midpoint
+            tpw);                                // Tangency portfolio
     starts:projectConstrained[lo;hi] each starts;
     startObjs:alphaObj[p;] each starts;
     w:starts startObjs?max startObjs;
 
-    // State (maximize objective)
-    state:`w`obj`iter`converged!(w;max startObjs;0;0b);
+    // State (maximize objective, formulated as minimize -objective for L-BFGS)
+    negObj:neg max startObjs;
+    grad0:neg alphaGrad[p;w];  // Gradient of -objective
+    state:`w`obj`iter`converged`grad`sHist`yHist!(w;negObj;0;0b;grad0;();());
+    lbfgsMem:10;
 
-    // SLSQP step with backtracking line search + Armijo condition
-    step:{[p;lo;hi;s]
+    // L-BFGS step with steepest descent fallback
+    step:{[p;lo;hi;lbfgsMem;s]
         if[s`converged; :s];
         wCur:s`w;
         objCur:s`obj;
-        // Gradient (ascent direction)
-        grad:alphaGrad[p;wCur];
-        gradNorm:sqrt sum grad*grad;
-        if[gradNorm < 1e-8; :`w`obj`iter`converged!(wCur;objCur;s`iter;1b)];
-        // Search direction (ascent)
-        dir:grad;
-        // Backtracking line search with Armijo condition
-        alpha:1f;
-        wNew:projectConstrained[lo;hi;wCur + alpha * dir];
-        objNew:alphaObj[p;wNew];
-        // Armijo: require sufficient improvement (c=1e-4)
-        armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
-        cnt:0;
-        while[(objNew < armijoThresh) and (alpha > 1e-10) and (cnt < 20);
-            alpha:0.5 * alpha;
-            wNew:projectConstrained[lo;hi;wCur + alpha * dir];
-            objNew:alphaObj[p;wNew];
-            armijoThresh:objCur + 1e-4 * alpha * sum grad * dir;
-            cnt+:1];
-        $[objNew > objCur;
-            `w`obj`iter`converged!(wNew;objNew;s[`iter]+1;0b);
-            `w`obj`iter`converged!(wCur;objCur;s`iter;1b)]};
+        gradCur:s`grad;
 
-    state:nIter step[p;lo;hi]/state;
+        // Projected gradient convergence check
+        atLo:wCur <= lo + 1e-12;
+        atHi:wCur >= hi - 1e-12;
+        projGrad:gradCur;
+        projGrad:?[atLo and projGrad > 0; 0f; projGrad];
+        projGrad:?[atHi and projGrad < 0; 0f; projGrad];
+        pgNorm:sqrt sum projGrad*projGrad;
+        if[pgNorm < 1e-10; :s,enlist[`converged]!enlist 1b];
+
+        // Try L-BFGS direction
+        rawDir:lbfgsDir[s`sHist;s`yHist;gradCur];
+        isDesc:(sum rawDir * gradCur) > 0;
+        lDir:$[isDesc; neg rawDir; neg gradCur];
+        dn:sqrt sum lDir*lDir;
+        if[dn < 1e-15; :s,enlist[`converged]!enlist 1b];
+        lDir:lDir % dn;
+        dd:sum gradCur * lDir;
+
+        res:alphaLineSearch[p;lo;hi;wCur;objCur;lDir;dd];
+        wNew:res 0; objNew:res 1;
+
+        // Steepest descent fallback
+        if[objNew >= objCur;
+            sdDir:neg gradCur;
+            sdNorm:sqrt sum sdDir*sdDir;
+            if[sdNorm > 1e-15;
+                sdDir:sdDir % sdNorm;
+                sdDD:sum gradCur * sdDir;
+                res:alphaLineSearch[p;lo;hi;wCur;objCur;sdDir;sdDD];
+                wNew:res 0; objNew:res 1]];
+
+        wDiff:max abs wNew - wCur;
+        if[(objNew >= objCur) or (wDiff < 1e-12);
+            :s,enlist[`converged]!enlist 1b];
+
+        // Update L-BFGS history
+        gradNew:neg alphaGrad[p;wNew];
+        sk:wNew - wCur;
+        yk:gradNew - gradCur;
+        syk:sum sk * yk;
+        sHist:s`sHist; yHist:s`yHist;
+        $[syk > 1e-10 * (sqrt sum sk*sk) * sqrt sum yk*yk;
+            [sHist:$[lbfgsMem <= count sHist; 1 _ sHist; sHist],enlist sk;
+             yHist:$[lbfgsMem <= count yHist; 1 _ yHist; yHist],enlist yk];
+            [sHist:(); yHist:()]];
+
+        `w`obj`iter`converged`grad`sHist`yHist!(wNew;objNew;s[`iter]+1;0b;gradNew;sHist;yHist)};
+
+    state:nIter step[p;lo;hi;lbfgsMem]/state;
     w:state`w;
 
     // Compute final metrics
-    corrPen:lamCorr * sum w * .kdbtools.mm[Corr;w];
+    corrConc:sum w * .kdbtools.mm[Corr;w];
     portTO:portfolioTO[deltaCtx;w];
-    toPen:lamTO * portTO;
 
-    `weights`sharpe`return`volatility`objective`corrPenalty`toPenalty`portfolioTO`converged`iterations!(
+    `weights`sharpe`return`volatility`objective`corrConcentration`portfolioTO`converged`iterations!(
         w;
-        portSharpe[w;R;C;rf];
-        annFactor * sum w * mu;
-        sqrt[annFactor] * sqrt sum w * .kdbtools.mm[C;w];
-        state`obj;
-        corrPen;
-        toPen;
+        sqrt[af] * (sum[w*mu] - rf % af) % sqrt sum w * .kdbtools.mm[C;w];
+        af * sum w * mu;
+        sqrt[af] * sqrt sum w * .kdbtools.mm[C;w];
+        neg state`obj;
+        corrConc;
         portTO;
         state`converged;
         state`iter)}
@@ -1525,9 +1698,19 @@ optimizeAlphasRolling:{[alphas;returns;window;step;cfg]
     nIter:$[`nIter in key cfg; cfg`nIter; 200];
     lo:$[`lo in key cfg; cfg`lo; 0f];
     hi:$[`hi in key cfg; cfg`hi; 1f];
+    af:$[`annFactor in key cfg; cfg`annFactor; annFactor];
+    hasPeriod:`period in key cfg;
 
     // Compute full alpha returns table
     arTable:alphaReturns[alphas;returns];
+
+    // Period aggregation (same logic as optimizeAlphas)
+    if[hasPeriod;
+        periodFn:cfg`period;
+        aCols:cols[arTable] except `time;
+        aggCols:aCols!({(sum;x)} each aCols);
+        arTable:?[arTable; (); enlist[`time]!enlist (periodFn;`time); aggCols]];
+
     times:arTable`time;
     R:fromTable delete time from arTable;
     n:count R;
@@ -1536,18 +1719,16 @@ optimizeAlphasRolling:{[alphas;returns;window;step;cfg]
     lo:$[0>type lo; n#lo; lo];
     hi:$[0>type hi; n#hi; hi];
 
-    // Build full delta context
+    // Build full delta context (full resolution for turnover)
     deltaCtx:alphaDeltas alphas;
 
     // Re-optimization indices
     optIdxs:window + step * til 1 + (nT - window) div step;
     optIdxs:optIdxs where optIdxs <= nT;
 
-    // Map times to delta time indices for subsetting
-    deltaTimes:asc distinct (deltaCtx`dMat)[0] @ where not null (deltaCtx`dMat)[0];
-
     // Pack context
-    ctx:`R`deltaCtx`times`window`rf`lamCorr`lamTO`lo`hi`nIter!(R;deltaCtx;times;window;rf;lamCorr;lamTO;lo;hi;nIter);
+    opts:`lo`hi`nIter`af!(lo;hi;nIter;af);
+    ctx:`R`deltaCtx`times`window`rf`lamCorr`lamTO`opts!(R;deltaCtx;times;window;rf;lamCorr;lamTO;opts);
 
     // Run optimization at each point
     results:{[ctx;idx]
@@ -1555,7 +1736,7 @@ optimizeAlphasRolling:{[alphas;returns;window;step;cfg]
         startIdx:idx - window;
         subR:{[x;s;w] x s + til w}[;startIdx;window] each R;
         // Use full deltaCtx (turnover structure is stationary across windows)
-        res:optimizeAlphasCore[subR;ctx`deltaCtx;ctx`rf;ctx`lamCorr;ctx`lamTO;ctx`lo;ctx`hi;ctx`nIter];
+        res:optimizeAlphasCore[subR;ctx`deltaCtx;ctx`rf;ctx`lamCorr;ctx`lamTO;ctx`opts];
         res,enlist[`time]!enlist times idx-1
     }[ctx] each optIdxs;
 
