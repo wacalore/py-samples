@@ -30,6 +30,10 @@ class AlphaOptimizerConfig:
     px_diff_col: str = "pxDiff"
     return_col: Optional[str] = None
     use_prev_signal: bool = True
+    alpha_mode: str = "sym"  # "sym" uses sym_col, "alpha" aggregates per alpha table
+    alpha_col: Optional[str] = None  # optional column name for alpha id (else uses source_id)
+    dt_unit: Optional[str] = None
+    dt_origin: Optional[str] = None
 
     window: int = 252
     min_periods: Optional[int] = None
@@ -52,6 +56,30 @@ class AlphaOptimizerConfig:
     target_vol: Optional[float] = None
     target_vol_penalty: float = 10.0
     turnover_penalty: float = 0.0
+
+    cov_shrinkage: Optional[float] = None
+    cov_shrinkage_target: str = "diag"
+    mean_shrinkage: Optional[float] = None
+    mean_shrinkage_target: str = "zero"
+
+    ewma_halflife: Optional[float] = None
+    ewma_span: Optional[float] = None
+    robust_method: Optional[str] = None
+    robust_clip: float = 3.0
+    robust_scale: str = "mad"
+
+    reliability_mode: Optional[str] = None
+    reliability_clip: float = 2.0
+    reliability_floor: float = 0.0
+    reliability_power: float = 1.0
+
+    weight_l2_penalty: float = 0.0
+
+    regime_mode: Optional[str] = None
+    regime_short_window: int = 20
+    regime_long_window: Optional[int] = None
+    regime_halflife_bounds: Tuple[float, float] = (0.5, 2.0)
+    regime_shrinkage_bounds: Tuple[float, float] = (0.5, 2.0)
 
 
 def _ensure_pandas() -> None:
@@ -113,10 +141,16 @@ def alpha_tables_to_returns_df(
     if dt_col not in df_all.columns:
         raise ValueError(f"missing dt column: '{cfg.dt_col}' or 'time'.")
 
-    df_all[dt_col] = pd.to_datetime(df_all[dt_col], errors="raise")  # type: ignore[union-attr]
-    if cfg.sym_col not in df_all.columns:
-        raise ValueError(f"missing sym column '{cfg.sym_col}'.")
-
+    dt_series = df_all[dt_col]
+    if cfg.dt_unit and cfg.dt_origin:
+        df_all[dt_col] = pd.to_datetime(  # type: ignore[union-attr]
+            dt_series,
+            unit=cfg.dt_unit,
+            origin=cfg.dt_origin,
+            errors="raise",
+        )
+    else:
+        df_all[dt_col] = pd.to_datetime(dt_series, errors="raise")  # type: ignore[union-attr]
     if cfg.return_col and cfg.return_col in df_all.columns:
         df_all["ret"] = pd.to_numeric(df_all[cfg.return_col], errors="coerce")  # type: ignore[union-attr]
     else:
@@ -127,8 +161,17 @@ def alpha_tables_to_returns_df(
         px = pd.to_numeric(df_all[cfg.px_diff_col], errors="coerce")  # type: ignore[union-attr]
         df_all["ret"] = sig * px
 
-    grouped = df_all.groupby([dt_col, cfg.sym_col], as_index=False)["ret"].sum()
-    wide = grouped.pivot(index=dt_col, columns=cfg.sym_col, values="ret").sort_index()
+    if cfg.alpha_mode == "alpha":
+        alpha_col = cfg.alpha_col or "source_id"
+        if alpha_col not in df_all.columns:
+            raise ValueError(f"missing alpha column '{alpha_col}'.")
+        grouped = df_all.groupby([dt_col, alpha_col], as_index=False)["ret"].sum()
+        wide = grouped.pivot(index=dt_col, columns=alpha_col, values="ret").sort_index()
+    else:
+        if cfg.sym_col not in df_all.columns:
+            raise ValueError(f"missing sym column '{cfg.sym_col}'.")
+        grouped = df_all.groupby([dt_col, cfg.sym_col], as_index=False)["ret"].sum()
+        wide = grouped.pivot(index=dt_col, columns=cfg.sym_col, values="ret").sort_index()
     if cfg.fillna is not None:
         wide = wide.fillna(cfg.fillna)
     return wide
@@ -174,6 +217,188 @@ def rolling_sharpe(
     sd = returns_df.rolling(window, min_periods=mp).std()
     sharpe = mu / sd.replace(0.0, np.nan) * math.sqrt(float(annualization))
     return sharpe
+
+
+def _shrink_cov(cov: np.ndarray, alpha: float, target: str) -> np.ndarray:
+    if not np.isfinite(alpha) or alpha <= 0.0:
+        return cov
+    alpha = float(min(max(alpha, 0.0), 1.0))
+    cov = np.asarray(cov, dtype=float)
+    cov = 0.5 * (cov + cov.T)
+    n = cov.shape[0]
+    if n == 0:
+        return cov
+    target_key = target.lower()
+    if target_key in {"identity", "eye", "i"}:
+        avg_var = float(np.trace(cov)) / float(n)
+        shrink_target = np.eye(n) * avg_var
+    elif target_key in {"diag", "diagonal"}:
+        shrink_target = np.diag(np.diag(cov))
+    elif target_key in {"constant_correlation", "constcorr", "cc"}:
+        std = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
+        denom = np.outer(std, std)
+        corr = np.zeros_like(cov)
+        mask = denom > 0.0
+        corr[mask] = cov[mask] / denom[mask]
+        if n > 1:
+            avg_corr = float((np.sum(corr) - np.trace(corr)) / (n * (n - 1)))
+        else:
+            avg_corr = 0.0
+        shrink_target = np.outer(std, std) * avg_corr
+        np.fill_diagonal(shrink_target, np.diag(cov))
+    else:
+        raise ValueError(f"unknown cov_shrinkage_target '{target}'.")
+    return (1.0 - alpha) * cov + alpha * shrink_target
+
+
+def _shrink_mean(mu: np.ndarray, alpha: float, target: str) -> np.ndarray:
+    if not np.isfinite(alpha) or alpha <= 0.0:
+        return mu
+    alpha = float(min(max(alpha, 0.0), 1.0))
+    target_key = target.lower()
+    if target_key in {"zero", "zeros"}:
+        shrink_target = np.zeros_like(mu)
+    elif target_key in {"grand_mean", "mean"}:
+        grand = float(np.mean(mu))
+        shrink_target = np.full_like(mu, grand)
+    else:
+        raise ValueError(f"unknown mean_shrinkage_target '{target}'.")
+    return (1.0 - alpha) * mu + alpha * shrink_target
+
+
+def _ewma_weights(n: int, halflife: Optional[float], span: Optional[float]) -> Optional[np.ndarray]:
+    if n <= 0:
+        return None
+    if halflife is not None and span is not None:
+        raise ValueError("set only one of ewma_halflife or ewma_span.")
+    if halflife is None and span is None:
+        return None
+    if halflife is not None:
+        if halflife <= 0:
+            raise ValueError("ewma_halflife must be positive.")
+        alpha = 1.0 - math.exp(math.log(0.5) / float(halflife))
+    else:
+        if span is None or span <= 0:
+            raise ValueError("ewma_span must be positive.")
+        alpha = 2.0 / (float(span) + 1.0)
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError("invalid EWMA alpha.")
+    idx = np.arange(n, dtype=float)
+    w = (1.0 - alpha) ** (n - 1 - idx)
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0:
+        return None
+    return w / w_sum
+
+
+def _weighted_mean_cov(x: np.ndarray, weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if x.ndim != 2:
+        raise ValueError("x must be 2D.")
+    if weights.ndim != 1 or weights.shape[0] != x.shape[0]:
+        raise ValueError("weights must be 1D and match rows of x.")
+    w = weights.astype(float)
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0:
+        raise ValueError("sum of weights must be positive.")
+    w = w / w_sum
+    mu = w @ x
+    x_c = x - mu
+    cov = (x_c.T * w) @ x_c
+    return mu, cov
+
+
+def _robust_winsorize(x: np.ndarray, clip: float, scale: str) -> np.ndarray:
+    if clip <= 0:
+        return x
+    med = np.median(x, axis=0)
+    scale_key = scale.lower()
+    if scale_key in {"mad", "median_abs_dev", "median_absolute_deviation"}:
+        mad = np.median(np.abs(x - med), axis=0)
+        s = 1.4826 * mad
+    elif scale_key in {"std", "stdev"}:
+        s = np.std(x, axis=0, ddof=1)
+    else:
+        raise ValueError(f"unknown robust_scale '{scale}'.")
+    s = np.where(np.isfinite(s) & (s > 0.0), s, 0.0)
+    lower = med - clip * s
+    upper = med + clip * s
+    return np.minimum(np.maximum(x, lower), upper)
+
+
+def _effective_sample_size(weights: Optional[np.ndarray], n: int) -> float:
+    if weights is None:
+        return float(n)
+    w = np.asarray(weights, dtype=float)
+    denom = float(np.sum(w * w))
+    if denom <= 0.0:
+        return float(n)
+    return 1.0 / denom
+
+
+def _reliability_weights(
+    mu: np.ndarray,
+    cov: np.ndarray,
+    n_eff: float,
+    mode: str,
+    clip: float,
+    floor: float,
+    power: float,
+) -> np.ndarray:
+    sd = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
+    sd = np.where(sd > 0.0, sd, np.nan)
+    sr_daily = mu / sd
+    mode_key = mode.lower()
+    if mode_key in {"sharpe", "sr"}:
+        score = np.abs(sr_daily)
+    elif mode_key in {"tstat", "t"}:
+        score = np.abs(sr_daily) * math.sqrt(max(n_eff, 1.0))
+    else:
+        raise ValueError("reliability_mode must be 'sharpe' or 'tstat'.")
+    clip_val = float(max(clip, 1.0e-12))
+    w = np.clip(score / clip_val, 0.0, 1.0)
+    if power != 1.0:
+        w = np.power(w, float(power))
+    if floor > 0.0:
+        w = np.maximum(w, float(floor))
+    w = np.nan_to_num(w, nan=0.0, posinf=1.0, neginf=0.0)
+    return w
+
+
+def _regime_adjustments(
+    x: np.ndarray,
+    short_window: int,
+    long_window: Optional[int],
+    base_halflife: Optional[float],
+    base_span: Optional[float],
+    base_shrink: Optional[float],
+    hl_bounds: Tuple[float, float],
+    shrink_bounds: Tuple[float, float],
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if x.size == 0:
+        return base_halflife, base_span, base_shrink
+    short_w = max(2, int(short_window))
+    long_w = int(long_window) if long_window else x.shape[0]
+    long_w = max(short_w, min(long_w, x.shape[0]))
+    short_x = x[-short_w:]
+    long_x = x[-long_w:]
+
+    short_vol = float(np.nanmean(np.std(short_x, axis=0, ddof=1)))
+    long_vol = float(np.nanmean(np.std(long_x, axis=0, ddof=1)))
+    if not np.isfinite(short_vol) or not np.isfinite(long_vol) or long_vol <= 0.0:
+        return base_halflife, base_span, base_shrink
+
+    ratio = short_vol / long_vol
+    hl_lo, hl_hi = hl_bounds
+    sh_lo, sh_hi = shrink_bounds
+    hl_mult = np.clip(1.0 / ratio, hl_lo, hl_hi)
+    sh_mult = np.clip(ratio, sh_lo, sh_hi)
+
+    halflife = base_halflife * hl_mult if base_halflife is not None else None
+    span = base_span * hl_mult if base_span is not None else None
+    shrink = base_shrink * sh_mult if base_shrink is not None else None
+    if shrink is not None:
+        shrink = float(min(max(shrink, 0.0), 1.0))
+    return halflife, span, shrink
 
 
 def _pc_limits_array(
@@ -250,6 +475,7 @@ def _max_sharpe_weights(
     target_vol: Optional[float] = None,
     target_vol_penalty: float = 10.0,
     turnover_penalty: float = 0.0,
+    weight_l2_penalty: float = 0.0,
     prev_weights: Optional[np.ndarray] = None,
     annualization: float = 252.0,
 ) -> np.ndarray:
@@ -263,6 +489,7 @@ def _max_sharpe_weights(
         and pc_targets is None
         and target_vol is None
         and turnover_penalty <= 0.0
+        and weight_l2_penalty <= 0.0
     ):
         inv = np.linalg.pinv(cov)
         w = inv @ (mu - risk_free)
@@ -283,6 +510,8 @@ def _max_sharpe_weights(
             obj += float(target_vol_penalty) * (vol - float(target_vol)) ** 2
         if turnover_penalty > 0.0 and prev_weights is not None:
             obj += float(turnover_penalty) * float(np.sum(np.abs(w - prev_weights)))
+        if weight_l2_penalty > 0.0:
+            obj += float(weight_l2_penalty) * float(np.sum(w * w))
         if pc_targets is not None and pc_loadings is not None:
             exposures = pc_loadings.T @ w
             for j in range(pc_loadings.shape[1]):
@@ -359,8 +588,53 @@ def optimize_portfolio_with_pca(
             continue
         start = max(0, i + 1 - window)
         window_df = returns_df.iloc[start : i + 1]
-        mu = window_df.mean().to_numpy(dtype=float)
-        cov = np.cov(window_df.to_numpy(dtype=float), rowvar=False)
+        window_x = window_df.to_numpy(dtype=float)
+        if cfg.robust_method:
+            if cfg.robust_method.lower() not in {"winsor", "winsorize"}:
+                raise ValueError("robust_method must be 'winsor' if set.")
+            window_x = _robust_winsorize(window_x, cfg.robust_clip, cfg.robust_scale)
+
+        ewma_halflife = cfg.ewma_halflife
+        ewma_span = cfg.ewma_span
+        cov_shrink = cfg.cov_shrinkage
+        if cfg.regime_mode:
+            if cfg.regime_mode.lower() not in {"vol_ratio", "vol"}:
+                raise ValueError("regime_mode must be 'vol_ratio' if set.")
+            ewma_halflife, ewma_span, cov_shrink = _regime_adjustments(
+                window_x,
+                cfg.regime_short_window,
+                cfg.regime_long_window,
+                ewma_halflife,
+                ewma_span,
+                cov_shrink,
+                cfg.regime_halflife_bounds,
+                cfg.regime_shrinkage_bounds,
+            )
+
+        ewma_w = _ewma_weights(window_x.shape[0], ewma_halflife, ewma_span)
+        if ewma_w is None:
+            mu = window_x.mean(axis=0)
+            cov = np.cov(window_x, rowvar=False)
+        else:
+            mu, cov = _weighted_mean_cov(window_x, ewma_w)
+
+        if cfg.reliability_mode:
+            n_eff = _effective_sample_size(ewma_w, window_x.shape[0])
+            rel_w = _reliability_weights(
+                mu,
+                cov,
+                n_eff,
+                cfg.reliability_mode,
+                cfg.reliability_clip,
+                cfg.reliability_floor,
+                cfg.reliability_power,
+            )
+            mu = mu * rel_w
+
+        if cfg.mean_shrinkage:
+            mu = _shrink_mean(mu, float(cfg.mean_shrinkage), cfg.mean_shrinkage_target)
+        if cov_shrink:
+            cov = _shrink_cov(cov, float(cov_shrink), cfg.cov_shrinkage_target)
 
         if cfg.pca_mode == "rolling":
             loadings_i, _, _ = pca_from_returns(
@@ -391,6 +665,7 @@ def optimize_portfolio_with_pca(
             target_vol=cfg.target_vol,
             target_vol_penalty=cfg.target_vol_penalty,
             turnover_penalty=cfg.turnover_penalty,
+            weight_l2_penalty=cfg.weight_l2_penalty,
             prev_weights=prev_w,
             annualization=cfg.annualization,
         )
