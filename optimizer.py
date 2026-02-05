@@ -793,6 +793,8 @@ def optimizer_result_to_dict(
 
     - DataFrames/Series are converted to dict-of-lists with index moved to `date_col`.
     - numpy arrays are returned as-is.
+    - date_mode="days" returns int days since epoch.
+    - date_mode in {"ns","datetime64[ns]","timestamp"} returns int64 ns since epoch.
     """
     if not HAVE_PANDAS:
         raise RuntimeError("pandas is required for optimizer_result_to_dict.")
@@ -804,10 +806,15 @@ def optimizer_result_to_dict(
         df = df.copy()
         idx = df.index
         if np.issubdtype(idx.dtype, np.datetime64):
-            if date_mode == "days":
+            dm = str(date_mode)
+            if dm == "days":
                 df[date_col] = (idx - epoch_ts).days.astype("int32")
+            elif dm in ("ns", "nanoseconds", "timestamp", "datetime64[ns]"):
+                epoch_ns = int(epoch_ts.value)
+                ns = idx.values.astype("datetime64[ns]").astype("int64") - epoch_ns
+                df[date_col] = ns.astype("int64")
             else:
-                df[date_col] = idx.values.astype("datetime64[D]")
+                df[date_col] = idx.values.astype(dm)
         else:
             df[date_col] = idx
         return df.reset_index(drop=True)
@@ -848,10 +855,15 @@ def optimizer_result_table(
         df = df.copy()
         idx = df.index
         if np.issubdtype(idx.dtype, np.datetime64):
-            if date_mode == "days":
+            dm = str(date_mode)
+            if dm == "days":
                 df[date_col] = (idx - epoch_ts).days.astype("int32")
+            elif dm in ("ns", "nanoseconds", "timestamp", "datetime64[ns]"):
+                epoch_ns = int(epoch_ts.value)
+                ns = idx.values.astype("datetime64[ns]").astype("int64") - epoch_ns
+                df[date_col] = ns.astype("int64")
             else:
-                df[date_col] = idx.values.astype("datetime64[D]")
+                df[date_col] = idx.values.astype(dm)
         else:
             df[date_col] = idx
         return df.reset_index(drop=True)
