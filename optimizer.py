@@ -428,3 +428,48 @@ def optimize_portfolio_with_pca(
             columns=[f"PC{i+1}" for i in range(loadings.shape[1])],
         )
     return result
+
+
+def optimizer_result_to_dict(
+    result: Dict[str, object],
+    date_col: str = "dt",
+    date_mode: str = "datetime64[D]",
+    epoch: str = "2000-01-01",
+) -> Dict[str, object]:
+    """
+    Convert optimizer output into a q-friendly dict.
+
+    - DataFrames/Series are converted to dict-of-lists with index moved to `date_col`.
+    - numpy arrays are returned as-is.
+    """
+    if not HAVE_PANDAS:
+        raise RuntimeError("pandas is required for optimizer_result_to_dict.")
+
+    out: Dict[str, object] = {}
+    epoch_ts = pd.Timestamp(epoch)  # type: ignore[union-attr]
+
+    def _index_to_col(df: "pd.DataFrame") -> "pd.DataFrame":  # type: ignore[name-defined]
+        df = df.copy()
+        idx = df.index
+        if np.issubdtype(idx.dtype, np.datetime64):
+            if date_mode == "days":
+                df[date_col] = (idx - epoch_ts).days.astype("int32")
+            else:
+                df[date_col] = idx.values.astype("datetime64[D]")
+        else:
+            df[date_col] = idx
+        return df.reset_index(drop=True)
+
+    for key, val in result.items():
+        if HAVE_PANDAS and isinstance(val, pd.Series):  # type: ignore[union-attr]
+            df = val.to_frame()
+            df = _index_to_col(df)
+            out[key] = {c: df[c].tolist() for c in df.columns}
+        elif HAVE_PANDAS and isinstance(val, pd.DataFrame):  # type: ignore[union-attr]
+            df = _index_to_col(val)
+            out[key] = {c: df[c].tolist() for c in df.columns}
+        elif isinstance(val, np.ndarray):
+            out[key] = val
+        else:
+            out[key] = val
+    return out
