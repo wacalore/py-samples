@@ -521,14 +521,17 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
 
     // Signal-level gross-normalized scoring (when signal matrices available)
     hasSignals:(`signalMats in key cfg) & `pxMat in key cfg;
-    signalMats:$[hasSignals; cfg`signalMats; ()];
-    pxMat:$[hasSignals; cfg`pxMat; ()];
 
-    // Gross-normalized Sharpe: combine signals, normalize by daily gross, compute Sharpe
-    normSharpe:{[sigMats;pxM;rf;w]
-        cSig:sum {x*y}'[w;sigMats];
-        rawRet:sum each cSig * pxM;
-        gross:sum each abs cSig;
+    // Precompute signal tensor for fast scoring: flatten A T×S matrices into (T*S)×A
+    // sigTensor mmu w gives (T*S) vector of combined signals, reshape to T×S for gross
+    sigTensor:$[hasSignals; flip raze each cfg`signalMats; ()];
+    nT:$[hasSignals; count first cfg`signalMats; 0];
+    nS:$[hasSignals; count first first cfg`signalMats; 0];
+
+    // Gross-normalized Sharpe using precomputed tensor (2 mmu ops, no per-alpha lambdas)
+    normSharpe:{[sigT;dims;alphaRets;rf;w]
+        rawRet:alphaRets mmu w;
+        gross:sum each abs dims # sigT mmu w;
         nRet:rawRet % gross + 1e-20;
         avg[nRet] % dev[nRet] + 1e-10};
 
@@ -544,7 +547,7 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
                objective=`maxRet; ret;
                objective=`riskParity; neg sum abs (alloc * alphaC mmu alloc) - variance%(count alloc);
                (ret - rf) % vol + 1e-10]]]};
-    sf:scoreFn[hasSignals; normSharpe[signalMats;pxMat;rf]; alphaMu; alphaC; objective; rf];
+    sf:scoreFn[hasSignals; normSharpe[sigTensor;(nT;nS);alphaRets;rf]; alphaMu; alphaC; objective; rf];
 
     // Analytical seed: tangency portfolio for maxSharpe, min-var for minVar
     analyticalW:nAlphas#1f%nAlphas;  // fallback: equal weight
@@ -599,9 +602,8 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
     // Compute final portfolio characteristics
     // Use normalized returns when signal data available
     $[hasSignals & objective=`maxSharpe;
-        [cSig:sum {x*y}'[allocBest;signalMats];
-         rawRet:sum each cSig * pxMat;
-         gross:sum each abs cSig;
+        [rawRet:alphaRets mmu allocBest;
+         gross:sum each abs (nT;nS) # sigTensor mmu allocBest;
          normRet:rawRet % gross + 1e-20;
          finalRet:avg normRet;
          finalVol:dev normRet;
