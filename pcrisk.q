@@ -471,24 +471,27 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
     assets:$[isTable; cols[R] except cfg`excludeCols; `$"A",/:string til count first Rmat];
     p:$[99h=type p; p; pca[R;0;cfg]];
 
-    // Compute alpha returns: each alpha's return = sum(alpha_weights * asset_returns)
-    // alphaRets[t;a] = return of alpha a at time t
-    alphaRets:{[Rmat;aw;assets;i]
-        w:aw i; wVec:`float$w assets;
-        Rmat mmu wVec
-    }[Rmat;alphaWeights;assets] each til nAlphas;
-    alphaRets:flip alphaRets;  // T x nAlphas
+    // Alpha returns: use actual time series if provided, else proxy from char weights
+    // Actual returns (from prevSig*pxDiff) preserve timing; proxy (Rmat mmu wVec) does not
+    alphaRets:$[`alphaRetMat in key cfg;
+        cfg`alphaRetMat;
+        // Proxy: char weights x asset returns (loses timing info)
+        0f^flip {[Rmat;aw;assets;i]
+            w:aw i; wVec:`float$0f^w assets;
+            Rmat mmu wVec
+        }[Rmat;alphaWeights;assets] each til nAlphas];
+    alphaRets:0f^alphaRets;  // fill any residual nulls
 
-    // Alpha statistics
-    alphaMu:avg each flip alphaRets;
-    alphaC:covmat alphaRets;
+    // Alpha statistics (from actual returns when available)
+    alphaMu:0f^avg each flip alphaRets;
+    alphaC:0f^covmat alphaRets;
 
     // PC exposures of each alpha - result is nAlphas x k (list of k-vectors)
     // alphaPCExp[i] = PC exposures for alpha i
     // alphaPCExp[;j] = all alphas' exposure to PC j
-    L:p`loadings;
+    L:0f^p`loadings;
     alphaPCExp:{[L;aw;assets;i]
-        w:aw i; wVec:`float$w assets;
+        w:aw i; wVec:`float$0f^w assets;
         (flip L) mmu wVec
     }[L;alphaWeights;assets] each til nAlphas;
 
@@ -853,8 +856,10 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
         // functional: select avg sc by yc from t
         r:0!?[t;();(enlist yc)!enlist yc;(enlist`v)!enlist(avg;sc)];
         w:r[yc]!r`v;
+        w:0f^w;  // fill null avg with 0
         w:allSyms#(allSyms!count[allSyms]#0f),w;
-        w%sum abs w};
+        s:sum abs w;
+        $[s>0; w%s; allSyms!(count allSyms)#1f%count allSyms]};
     charWeights:computeWeights[sc;yc;allSyms] each alphaList;
     alphas:alphaNames!charWeights;
 
@@ -879,13 +884,16 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
     // Run PCA (dc column is excluded automatically by pca)
     p:pca[R;cfg`k;()!()];
 
-    // Run optimization
-    optCfg:`objective`nIter!(cfg`objective;cfg`nIter);
-    result:alphaOptimize[alphas;R;p;pcLimits;optCfg];
-
-    // Join alpha return tables into wide format
+    // Build wide alpha return table (actual returns from prevSig*pxDiff)
     alphaRetWide:flip (enlist dc)!enlist allDates;
     i:0; while[i<count alphaNames; alphaRetWide:alphaRetWide lj alphaRetTables[i]; i+:1];
+
+    // Extract actual alpha return matrix (T x nAlphas) for optimization
+    alphaRetMat:flip 0f^value alphaNames#flip alphaRetWide;
+
+    // Run optimization with actual alpha returns
+    optCfg:`objective`nIter`alphaRetMat!(cfg`objective;cfg`nIter;alphaRetMat);
+    result:alphaOptimize[alphas;R;p;pcLimits;optCfg];
 
     // Compute stats for each alpha's return column
     computeStats:{[t;nm] ret:t nm; `ret`vol`sharpe!(avg ret;dev ret;avg[ret]%dev[ret]+1e-10)};
