@@ -35,7 +35,14 @@ from .core import (
     implied_straddle_breakevens_df,
     add_alpha_metrics_df,
 )
-from .optimizer import AlphaOptimizerConfig, alpha_tables_to_returns_df, optimize_portfolio_with_pca
+from .optimizer import (
+    AlphaOptimizerConfig,
+    alpha_tables_to_returns_df,
+    optimize_portfolio_with_pca,
+    optimizer_result_to_dict,
+    optimizer_result_table,
+    optimizer_result_tables,
+)
 
 __all__ = [
     "ExpirySurface",
@@ -76,4 +83,7 @@ __all__ = [
     "AlphaOptimizerConfig",
     "alpha_tables_to_returns_df",
     "optimize_portfolio_with_pca",
+    "optimizer_result_to_dict",
+    "optimizer_result_table",
+    "optimizer_result_tables",
 ]
