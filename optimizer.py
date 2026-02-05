@@ -651,16 +651,27 @@ def optimize_portfolio_with_pca(
             pc_targets_i = pc_targets
             pc_tolerance_i = pc_tolerance
 
+        use_pc_constraints = False
+        if pc_limits_i is not None and np.any(np.isfinite(pc_limits_i)):
+            use_pc_constraints = True
+        if pc_targets_i is not None and np.any(np.isfinite(pc_targets_i)):
+            use_pc_constraints = True
+
+        pc_loadings_opt = loadings_i if use_pc_constraints else None
+        pc_limits_opt = pc_limits_i if use_pc_constraints else None
+        pc_targets_opt = pc_targets_i if use_pc_constraints else None
+        pc_tolerance_opt = pc_tolerance_i if use_pc_constraints else None
+
         w = _max_sharpe_weights(
             mu,
             cov,
             bounds=cfg.weight_bounds,
             sum_to_one=cfg.sum_to_one,
-            pc_loadings=loadings_i,
-            pc_limits=pc_limits_i,
+            pc_loadings=pc_loadings_opt,
+            pc_limits=pc_limits_opt,
             risk_free=cfg.risk_free,
-            pc_targets=pc_targets_i,
-            pc_target_tolerance=pc_tolerance_i,
+            pc_targets=pc_targets_opt,
+            pc_target_tolerance=pc_tolerance_opt,
             pc_target_penalty=cfg.pc_target_penalty,
             target_vol=cfg.target_vol,
             target_vol_penalty=cfg.target_vol_penalty,
