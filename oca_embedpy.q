@@ -88,6 +88,13 @@ normalize_cfg:{[cfg]
   $[cfg~(::); ()!(); cfg]
  }
 
+to_sym:{[x]
+  t:type x;
+  $[t=-11h; x;
+    t=11h; first x;
+    `$string x]
+ }
+
 as_tables:{[tbls]
   $[98h=type tbls; enlist tbls;
     99h=type tbls; enlist 0!tbls;
@@ -97,11 +104,16 @@ as_tables:{[tbls]
 
 full_cfg:{[tbls; cfg]
   c: normalize_cfg cfg;
-  dtc:$[`dt_col in key c; c`dt_col; `dt];
-  dtc:$[10h=type dtc; `$dtc; dtc];
   ts: as_tables tbls;
-  if[not dtc in cols first ts; dtc:`time];
-  n: count distinct raze {x dtc} each ts;
+  if[0=count ts; '"tables must be non-empty"];
+  dtc:$[`dt_col in key c; c`dt_col; `dt];
+  dtc: .oca.to_sym dtc;
+  if[not dtc in cols first ts;
+    if[`dt_col in key c; '"dt_col not found in tables"];
+    dtc:$[`dt in cols first ts; `dt; `time];
+  ];
+  if[not all dtc in/: cols each ts; '"dt column not found in all tables"];
+  n: count distinct raze ({[t;c] t c})'[ts; (count ts)#enlist dtc];
   c[`window]: n;
   c[`min_periods]: n;
   c
