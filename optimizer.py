@@ -473,3 +473,64 @@ def optimizer_result_to_dict(
         else:
             out[key] = val
     return out
+
+
+def optimizer_result_table(
+    result: Dict[str, object],
+    key: str,
+    date_col: str = "dt",
+    date_mode: str = "datetime64[D]",
+    epoch: str = "2000-01-01",
+) -> "pd.DataFrame":  # type: ignore[name-defined]
+    """
+    Return a single result entry as a DataFrame with index moved to `date_col`.
+    """
+    if not HAVE_PANDAS:
+        raise RuntimeError("pandas is required for optimizer_result_table.")
+    if key not in result:
+        raise KeyError(f"result has no key '{key}'.")
+    val = result[key]
+    epoch_ts = pd.Timestamp(epoch)  # type: ignore[union-attr]
+
+    def _index_to_col(df: "pd.DataFrame") -> "pd.DataFrame":  # type: ignore[name-defined]
+        df = df.copy()
+        idx = df.index
+        if np.issubdtype(idx.dtype, np.datetime64):
+            if date_mode == "days":
+                df[date_col] = (idx - epoch_ts).days.astype("int32")
+            else:
+                df[date_col] = idx.values.astype("datetime64[D]")
+        else:
+            df[date_col] = idx
+        return df.reset_index(drop=True)
+
+    if HAVE_PANDAS and isinstance(val, pd.Series):  # type: ignore[union-attr]
+        return _index_to_col(val.to_frame())
+    if HAVE_PANDAS and isinstance(val, pd.DataFrame):  # type: ignore[union-attr]
+        return _index_to_col(val)
+    if isinstance(val, np.ndarray):
+        if val.ndim == 1:
+            df = pd.DataFrame({key: val})
+        else:
+            cols = [f"c{i}" for i in range(val.shape[1])]
+            df = pd.DataFrame(val, columns=cols)
+        return _index_to_col(df)
+    return pd.DataFrame({key: [val]})
+
+
+def optimizer_result_tables(
+    result: Dict[str, object],
+    date_col: str = "dt",
+    date_mode: str = "datetime64[D]",
+    epoch: str = "2000-01-01",
+) -> Tuple[List[str], List["pd.DataFrame"]]:  # type: ignore[name-defined]
+    """
+    Return (names, tables) where each table is a DataFrame (index moved to `date_col`).
+    This is intended for embedPy to convert to a list of q tables without nested dicts.
+    """
+    names: List[str] = []
+    tables: List["pd.DataFrame"] = []  # type: ignore[name-defined]
+    for key in sorted(result.keys()):
+        names.append(key)
+        tables.append(optimizer_result_table(result, key, date_col=date_col, date_mode=date_mode, epoch=epoch))
+    return names, tables
