@@ -23,6 +23,28 @@
 // Covariance matrix (avoid dependency on kdbtools.q)
 covmat:{[X] n:count X; mu:avg each flip X; Xc:X -\: mu; (flip Xc) mmu Xc % n-1}
 
+// Ledoit-Wolf shrinkage estimator
+// Shrinks sample covariance toward scaled identity: (1-d)*S + d*mu*I
+// @param X - data matrix (T x p)
+// @return shrunk covariance matrix (p x p)
+shrinkCov:{[X]
+    T:count X; p:count first X;
+    mu0:avg each flip X;
+    Xc:X -\: mu0;
+    S:(flip Xc) mmu Xc % T-1;
+    // Target: mu * I where mu = trace(S)/p
+    mu:(sum S@'til p) % p;
+    // d^2 = ||S - mu*I||_F^2 = ||S||_F^2 - p*mu^2
+    frobS:sum sum S*S;
+    d2:frobS - p*mu*mu;
+    // b-bar^2: (1/T^2) * sum_t ||x_t x_t' - S||_F^2
+    // = (sum_t (||x_t||^2)^2 + (2-T)*||S||_F^2) / T^2
+    norms:{x wsum x} each Xc;
+    b2:((sum norms*norms) + (2-T)*frobS) % T*T;
+    // Shrinkage intensity clamped to [0,1]
+    delta:0f|1f&b2 % d2+1e-20;
+    ((1-delta)*S) + delta*mu*`float$(til p)=/:til p}
+
 // =============================================================================
 // CORE PCA COMPUTATION
 // =============================================================================
@@ -453,8 +475,8 @@ riskParityPC:{[R;p;cfg]
 //              objective: `maxSharpe`minVar`riskParity`maxRet`minTE
 // @return dict with optimal alpha weights and diagnostics
 alphaOptimize:{[alphas;R;p;pcLimits;cfg]
-    defaults:`objective`nIter`tol`lo`hi`lambda`targetRet`rf`excludeCols!(
-        `maxSharpe;5000;1e-6;0f;1f;0.01;0n;0f;`dt`date`time);
+    defaults:`objective`nIter`tol`lo`hi`lambda`targetRet`rf`shrink`excludeCols!(
+        `maxSharpe;5000;1e-6;0f;1f;0.01;0n;0f;1b;`dt`date`time);
     cfg:defaults,cfg;
 
     // Extract alpha names and weights
@@ -484,7 +506,7 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
 
     // Alpha statistics (from actual returns when available)
     alphaMu:0f^avg each flip alphaRets;
-    alphaC:0f^covmat alphaRets;
+    alphaC:0f^$[cfg`shrink; shrinkCov alphaRets; covmat alphaRets];
 
     // PC exposures of each alpha - result is nAlphas x k (list of k-vectors)
     // alphaPCExp[i] = PC exposures for alpha i
@@ -938,6 +960,7 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
     cfg:defaults,cfg;
 
     sc:cfg`sigCol; rc:cfg`retCol; yc:cfg`symCol; dc:cfg`dtCol; pc:cfg`prevSigCol;
+    t0:.z.p;
 
     n:count alphaList;
     if[n<>count alphaNames; '"alphaList and alphaNames must have same length"];
@@ -960,8 +983,10 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
     // Compute alpha returns: sum(prevSig * pxDiff) by dtCol, named after alpha
     computeAlphaRet:{[dc;pc;rc;t;nm] ?[t;();(enlist dc)!enlist dc;(enlist nm)!enlist(sum;(*;pc;rc))]};
     alphaRetTables:computeAlphaRet[dc;pc;rc]'[alphaList;alphaNames];
+    -1 "  [timing] weights+alphaRet: ",string `long$(`long$(.z.p)-t0)%1000000;
 
     // Build asset returns: pivot retCol by symCol
+    t1:.z.p;
     combined:raze alphaList;
     // functional: select last rc by dc, yc from combined
     assetRetLong:0!?[combined;();(dc,yc)!(dc;yc);(enlist rc)!enlist(last;rc)];
@@ -974,20 +999,26 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
         allSyms#(allSyms!count[allSyms]#0f),r};
     dicts:pivotRow[assetRetLong;yc;rc;allSyms] each gidx allDates;
     R:flip (enlist[dc]!enlist allDates),allSyms!flip value each dicts;
+    -1 "  [timing] assetRetPivot:   ",string `long$(`long$(.z.p)-t1)%1000000;
 
     // Run PCA (dc column is excluded automatically by pca)
+    t2:.z.p;
     p:pca[R;cfg`k;()!()];
+    -1 "  [timing] PCA:             ",string `long$(`long$(.z.p)-t2)%1000000;
 
     // Build wide alpha return table (actual returns from prevSig*pxDiff)
+    t3:.z.p;
     alphaRetWide:flip (enlist dc)!enlist allDates;
     i:0; while[i<count alphaNames; alphaRetWide:alphaRetWide lj alphaRetTables[i]; i+:1];
 
     // Extract actual alpha return matrix (T x nAlphas) for optimization
     alphaRetMat:flip 0f^value alphaNames#flip alphaRetWide;
+    -1 "  [timing] alphaRetJoin:    ",string `long$(`long$(.z.p)-t3)%1000000;
 
     // Build signal matrices for gross-normalized scoring
     // sigMats: list of nAlphas T x S matrices (prevSig per alpha)
     // pxMat: T x S matrix (shared asset returns)
+    t4:.z.p;
     buildSigMat:{[dc;pc;yc;allDates;allSyms;t]
         long:0!?[t;();(dc,yc)!(dc;yc);(enlist`v)!enlist(last;pc)];
         gidx:group long dc;
@@ -998,10 +1029,14 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
         0f^value each dicts};  // T x S matrix
     sigMats:buildSigMat[dc;pc;yc;allDates;allSyms] each alphaList;
     pxMat:flip 0f^value allSyms#flip R;  // T x S matrix
+    -1 "  [timing] buildSigMats:    ",string `long$(`long$(.z.p)-t4)%1000000;
 
     // Run optimization with actual alpha returns + signal matrices
+    t5:.z.p;
     optCfg:`objective`nIter`alphaRetMat`signalMats`pxMat!(cfg`objective;cfg`nIter;alphaRetMat;sigMats;pxMat);
     result:alphaOptimize[alphas;R;p;pcLimits;optCfg];
+    -1 "  [timing] optimize:        ",string `long$(`long$(.z.p)-t5)%1000000;
+    -1 "  [timing] TOTAL:           ",string `long$(`long$(.z.p)-t0)%1000000;
 
     // Compute stats for each alpha's return column
     computeStats:{[t;nm] ret:t nm; `ret`vol`sharpe!(avg ret;dev ret;avg[ret]%dev[ret]+1e-10)};
