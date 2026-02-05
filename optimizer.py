@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linprog, minimize
 
 try:
     import pandas as pd  # type: ignore[import-not-found]
@@ -85,6 +85,10 @@ class AlphaOptimizerConfig:
 
     rebalance_step: int = 1
     n_jobs: int = 1
+
+    cvar_alpha: float = 0.95
+    cvar_lambda: float = 1.0
+    cvar_target_return: Optional[float] = None
 
 
 def _ensure_pandas() -> None:
@@ -780,6 +784,392 @@ def optimize_portfolio_with_pca(
             columns=[f"PC{i+1}" for i in range(loadings.shape[1])],
         )
     return result
+
+
+def optimize_portfolio(
+    tables: Sequence[object],
+    config: Optional[object] = None,
+) -> Dict[str, object]:
+    """
+    Optimize max Sharpe weights without PCA constraints.
+
+    Returns a dict with:
+      - returns: per-symbol returns (DataFrame)
+      - alpha_rolling_sharpe: rolling Sharpe per symbol (DataFrame)
+      - portfolio_weights: per-symbol weights by date (DataFrame)
+      - portfolio_returns: portfolio return series (Series)
+      - portfolio_rolling_sharpe: rolling Sharpe of portfolio (DataFrame)
+    """
+    _ensure_pandas()
+    cfg = _config_from_object(config)
+    returns_df = alpha_tables_to_returns_df(tables, cfg)
+
+    if cfg.pc_exposure_limits is not None or cfg.pc_exposure_targets is not None or cfg.pc_target_tolerance is not None:
+        raise ValueError("PC constraints are not supported in optimize_portfolio. Use optimize_portfolio_with_pca.")
+
+    window = cfg.window
+    min_periods = cfg.min_periods or window
+    dates = returns_df.index
+
+    weights_list: List[np.ndarray] = []
+    weight_dates: List[object] = []
+    port_rets: List[float] = []
+
+    rebalance_step = max(1, int(cfg.rebalance_step))
+    n_jobs = int(cfg.n_jobs) if cfg.n_jobs is not None else 1
+    if n_jobs == 0:
+        n_jobs = os.cpu_count() or 1
+    if n_jobs < 0:
+        n_jobs = max(1, (os.cpu_count() or 1) + n_jobs + 1)
+    n_jobs = max(1, n_jobs)
+    if n_jobs != 1 and cfg.turnover_penalty > 0.0:
+        raise ValueError("n_jobs>1 is not supported when turnover_penalty > 0.")
+
+    def _solve_window(
+        i: int,
+        prev_weights: Optional[np.ndarray],
+        turnover_penalty: float,
+    ) -> Tuple[int, np.ndarray]:
+        start = max(0, i + 1 - window)
+        window_df = returns_df.iloc[start : i + 1]
+        window_x = window_df.to_numpy(dtype=float)
+        if cfg.robust_method:
+            if cfg.robust_method.lower() not in {"winsor", "winsorize"}:
+                raise ValueError("robust_method must be 'winsor' if set.")
+            window_x = _robust_winsorize(window_x, cfg.robust_clip, cfg.robust_scale)
+
+        ewma_halflife = cfg.ewma_halflife
+        ewma_span = cfg.ewma_span
+        cov_shrink = cfg.cov_shrinkage
+        if cfg.regime_mode:
+            if cfg.regime_mode.lower() not in {"vol_ratio", "vol"}:
+                raise ValueError("regime_mode must be 'vol_ratio' if set.")
+            ewma_halflife, ewma_span, cov_shrink = _regime_adjustments(
+                window_x,
+                cfg.regime_short_window,
+                cfg.regime_long_window,
+                ewma_halflife,
+                ewma_span,
+                cov_shrink,
+                cfg.regime_halflife_bounds,
+                cfg.regime_shrinkage_bounds,
+            )
+
+        ewma_w = _ewma_weights(window_x.shape[0], ewma_halflife, ewma_span)
+        if ewma_w is None:
+            mu = window_x.mean(axis=0)
+            cov = np.cov(window_x, rowvar=False)
+        else:
+            mu, cov = _weighted_mean_cov(window_x, ewma_w)
+
+        if cfg.reliability_mode:
+            n_eff = _effective_sample_size(ewma_w, window_x.shape[0])
+            rel_w = _reliability_weights(
+                mu,
+                cov,
+                n_eff,
+                cfg.reliability_mode,
+                cfg.reliability_clip,
+                cfg.reliability_floor,
+                cfg.reliability_power,
+            )
+            mu = mu * rel_w
+
+        if cfg.mean_shrinkage:
+            mu = _shrink_mean(mu, float(cfg.mean_shrinkage), cfg.mean_shrinkage_target)
+        if cov_shrink:
+            cov = _shrink_cov(cov, float(cov_shrink), cfg.cov_shrinkage_target)
+
+        w = _max_sharpe_weights(
+            mu,
+            cov,
+            bounds=cfg.weight_bounds,
+            sum_to_one=cfg.sum_to_one,
+            pc_loadings=None,
+            pc_limits=None,
+            risk_free=cfg.risk_free,
+            pc_targets=None,
+            pc_target_tolerance=None,
+            pc_target_penalty=cfg.pc_target_penalty,
+            target_vol=cfg.target_vol,
+            target_vol_penalty=cfg.target_vol_penalty,
+            turnover_penalty=turnover_penalty,
+            weight_l2_penalty=cfg.weight_l2_penalty,
+            prev_weights=prev_weights,
+            annualization=cfg.annualization,
+        )
+        return i, w
+
+    prev_w: Optional[np.ndarray] = None
+
+    start_idx = min_periods - 1
+    if start_idx < 0:
+        start_idx = 0
+    eligible_indices = list(range(start_idx, len(returns_df)))
+    rebalance_indices = [i for i in eligible_indices if (i - start_idx) % rebalance_step == 0]
+
+    if n_jobs == 1 or len(rebalance_indices) <= 1:
+        for i in range(len(returns_df)):
+            if i + 1 < min_periods:
+                continue
+            do_rebalance = prev_w is None
+            if not do_rebalance:
+                offset = (i + 1 - min_periods)
+                do_rebalance = (offset % rebalance_step) == 0
+
+            if do_rebalance:
+                _, w = _solve_window(i, prev_w, cfg.turnover_penalty)
+                prev_w = w
+            else:
+                w = prev_w
+
+            weights_list.append(w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ w))
+    else:
+        results: Dict[int, np.ndarray] = {}
+        max_workers = min(n_jobs, len(rebalance_indices))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_solve_window, i, None, 0.0) for i in rebalance_indices]
+            for fut in as_completed(futures):
+                idx, w_i = fut.result()
+                results[idx] = w_i
+
+        last_w: Optional[np.ndarray] = None
+        for i in eligible_indices:
+            if i in results:
+                last_w = results[i]
+            if last_w is None:
+                continue
+            weights_list.append(last_w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ last_w))
+
+    weights_df = pd.DataFrame(weights_list, index=weight_dates, columns=returns_df.columns)  # type: ignore[union-attr]
+    port_series = pd.Series(port_rets, index=weight_dates, name="portfolio_return")  # type: ignore[union-attr]
+    sharpe_df = rolling_sharpe(returns_df, window=window, min_periods=min_periods, annualization=cfg.annualization)
+    port_sharpe = rolling_sharpe(port_series.to_frame(), window=window, min_periods=min_periods, annualization=cfg.annualization)
+
+    return {
+        "returns": returns_df,
+        "alpha_rolling_sharpe": sharpe_df,
+        "portfolio_weights": weights_df,
+        "portfolio_returns": port_series,
+        "portfolio_rolling_sharpe": port_sharpe,
+    }
+
+
+def optimize_portfolio_cvar(
+    tables: Sequence[object],
+    config: Optional[object] = None,
+) -> Dict[str, object]:
+    """
+    Optimize weights using a mean-CVaR objective (or min-CVaR with target return).
+
+    Constraints supported:
+      - weight bounds
+      - sum_to_one
+      - optional target return (cvar_target_return)
+
+    Not supported:
+      - PCA constraints
+      - turnover_penalty
+      - weight_l2_penalty
+      - target_vol
+    """
+    _ensure_pandas()
+    cfg = _config_from_object(config)
+    returns_df = alpha_tables_to_returns_df(tables, cfg)
+
+    if cfg.pc_exposure_limits is not None or cfg.pc_exposure_targets is not None or cfg.pc_target_tolerance is not None:
+        raise ValueError("PC constraints are not supported in optimize_portfolio_cvar.")
+    if cfg.turnover_penalty and cfg.turnover_penalty != 0.0:
+        raise ValueError("turnover_penalty is not supported in optimize_portfolio_cvar.")
+    if cfg.weight_l2_penalty and cfg.weight_l2_penalty != 0.0:
+        raise ValueError("weight_l2_penalty is not supported in optimize_portfolio_cvar.")
+    if cfg.target_vol is not None:
+        raise ValueError("target_vol is not supported in optimize_portfolio_cvar.")
+    if cfg.cvar_alpha <= 0.0 or cfg.cvar_alpha >= 1.0:
+        raise ValueError("cvar_alpha must be in (0, 1).")
+    if cfg.cvar_lambda is None or cfg.cvar_lambda <= 0.0:
+        raise ValueError("cvar_lambda must be positive.")
+
+    window = cfg.window
+    min_periods = cfg.min_periods or window
+    dates = returns_df.index
+
+    weights_list: List[np.ndarray] = []
+    weight_dates: List[object] = []
+    port_rets: List[float] = []
+
+    rebalance_step = max(1, int(cfg.rebalance_step))
+    n_jobs = int(cfg.n_jobs) if cfg.n_jobs is not None else 1
+    if n_jobs == 0:
+        n_jobs = os.cpu_count() or 1
+    if n_jobs < 0:
+        n_jobs = max(1, (os.cpu_count() or 1) + n_jobs + 1)
+    n_jobs = max(1, n_jobs)
+
+    def _solve_window(i: int) -> Tuple[int, np.ndarray]:
+        start = max(0, i + 1 - window)
+        window_df = returns_df.iloc[start : i + 1]
+        window_x = window_df.to_numpy(dtype=float)
+        if cfg.robust_method:
+            if cfg.robust_method.lower() not in {"winsor", "winsorize"}:
+                raise ValueError("robust_method must be 'winsor' if set.")
+            window_x = _robust_winsorize(window_x, cfg.robust_clip, cfg.robust_scale)
+
+        ewma_halflife = cfg.ewma_halflife
+        ewma_span = cfg.ewma_span
+        cov_shrink = cfg.cov_shrinkage
+        if cfg.regime_mode:
+            if cfg.regime_mode.lower() not in {"vol_ratio", "vol"}:
+                raise ValueError("regime_mode must be 'vol_ratio' if set.")
+            ewma_halflife, ewma_span, cov_shrink = _regime_adjustments(
+                window_x,
+                cfg.regime_short_window,
+                cfg.regime_long_window,
+                ewma_halflife,
+                ewma_span,
+                cov_shrink,
+                cfg.regime_halflife_bounds,
+                cfg.regime_shrinkage_bounds,
+            )
+
+        ewma_w = _ewma_weights(window_x.shape[0], ewma_halflife, ewma_span)
+        if ewma_w is None:
+            p = np.full(window_x.shape[0], 1.0 / float(window_x.shape[0]))
+            mu = window_x.mean(axis=0)
+            cov = np.cov(window_x, rowvar=False)
+        else:
+            p = ewma_w
+            mu, cov = _weighted_mean_cov(window_x, ewma_w)
+
+        if cfg.reliability_mode:
+            n_eff = _effective_sample_size(ewma_w, window_x.shape[0])
+            rel_w = _reliability_weights(
+                mu,
+                cov,
+                n_eff,
+                cfg.reliability_mode,
+                cfg.reliability_clip,
+                cfg.reliability_floor,
+                cfg.reliability_power,
+            )
+            mu = mu * rel_w
+
+        if cfg.mean_shrinkage:
+            mu = _shrink_mean(mu, float(cfg.mean_shrinkage), cfg.mean_shrinkage_target)
+
+        t_count, n_assets = window_x.shape
+        alpha = float(cfg.cvar_alpha)
+        lam = float(cfg.cvar_lambda)
+
+        # Variables: [w (n_assets), z (1), u (t_count)]
+        total_vars = n_assets + 1 + t_count
+        c = np.zeros(total_vars, dtype=float)
+        if cfg.cvar_target_return is None:
+            c[:n_assets] = -mu
+        c[n_assets] = lam
+        c[n_assets + 1 :] = lam * (p / (1.0 - alpha))
+
+        # u_t >= -r_t w - z  =>  -r_t w - z - u_t <= 0
+        A_ub = np.zeros((t_count + t_count + (1 if cfg.cvar_target_return is not None else 0), total_vars), dtype=float)
+        b_ub = np.zeros(A_ub.shape[0], dtype=float)
+        A_ub[:t_count, :n_assets] = -window_x
+        A_ub[:t_count, n_assets] = -1.0
+        A_ub[:t_count, n_assets + 1 :] = -np.eye(t_count)
+        # u_t >= 0 => -u_t <= 0
+        A_ub[t_count : 2 * t_count, n_assets + 1 :] = -np.eye(t_count)
+        # target return constraint
+        if cfg.cvar_target_return is not None:
+            A_ub[-1, :n_assets] = -mu
+            b_ub[-1] = -float(cfg.cvar_target_return)
+
+        A_eq = None
+        b_eq = None
+        if cfg.sum_to_one:
+            A_eq = np.zeros((1, total_vars), dtype=float)
+            A_eq[0, :n_assets] = 1.0
+            b_eq = np.array([1.0], dtype=float)
+
+        bounds: List[Tuple[Optional[float], Optional[float]]] = []
+        w_lo, w_hi = cfg.weight_bounds
+        for _ in range(n_assets):
+            bounds.append((float(w_lo), float(w_hi)))
+        bounds.append((None, None))  # z
+        bounds.extend([(0.0, None) for _ in range(t_count)])  # u
+
+        res = linprog(
+            c,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds,
+            method="highs",
+        )
+        if not res.success or res.x is None:
+            raise RuntimeError(f"CVaR optimization failed: {res.message}")
+        w = res.x[:n_assets]
+        return i, w
+
+    start_idx = min_periods - 1
+    if start_idx < 0:
+        start_idx = 0
+    eligible_indices = list(range(start_idx, len(returns_df)))
+    rebalance_indices = [i for i in eligible_indices if (i - start_idx) % rebalance_step == 0]
+
+    if n_jobs == 1 or len(rebalance_indices) <= 1:
+        last_w: Optional[np.ndarray] = None
+        for i in range(len(returns_df)):
+            if i + 1 < min_periods:
+                continue
+            do_rebalance = last_w is None
+            if not do_rebalance:
+                offset = (i + 1 - min_periods)
+                do_rebalance = (offset % rebalance_step) == 0
+
+            if do_rebalance:
+                _, w = _solve_window(i)
+                last_w = w
+            else:
+                w = last_w
+
+            weights_list.append(w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ w))
+    else:
+        results: Dict[int, np.ndarray] = {}
+        max_workers = min(n_jobs, len(rebalance_indices))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_solve_window, i) for i in rebalance_indices]
+            for fut in as_completed(futures):
+                idx, w_i = fut.result()
+                results[idx] = w_i
+
+        last_w = None
+        for i in eligible_indices:
+            if i in results:
+                last_w = results[i]
+            if last_w is None:
+                continue
+            weights_list.append(last_w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ last_w))
+
+    weights_df = pd.DataFrame(weights_list, index=weight_dates, columns=returns_df.columns)  # type: ignore[union-attr]
+    port_series = pd.Series(port_rets, index=weight_dates, name="portfolio_return")  # type: ignore[union-attr]
+    sharpe_df = rolling_sharpe(returns_df, window=window, min_periods=min_periods, annualization=cfg.annualization)
+    port_sharpe = rolling_sharpe(port_series.to_frame(), window=window, min_periods=min_periods, annualization=cfg.annualization)
+
+    return {
+        "returns": returns_df,
+        "alpha_rolling_sharpe": sharpe_df,
+        "portfolio_weights": weights_df,
+        "portfolio_returns": port_series,
+        "portfolio_rolling_sharpe": port_sharpe,
+    }
 
 
 def optimizer_result_to_dict(
