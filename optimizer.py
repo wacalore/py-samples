@@ -6,6 +6,8 @@ Alpha portfolio optimizer with PCA-aware constraints.
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -82,6 +84,7 @@ class AlphaOptimizerConfig:
     regime_shrinkage_bounds: Tuple[float, float] = (0.5, 2.0)
 
     rebalance_step: int = 1
+    n_jobs: int = 1
 
 
 def _ensure_pandas() -> None:
@@ -585,128 +588,170 @@ def optimize_portfolio_with_pca(
     pc_exposure_list: List[np.ndarray] = []
 
     rebalance_step = max(1, int(cfg.rebalance_step))
-    prev_w: Optional[np.ndarray] = None
-    prev_loadings: Optional[np.ndarray] = loadings if cfg.pca_mode == "full" else None
-    prev_pc_limits: Optional[np.ndarray] = pc_limits if cfg.pca_mode == "full" else None
-    prev_pc_targets: Optional[np.ndarray] = pc_targets if cfg.pca_mode == "full" else None
-    prev_pc_tolerance: Optional[np.ndarray] = pc_tolerance if cfg.pca_mode == "full" else None
+    n_jobs = int(cfg.n_jobs) if cfg.n_jobs is not None else 1
+    if n_jobs == 0:
+        n_jobs = os.cpu_count() or 1
+    if n_jobs < 0:
+        n_jobs = max(1, (os.cpu_count() or 1) + n_jobs + 1)
+    n_jobs = max(1, n_jobs)
+    if n_jobs != 1 and cfg.turnover_penalty > 0.0:
+        raise ValueError("n_jobs>1 is not supported when turnover_penalty > 0.")
 
-    for i in range(len(returns_df)):
-        if i + 1 < min_periods:
-            continue
-        do_rebalance = prev_w is None
-        if not do_rebalance:
-            offset = (i + 1 - min_periods)
-            do_rebalance = (offset % rebalance_step) == 0
+    def _solve_window(
+        i: int,
+        prev_weights: Optional[np.ndarray],
+        turnover_penalty: float,
+    ) -> Tuple[int, np.ndarray, Optional[np.ndarray]]:
+        start = max(0, i + 1 - window)
+        window_df = returns_df.iloc[start : i + 1]
+        window_x = window_df.to_numpy(dtype=float)
+        if cfg.robust_method:
+            if cfg.robust_method.lower() not in {"winsor", "winsorize"}:
+                raise ValueError("robust_method must be 'winsor' if set.")
+            window_x = _robust_winsorize(window_x, cfg.robust_clip, cfg.robust_scale)
 
-        if do_rebalance:
-            start = max(0, i + 1 - window)
-            window_df = returns_df.iloc[start : i + 1]
-            window_x = window_df.to_numpy(dtype=float)
-            if cfg.robust_method:
-                if cfg.robust_method.lower() not in {"winsor", "winsorize"}:
-                    raise ValueError("robust_method must be 'winsor' if set.")
-                window_x = _robust_winsorize(window_x, cfg.robust_clip, cfg.robust_scale)
+        ewma_halflife = cfg.ewma_halflife
+        ewma_span = cfg.ewma_span
+        cov_shrink = cfg.cov_shrinkage
+        if cfg.regime_mode:
+            if cfg.regime_mode.lower() not in {"vol_ratio", "vol"}:
+                raise ValueError("regime_mode must be 'vol_ratio' if set.")
+            ewma_halflife, ewma_span, cov_shrink = _regime_adjustments(
+                window_x,
+                cfg.regime_short_window,
+                cfg.regime_long_window,
+                ewma_halflife,
+                ewma_span,
+                cov_shrink,
+                cfg.regime_halflife_bounds,
+                cfg.regime_shrinkage_bounds,
+            )
 
-            ewma_halflife = cfg.ewma_halflife
-            ewma_span = cfg.ewma_span
-            cov_shrink = cfg.cov_shrinkage
-            if cfg.regime_mode:
-                if cfg.regime_mode.lower() not in {"vol_ratio", "vol"}:
-                    raise ValueError("regime_mode must be 'vol_ratio' if set.")
-                ewma_halflife, ewma_span, cov_shrink = _regime_adjustments(
-                    window_x,
-                    cfg.regime_short_window,
-                    cfg.regime_long_window,
-                    ewma_halflife,
-                    ewma_span,
-                    cov_shrink,
-                    cfg.regime_halflife_bounds,
-                    cfg.regime_shrinkage_bounds,
-                )
+        ewma_w = _ewma_weights(window_x.shape[0], ewma_halflife, ewma_span)
+        if ewma_w is None:
+            mu = window_x.mean(axis=0)
+            cov = np.cov(window_x, rowvar=False)
+        else:
+            mu, cov = _weighted_mean_cov(window_x, ewma_w)
 
-            ewma_w = _ewma_weights(window_x.shape[0], ewma_halflife, ewma_span)
-            if ewma_w is None:
-                mu = window_x.mean(axis=0)
-                cov = np.cov(window_x, rowvar=False)
-            else:
-                mu, cov = _weighted_mean_cov(window_x, ewma_w)
-
-            if cfg.reliability_mode:
-                n_eff = _effective_sample_size(ewma_w, window_x.shape[0])
-                rel_w = _reliability_weights(
-                    mu,
-                    cov,
-                    n_eff,
-                    cfg.reliability_mode,
-                    cfg.reliability_clip,
-                    cfg.reliability_floor,
-                    cfg.reliability_power,
-                )
-                mu = mu * rel_w
-
-            if cfg.mean_shrinkage:
-                mu = _shrink_mean(mu, float(cfg.mean_shrinkage), cfg.mean_shrinkage_target)
-            if cov_shrink:
-                cov = _shrink_cov(cov, float(cov_shrink), cfg.cov_shrinkage_target)
-
-            if cfg.pca_mode == "rolling":
-                loadings_i, _, _ = pca_from_returns(
-                    window_df,
-                    n_components=cfg.n_components,
-                    variance_threshold=cfg.variance_threshold,
-                )
-                pc_limits_i = _pc_limits_array(cfg.pc_exposure_limits, loadings_i.shape[1])
-                pc_targets_i = _pc_targets_array(cfg.pc_exposure_targets, loadings_i.shape[1])
-                pc_tolerance_i = _pc_tolerance_array(cfg.pc_target_tolerance, loadings_i.shape[1])
-                prev_loadings = loadings_i
-                prev_pc_limits = pc_limits_i
-                prev_pc_targets = pc_targets_i
-                prev_pc_tolerance = pc_tolerance_i
-            else:
-                loadings_i = prev_loadings if prev_loadings is not None else loadings
-                pc_limits_i = prev_pc_limits if prev_pc_limits is not None else pc_limits
-                pc_targets_i = prev_pc_targets if prev_pc_targets is not None else pc_targets
-                pc_tolerance_i = prev_pc_tolerance if prev_pc_tolerance is not None else pc_tolerance
-
-            use_pc_constraints = False
-            if pc_limits_i is not None and np.any(np.isfinite(pc_limits_i)):
-                use_pc_constraints = True
-            if pc_targets_i is not None and np.any(np.isfinite(pc_targets_i)):
-                use_pc_constraints = True
-
-            pc_loadings_opt = loadings_i if use_pc_constraints else None
-            pc_limits_opt = pc_limits_i if use_pc_constraints else None
-            pc_targets_opt = pc_targets_i if use_pc_constraints else None
-            pc_tolerance_opt = pc_tolerance_i if use_pc_constraints else None
-
-            w = _max_sharpe_weights(
+        if cfg.reliability_mode:
+            n_eff = _effective_sample_size(ewma_w, window_x.shape[0])
+            rel_w = _reliability_weights(
                 mu,
                 cov,
-                bounds=cfg.weight_bounds,
-                sum_to_one=cfg.sum_to_one,
-                pc_loadings=pc_loadings_opt,
-                pc_limits=pc_limits_opt,
-                risk_free=cfg.risk_free,
-                pc_targets=pc_targets_opt,
-                pc_target_tolerance=pc_tolerance_opt,
-                pc_target_penalty=cfg.pc_target_penalty,
-                target_vol=cfg.target_vol,
-                target_vol_penalty=cfg.target_vol_penalty,
-                turnover_penalty=cfg.turnover_penalty,
-                weight_l2_penalty=cfg.weight_l2_penalty,
-                prev_weights=prev_w,
-                annualization=cfg.annualization,
+                n_eff,
+                cfg.reliability_mode,
+                cfg.reliability_clip,
+                cfg.reliability_floor,
+                cfg.reliability_power,
             )
-            prev_w = w
-        else:
-            w = prev_w
+            mu = mu * rel_w
 
-        weights_list.append(w)
-        weight_dates.append(dates[i])
-        port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ w))
-        if prev_loadings is not None:
-            pc_exposure_list.append(prev_loadings.T @ w)
+        if cfg.mean_shrinkage:
+            mu = _shrink_mean(mu, float(cfg.mean_shrinkage), cfg.mean_shrinkage_target)
+        if cov_shrink:
+            cov = _shrink_cov(cov, float(cov_shrink), cfg.cov_shrinkage_target)
+
+        if cfg.pca_mode == "rolling":
+            loadings_i, _, _ = pca_from_returns(
+                window_df,
+                n_components=cfg.n_components,
+                variance_threshold=cfg.variance_threshold,
+            )
+            pc_limits_i = _pc_limits_array(cfg.pc_exposure_limits, loadings_i.shape[1])
+            pc_targets_i = _pc_targets_array(cfg.pc_exposure_targets, loadings_i.shape[1])
+            pc_tolerance_i = _pc_tolerance_array(cfg.pc_target_tolerance, loadings_i.shape[1])
+        else:
+            loadings_i = loadings
+            pc_limits_i = pc_limits
+            pc_targets_i = pc_targets
+            pc_tolerance_i = pc_tolerance
+
+        use_pc_constraints = False
+        if pc_limits_i is not None and np.any(np.isfinite(pc_limits_i)):
+            use_pc_constraints = True
+        if pc_targets_i is not None and np.any(np.isfinite(pc_targets_i)):
+            use_pc_constraints = True
+
+        pc_loadings_opt = loadings_i if use_pc_constraints else None
+        pc_limits_opt = pc_limits_i if use_pc_constraints else None
+        pc_targets_opt = pc_targets_i if use_pc_constraints else None
+        pc_tolerance_opt = pc_tolerance_i if use_pc_constraints else None
+
+        w = _max_sharpe_weights(
+            mu,
+            cov,
+            bounds=cfg.weight_bounds,
+            sum_to_one=cfg.sum_to_one,
+            pc_loadings=pc_loadings_opt,
+            pc_limits=pc_limits_opt,
+            risk_free=cfg.risk_free,
+            pc_targets=pc_targets_opt,
+            pc_target_tolerance=pc_tolerance_opt,
+            pc_target_penalty=cfg.pc_target_penalty,
+            target_vol=cfg.target_vol,
+            target_vol_penalty=cfg.target_vol_penalty,
+            turnover_penalty=turnover_penalty,
+            weight_l2_penalty=cfg.weight_l2_penalty,
+            prev_weights=prev_weights,
+            annualization=cfg.annualization,
+        )
+        return i, w, loadings_i
+
+    prev_w: Optional[np.ndarray] = None
+    prev_loadings: Optional[np.ndarray] = loadings if cfg.pca_mode == "full" else None
+
+    start_idx = min_periods - 1
+    if start_idx < 0:
+        start_idx = 0
+    eligible_indices = list(range(start_idx, len(returns_df)))
+    rebalance_indices = [i for i in eligible_indices if (i - start_idx) % rebalance_step == 0]
+
+    if n_jobs == 1 or len(rebalance_indices) <= 1:
+        for i in range(len(returns_df)):
+            if i + 1 < min_periods:
+                continue
+            do_rebalance = prev_w is None
+            if not do_rebalance:
+                offset = (i + 1 - min_periods)
+                do_rebalance = (offset % rebalance_step) == 0
+
+            if do_rebalance:
+                _, w, loadings_i = _solve_window(i, prev_w, cfg.turnover_penalty)
+                prev_w = w
+                if cfg.pca_mode == "rolling":
+                    prev_loadings = loadings_i
+                else:
+                    prev_loadings = loadings
+            else:
+                w = prev_w
+
+            weights_list.append(w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ w))
+            if prev_loadings is not None:
+                pc_exposure_list.append(prev_loadings.T @ w)
+    else:
+        results: Dict[int, Tuple[np.ndarray, Optional[np.ndarray]]] = {}
+        max_workers = min(n_jobs, len(rebalance_indices))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_solve_window, i, None, 0.0) for i in rebalance_indices]
+            for fut in as_completed(futures):
+                idx, w_i, loadings_i = fut.result()
+                results[idx] = (w_i, loadings_i)
+
+        last_w: Optional[np.ndarray] = None
+        last_loadings: Optional[np.ndarray] = loadings if cfg.pca_mode == "full" else None
+        for i in eligible_indices:
+            if i in results:
+                last_w, last_loadings = results[i]
+            if last_w is None:
+                continue
+            weights_list.append(last_w)
+            weight_dates.append(dates[i])
+            port_rets.append(float(returns_df.iloc[i].to_numpy(dtype=float) @ last_w))
+            if last_loadings is not None:
+                pc_exposure_list.append(last_loadings.T @ last_w)
 
     weights_df = pd.DataFrame(weights_list, index=weight_dates, columns=returns_df.columns)  # type: ignore[union-attr]
     port_series = pd.Series(port_rets, index=weight_dates, name="portfolio_return")  # type: ignore[union-attr]
