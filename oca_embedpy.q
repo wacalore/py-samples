@@ -26,11 +26,12 @@ init:{[libpath; dm; ep]
       epoch_date::"D"$ep_str;
     ];
   ];
-  .p.e "import sys";
+  .p.e "import sys, importlib";
   cmd:raze ("p = r'''"; libpath; "'''");
   .p.e cmd;
   cmd2:raze ("import sys; p = r'''"; libpath; "'''; sys.path.insert(0,p) if p not in sys.path else None");
   .p.e cmd2;
+  .p.e "sys.modules.pop('options_chain_analyzer', None)";
   .p.e "import options_chain_analyzer as oca";
   .p.e "def oca_opt_wrapper(tables, cfg=None): return oca.optimize_portfolio_with_pca(tables, cfg)";
   .p.e "def oca_opt_to_dict(res, date_mode='days', epoch='2000-01-01'): return oca.optimizer_result_to_dict(res, date_mode=date_mode, epoch=epoch)";
