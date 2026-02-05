@@ -32,7 +32,10 @@ from .core import (
     scenario_grid_strategy_df,
     scenario_panel_backtest_df,
     strategy_screener_df,
+    implied_straddle_breakevens_df,
+    add_alpha_metrics_df,
 )
+from .optimizer import AlphaOptimizerConfig, alpha_tables_to_returns_df, optimize_portfolio_with_pca
 
 __all__ = [
     "ExpirySurface",
@@ -68,4 +71,9 @@ __all__ = [
     "scenario_grid_strategy_df",
     "scenario_panel_backtest_df",
     "strategy_screener_df",
+    "implied_straddle_breakevens_df",
+    "add_alpha_metrics_df",
+    "AlphaOptimizerConfig",
+    "alpha_tables_to_returns_df",
+    "optimize_portfolio_with_pca",
 ]
