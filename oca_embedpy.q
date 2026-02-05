@@ -31,6 +31,8 @@ init:{[libpath; dm; ep]
   .p.e cmd;
   cmd2:raze ("import sys; p = r'''"; libpath; "'''; sys.path.insert(0,p) if p not in sys.path else None");
   .p.e cmd2;
+  .p.e "importlib.invalidate_caches()";
+  .p.e "sys.modules.pop('options_chain_analyzer.optimizer', None)";
   .p.e "sys.modules.pop('options_chain_analyzer', None)";
   .p.e "import options_chain_analyzer as oca";
   .p.e "def oca_opt_wrapper(tables, cfg=None): return oca.optimize_portfolio_with_pca(tables, cfg)";
