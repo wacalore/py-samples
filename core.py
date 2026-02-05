@@ -368,6 +368,33 @@ def _prepare_spline_inputs(
     return k_sorted, w_sorted, wts_sorted
 
 
+def _parse_horizons(
+    horizons: Optional[Sequence[object]],
+    day_count: str,
+) -> List[Tuple[str, int]]:
+    if horizons is None:
+        if day_count == "calendar":
+            return [("1d", 1), ("2d", 2), ("1w", 7), ("2w", 14), ("3w", 21), ("1m", 30)]
+        return [("1d", 1), ("2d", 2), ("1w", 5), ("2w", 10), ("3w", 15), ("1m", 21)]
+    if isinstance(horizons, dict):
+        return [(str(k), int(v)) for k, v in horizons.items()]
+    out: List[Tuple[str, int]] = []
+    for idx, h in enumerate(horizons):
+        if isinstance(h, (list, tuple)) and len(h) == 2:
+            out.append((str(h[0]), int(h[1])))
+        else:
+            out.append((f"h{idx}", int(h)))
+    return out
+
+
+def _zscore_series(series: "pd.Series") -> "pd.Series":  # type: ignore[name-defined]
+    mu = series.mean()
+    sd = series.std()
+    if not np.isfinite(sd) or sd <= 1.0e-8:
+        return (series - mu) / 1.0
+    return (series - mu) / sd
+
+
 def validate_options_df(df: "pd.DataFrame") -> "pd.DataFrame":  # type: ignore[name-defined]
     _ensure_pandas()
     missing = _missing_columns(df.columns, OPTIONS_REQUIRED_COLS)
@@ -588,6 +615,225 @@ def fit_surfaces_by_date_contract_df(
         out = out.reindex(df.index)
         return surfaces, out
     return surfaces
+
+
+def implied_straddle_breakevens_df(
+    analytics_df: "pd.DataFrame",  # type: ignore[name-defined]
+    horizons: Optional[Sequence[object]] = None,
+    curve: Optional[Union[ZeroCurve, "pd.DataFrame"]] = None,  # type: ignore[name-defined]
+    contract_col: str = "underlying_ric",
+    day_count: str = "trading",
+) -> "pd.DataFrame":  # type: ignore[name-defined]
+    _ensure_pandas()
+    df = validate_analytics_df(analytics_df)
+    horizon_list = _parse_horizons(horizons, day_count)
+
+    if curve is not None:
+        terms, rates = _curve_arrays_from(curve)
+    else:
+        terms = np.array([])
+        rates = np.array([])
+
+    use_contract = contract_col in df.columns
+    group_cols = ["date"]
+    if use_contract:
+        group_cols.append(contract_col)
+
+    surfaces_by_date = fit_surfaces_by_date_df(df) if not use_contract else None
+    surfaces_by_date_contract = fit_surfaces_by_date_contract_df(df, contract_col=contract_col) if use_contract else None
+
+    rows: List[Dict[str, object]] = []
+    for key, sub in df.groupby(group_cols):
+        if use_contract:
+            dt, contract = key
+            surface = surfaces_by_date_contract[dt][contract]  # type: ignore[index]
+        else:
+            dt = key
+            contract = None
+            surface = surfaces_by_date[dt]  # type: ignore[index]
+
+        underlying = float(sub["underlying"].iloc[0])
+        if curve is not None and terms.size:
+            rate_func = lambda t: float(np.interp(t, terms, rates))
+        elif "rate" in sub.columns and "T" in sub.columns and len(sub["T"]) > 1:
+            order = np.argsort(sub["T"].to_numpy(dtype=float))
+            t_arr = sub["T"].to_numpy(dtype=float)[order]
+            r_arr = sub["rate"].to_numpy(dtype=float)[order]
+            rate_func = lambda t: float(np.interp(t, t_arr, r_arr))
+        else:
+            r0 = float(sub["rate"].iloc[0]) if "rate" in sub.columns else 0.0
+            rate_func = lambda t: r0
+
+        for label, days in horizon_list:
+            T = max(float(days) / 365.0, 1.0e-8)
+            vol = surface.iv_by_T(T, underlying, underlying)
+            r = rate_func(T)
+            call = black76_price(underlying, underlying, T, r, vol, True)
+            put = black76_price(underlying, underlying, T, r, vol, False)
+            premium = call + put
+            rows.append(
+                {
+                    "date": dt,
+                    "underlying_ric": contract,
+                    "underlying": underlying,
+                    "horizon_label": label,
+                    "horizon_days": int(days),
+                    "T": T,
+                    "iv_atm": vol,
+                    "rate": r,
+                    "straddle_premium": premium,
+                    "breakeven_move": premium,
+                    "breakeven_pct": premium / underlying if underlying != 0.0 else np.nan,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def add_alpha_metrics_df(
+    analytics_df: "pd.DataFrame",  # type: ignore[name-defined]
+    holding_period_days: Union[int, Sequence[int]] = 1,
+    vol_forecast_col: Optional[str] = None,
+    contract_col: str = "underlying_ric",
+    zscore_mode: str = "time",
+    use_surface_iv: bool = True,
+) -> "pd.DataFrame":  # type: ignore[name-defined]
+    _ensure_pandas()
+    df = analytics_df.copy()
+    df = validate_analytics_df(df, require_surface=False)
+
+    # Ensure surface columns when needed
+    if use_surface_iv and "iv_fit" not in df.columns:
+        if contract_col in df.columns:
+            parts = []
+            for (dt, ric), sub in df.groupby(["date", contract_col]):
+                parts.append(annotate_surface_df(sub, group_by_date=False))
+            df = pd.concat(parts, axis=0).reindex(df.index)  # type: ignore[union-attr]
+        else:
+            df = annotate_surface_df(df, group_by_date=True)
+
+    if contract_col in df.columns:
+        group_contract = ["date", contract_col, "expiry"]
+        group_date_contract = ["date", contract_col]
+        group_expiry_contract = [contract_col, "expiry"]
+    else:
+        group_contract = ["date", "expiry"]
+        group_date_contract = ["date"]
+        group_expiry_contract = ["expiry"]
+
+    # Vol used for expected PnL
+    if vol_forecast_col is not None and vol_forecast_col in df.columns:
+        vol_fcst = pd.to_numeric(df[vol_forecast_col], errors="coerce")  # type: ignore[union-attr]
+    elif "rv" in df.columns:
+        vol_fcst = pd.to_numeric(df["rv"], errors="coerce")  # type: ignore[union-attr]
+    elif "iv_fit" in df.columns:
+        vol_fcst = pd.to_numeric(df["iv_fit"], errors="coerce")  # type: ignore[union-attr]
+    else:
+        vol_fcst = pd.to_numeric(df["iv"], errors="coerce")  # type: ignore[union-attr]
+    df["vol_forecast"] = vol_fcst
+
+    # Variance swap proxy per expiry (vega-weighted iv^2)
+    iv_base = df["iv_fit"] if "iv_fit" in df.columns else df["iv"]
+    df["_iv2"] = pd.to_numeric(iv_base, errors="coerce") ** 2  # type: ignore[union-attr]
+    df["_w"] = df["vega"].abs()
+    varswap = (
+        df.groupby(group_contract)
+        .apply(lambda g: float(np.sum(g["_iv2"] * g["_w"]) / max(np.sum(g["_w"]), 1.0e-12)))
+        .rename("varswap_proxy")
+    )
+    df = df.merge(varswap.reset_index(), on=group_contract, how="left", sort=False)
+
+    # Term structure slope (ATM iv across expiries)
+    if "iv_atm" in df.columns:
+        atm = df.groupby(group_contract, as_index=False).agg({"iv_atm": "first", "T": "first"})
+        atm = atm.sort_values(group_contract[:-1] + ["T"])
+        term_slope = []
+        for key, sub in atm.groupby(group_date_contract):
+            t = sub["T"].to_numpy(dtype=float)
+            iv = sub["iv_atm"].to_numpy(dtype=float)
+            slope = np.full_like(iv, np.nan)
+            if len(t) >= 2:
+                for i in range(len(t)):
+                    if i < len(t) - 1:
+                        slope[i] = (iv[i + 1] - iv[i]) / max(t[i + 1] - t[i], 1.0e-8)
+                    else:
+                        slope[i] = (iv[i] - iv[i - 1]) / max(t[i] - t[i - 1], 1.0e-8)
+            term_slope.append(pd.Series(slope, index=sub.index))
+        atm["term_slope"] = pd.concat(term_slope).sort_index().values
+        df = df.merge(atm[group_contract + ["term_slope"]], on=group_contract, how="left", sort=False)
+    else:
+        df["term_slope"] = np.nan
+
+    # Skew/curvature z-scores
+    if "skew" in df.columns:
+        if zscore_mode == "cross":
+            df["skew_z"] = df.groupby(group_date_contract)["skew"].transform(_zscore_series)
+        else:
+            df["skew_z"] = df.groupby(group_expiry_contract)["skew"].transform(_zscore_series)
+    else:
+        df["skew_z"] = np.nan
+
+    if "curvature" in df.columns:
+        if zscore_mode == "cross":
+            df["curvature_z"] = df.groupby(group_date_contract)["curvature"].transform(_zscore_series)
+        else:
+            df["curvature_z"] = df.groupby(group_expiry_contract)["curvature"].transform(_zscore_series)
+    else:
+        df["curvature_z"] = np.nan
+
+    # Roll-down (ATM iv at T - dt)
+    surfaces_by_date = None
+    surfaces_by_date_contract = None
+    if use_surface_iv:
+        if contract_col in df.columns:
+            surfaces_by_date_contract = fit_surfaces_by_date_contract_df(df, contract_col=contract_col)
+        else:
+            surfaces_by_date = fit_surfaces_by_date_df(df)
+
+    hps = [holding_period_days] if isinstance(holding_period_days, (int, float)) else list(holding_period_days)
+    for hp in hps:
+        hp_int = int(hp)
+        dt_years = float(hp_int) / 365.0
+        suffix = "" if len(hps) == 1 else f"_h{hp_int}"
+
+        roll_vals = []
+        for key, sub in df.groupby(group_contract):
+            if contract_col in df.columns:
+                dt, ric, exp = key
+                surface = surfaces_by_date_contract[dt][ric] if surfaces_by_date_contract else None
+            else:
+                dt, exp = key
+                surface = surfaces_by_date[dt] if surfaces_by_date else None
+            if surface is None:
+                roll_vals.extend([np.nan] * len(sub))
+                continue
+            T = float(sub["T"].iloc[0])
+            if T <= dt_years + 1.0e-8:
+                roll_vals.extend([np.nan] * len(sub))
+                continue
+            F0 = float(sub["underlying"].iloc[0])
+            iv_now = surface.iv_by_T(T, F0, F0)
+            iv_next = surface.iv_by_T(T - dt_years, F0, F0)
+            roll_down = iv_next - iv_now
+            roll_vals.extend([roll_down] * len(sub))
+
+        df[f"roll_down_atm{suffix}"] = roll_vals
+
+        F = df["underlying"].to_numpy(dtype=float)
+        gamma = df["gamma"].to_numpy(dtype=float)
+        theta = df["theta"].to_numpy(dtype=float)
+        vega = df["vega"].to_numpy(dtype=float)
+        price = df["settle"].to_numpy(dtype=float)
+        sigma = df["vol_forecast"].to_numpy(dtype=float)
+        expected = theta * dt_years + 0.5 * gamma * (F ** 2) * (sigma ** 2) * dt_years
+
+        df[f"expected_pnl{suffix}"] = expected
+        df[f"carry_per_vega{suffix}"] = np.where(np.abs(vega) > 1.0e-8, expected / np.abs(vega), 0.0)
+        df[f"carry_per_price{suffix}"] = np.where(np.abs(price) > 1.0e-12, expected / np.abs(price), 0.0)
+
+    # cleanup helper columns
+    df.drop(columns=["_iv2", "_w"], inplace=True, errors="ignore")
+    return df
 
 
 def validate_options_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
