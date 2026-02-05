@@ -549,55 +549,97 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
                (ret - rf) % vol + 1e-10]]]};
     sf:scoreFn[hasSignals; normSharpe[sigTensor;(nT;nS);alphaRets;rf]; alphaMu; alphaC; objective; rf];
 
+    // Project candidate: PC constraints + bounds + normalize
+    proj:{[alphaPCExp;pcLo;pcHi;lo;hi;alloc]
+        alloc:alphaProjectPC[alloc;alphaPCExp;pcLo;pcHi;10];
+        alloc:lo | hi & alloc;
+        if[0 < sum alloc; alloc:alloc % sum alloc];
+        alloc}[alphaPCExp;pcLo;pcHi;lo;hi];
+
     // Analytical seed: tangency portfolio for maxSharpe, min-var for minVar
-    analyticalW:nAlphas#1f%nAlphas;  // fallback: equal weight
+    analyticalW:nAlphas#1f%nAlphas;
     if[objective in `maxSharpe;
         w:.[{(inv x) mmu y};(alphaC;alphaMu - rf);{[n;e] n#0n}[nAlphas]];
         if[not any null w; analyticalW:w]];
     if[objective=`minVar;
         w:.[{(inv x) mmu y};(alphaC;nAlphas#1f);{[n;e] n#0n}[nAlphas]];
         if[not any null w; analyticalW:w]];
-    // Clip to bounds and normalize
-    analyticalW:lo | hi & analyticalW;
-    if[0 < sum analyticalW; analyticalW:analyticalW % sum analyticalW];
 
-    // Project and score a candidate
-    projectAndScore:{[alphaPCExp;pcLo;pcHi;lo;hi;sf;alloc]
-        alloc:alphaProjectPC[alloc;alphaPCExp;pcLo;pcHi;10];
-        alloc:lo | hi & alloc;
-        if[0 < sum alloc; alloc:alloc % sum alloc];
-        (sf alloc; alloc)};
-    ps:projectAndScore[alphaPCExp;pcLo;pcHi;lo;hi;sf];
+    // Initialize: multiple starting points
+    starts:(proj lo | hi & analyticalW;
+            proj nAlphas#1f%nAlphas);
+    starts:starts,{[proj;lo;hi;n;i] proj lo+(hi-lo)*n?1f}[proj;lo;hi;nAlphas] each til 5;
+    scores:sf each starts;
+    bestIdx:scores?max scores;
+    allocBest:starts bestIdx;
+    bestScore:scores bestIdx;
 
-    // Initialize with analytical solution
-    sa:ps analyticalW;
-    allocBest:sa 1;
-    bestScore:sa 0;
+    // Gradient functions
+    // Sequential numerical gradient (forward difference) - for non-signal objectives
+    nGrad:{[sf;w;eps]
+        base:sf w;
+        {[sf;w;eps;base;i]
+            (sf[@[w;i;+;eps]] - base) % eps
+        }[sf;w;eps;base] each til count w};
 
-    // Also try equal weight
-    se:ps nAlphas#1f%nAlphas;
-    if[se[0] > bestScore; bestScore:se 0; allocBest:se 1];
+    // Batched numerical gradient for gross-normalized Sharpe
+    // Uses 2 matrix-matrix multiplies instead of n×2 matrix-vector multiplies
+    bGrad:{[sigT;dims;aRets;w;eps]
+        n:count w;
+        I:eps*(`float$(til[n]=/:til n));
+        W:(enlist w),w+/:I;
+        Wt:flip W;
+        allRaw:aRets mmu Wt;
+        allSig:sigT mmu Wt;
+        grossMat:{sum abs x} each dims[1] cut allSig;
+        nRetMat:allRaw % grossMat+1e-20;
+        nRetFlip:flip nRetMat;
+        mu2:avg each nRetFlip;
+        sd2:dev each nRetFlip;
+        sharpes:mu2 % sd2+1e-10;
+        base:first sharpes;
+        (1_sharpes-base) % eps};
 
-    // Search: local perturbations around best + random exploration
-    i:0;
-    while[i < nIter;
-        alloc:$[i < nIter div 4;
-            allocBest + (0.1 * nAlphas?1f) - 0.05;
-            lo + (hi-lo) * nAlphas?1f];
-        alloc:lo | hi & alloc;
-        if[0 < sum alloc; alloc:alloc % sum alloc];
-        alloc:alphaProjectPC[alloc;alphaPCExp;pcLo;pcHi;10];
-        alloc:lo | hi & alloc;
-        if[0 < sum alloc; alloc:alloc % sum alloc];
+    // Analytical Sharpe gradient: d[(w'mu-rf)/sqrt(w'Cw)]/dw = (mu - S*Cw/s) / s
+    aGrad:{[mu;C;rf;w]
+        Cw:C mmu w;
+        sig:sqrt w mmu Cw;
+        s:(sum[w*mu]-rf) % sig+1e-10;
+        (mu - s * Cw % sig+1e-10) % sig+1e-10};
 
-        score:sf alloc;
+    // Select gradient: batched for gross-normalized, analytical for standard Sharpe,
+    // sequential numerical for other objectives
+    eps:1e-5;
+    gfBatch:{[bG;sT;d;aR;e;w] bG[sT;d;aR;w;e]}[bGrad;sigTensor;(nT;nS);alphaRets;eps];
+    gf:$[hasSignals & objective=`maxSharpe;
+        gfBatch;
+      objective=`maxSharpe;
+        aGrad[alphaMu;alphaC;rf];
+        {[nG;sf;eps;w] nG[sf;w;eps]}[nGrad;sf;eps]];
 
-        if[score > bestScore;
-            bestScore:score;
-            allocBest:alloc
-        ];
-        i+:1
-    ];
+    // Projected gradient ascent with adaptive step size and line search
+    gradIter:nIter & 500;
+    gStep:{[gf;sf;proj;s]
+        w:s`w; best:s`best; bsc:s`bsc; lr:s`lr; ni:s`ni;
+        if[ni>30; :s];
+        g:gf w;
+        g:g - avg g;  // project to simplex tangent space
+        gn:sqrt sum g*g;
+        if[gn<1e-10; :@[s;`ni;:;999]];
+        g:g%gn;
+        // Line search: try 5 step sizes
+        alphas:lr*1 0.5 0.25 0.125 0.0625;
+        res:{[sf;proj;w;g;a] wN:proj w+a*g; (sf wN;wN)}[sf;proj;w;g] each alphas;
+        sc:res[;0]; bi:sc?max sc;
+        sNew:sc bi; wNew:res[bi;1];
+        $[sNew > bsc;
+            `w`best`bsc`lr`ni!(wNew;wNew;sNew;1.5*alphas[bi]&0.1;0);
+            `w`best`bsc`lr`ni!(w;best;bsc;0.5*lr|1e-4;ni+1)]};
+
+    gs:`w`best`bsc`lr`ni!(allocBest;allocBest;bestScore;0.01;0);
+    gs:gradIter gStep[gf;sf;proj]/gs;
+    allocBest:gs`best;
+    bestScore:gs`bsc;
 
     // Compute final portfolio characteristics
     // Use normalized returns when signal data available
