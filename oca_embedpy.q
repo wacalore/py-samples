@@ -7,6 +7,7 @@ inited:0b
 date_mode:`days
 epoch:"2000-01-01"
 epoch_date:2000.01.01
+epoch_ts:2000.01.01D00:00:00.000000000
 
 unwrap:{ $[105h=type x; x`.; x] }
 
@@ -24,6 +25,7 @@ init:{[libpath; dm; ep]
     if[0<count ep_str;
       epoch::ep;
       epoch_date::"D"$ep_str;
+      epoch_ts::epoch_date + 0D00:00:00.000000000;
     ];
   ];
   .p.e "import sys, importlib";
@@ -49,14 +51,24 @@ ensure_init:{[libpath]
 
 fix_dt:{[t]
   if[not `dt in cols t; :t];
-  if[6h=type t`dt; :update dt:.oca.epoch_date + dt from t];
-  if[7h=type t`dt; :update dt:.oca.epoch_date + dt from t];
+  dm_str:$[10h=type .oca.date_mode; .oca.date_mode; string .oca.date_mode];
+  if[dm_str in ("days";"day");
+    if[6h=type t`dt; :update dt:.oca.epoch_date + dt from t];
+    if[7h=type t`dt; :update dt:.oca.epoch_date + `int$dt from t];
+    :t;
+  ];
+  if[dm_str in ("ns";"nanoseconds";"timestamp";"datetime64[ns]");
+    if[6h=type t`dt; :update dt:.oca.epoch_ts + `long$dt from t];
+    if[7h=type t`dt; :update dt:.oca.epoch_ts + dt from t];
+    :t;
+  ];
   :t;
  }
 
 to_table:{[v]
   $[98h=type v; fix_dt v;
-    99h=type v; fix_dt flip v;
+    99h=type v;
+      $[98h=type key v; fix_dt 0!v; fix_dt[flip v]];
     v]
  }
 
@@ -72,13 +84,22 @@ optimize_raw1:{[args]
   d:args_dict args;
   tbls:d`tables;
   cfg:d`cfg;
-  dm:d`date_mode;
-  ep:d`epoch;
+  dm_arg:d`date_mode;
+  ep_arg:d`epoch;
   libpath:d`libpath;
   .oca.ensure_init libpath;
+  if[not dm_arg~(::); .oca.date_mode::dm_arg];
+  if[not ep_arg~(::);
+    ep_arg_str:$[10h=type ep_arg; ep_arg; string ep_arg];
+    if[0<count ep_arg_str;
+      .oca.epoch::ep_arg;
+      .oca.epoch_date::"D"$ep_arg_str;
+      .oca.epoch_ts::.oca.epoch_date + 0D00:00:00.000000000;
+    ];
+  ];
   res: .oca.opt_wrapper[tbls; cfg];
-  dm:$[dm~(::); .oca.date_mode; dm];
-  ep:$[ep~(::); .oca.epoch; ep];
+  dm:$[dm_arg~(::); .oca.date_mode; dm_arg];
+  ep:$[ep_arg~(::); .oca.epoch; ep_arg];
   dm_str:$[10h=type dm; dm; string dm];
   ep_str:$[10h=type ep; ep; string ep];
   resd_py: .oca.opt_to_dict[res; dm_str; ep_str];
