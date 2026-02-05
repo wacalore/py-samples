@@ -519,6 +519,33 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
     lo:cfg`lo; hi:cfg`hi;
     rf:cfg`rf;
 
+    // Signal-level gross-normalized scoring (when signal matrices available)
+    hasSignals:(`signalMats in key cfg) & `pxMat in key cfg;
+    signalMats:$[hasSignals; cfg`signalMats; ()];
+    pxMat:$[hasSignals; cfg`pxMat; ()];
+
+    // Gross-normalized Sharpe: combine signals, normalize by daily gross, compute Sharpe
+    normSharpe:{[sigMats;pxM;rf;w]
+        cSig:sum {x*y}'[w;sigMats];
+        rawRet:sum each cSig * pxM;
+        gross:sum each abs cSig;
+        nRet:rawRet % gross + 1e-20;
+        avg[nRet] % dev[nRet] + 1e-10};
+
+    // Score function: use normalized scoring for maxSharpe when signal data available
+    scoreFn:{[hasSig;nsFn;alphaMu;alphaC;objective;rf;alloc]
+        $[(hasSig) & objective=`maxSharpe;
+            nsFn alloc;
+            [ret:sum alloc * alphaMu;
+             variance:alloc mmu alphaC mmu alloc;
+             vol:sqrt variance;
+             $[objective=`maxSharpe; (ret - rf) % vol + 1e-10;
+               objective=`minVar; neg variance;
+               objective=`maxRet; ret;
+               objective=`riskParity; neg sum abs (alloc * alphaC mmu alloc) - variance%(count alloc);
+               (ret - rf) % vol + 1e-10]]]};
+    sf:scoreFn[hasSignals; normSharpe[signalMats;pxMat;rf]; alphaMu; alphaC; objective; rf];
+
     // Analytical seed: tangency portfolio for maxSharpe, min-var for minVar
     analyticalW:nAlphas#1f%nAlphas;  // fallback: equal weight
     if[objective in `maxSharpe;
@@ -531,59 +558,36 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
     analyticalW:lo | hi & analyticalW;
     if[0 < sum analyticalW; analyticalW:analyticalW % sum analyticalW];
 
-    // Scoring helper (<=8 params: bundle bounds and PC info)
-    scoreAlloc:{[alphaMu;alphaC;pcInfo;bounds;objective;rf;alloc]
-        alloc:alphaProjectPC[alloc;pcInfo 0;pcInfo 1;pcInfo 2;10];
-        alloc:bounds[0] | bounds[1] & alloc;
+    // Project and score a candidate
+    projectAndScore:{[alphaPCExp;pcLo;pcHi;lo;hi;sf;alloc]
+        alloc:alphaProjectPC[alloc;alphaPCExp;pcLo;pcHi;10];
+        alloc:lo | hi & alloc;
         if[0 < sum alloc; alloc:alloc % sum alloc];
-        ret:sum alloc * alphaMu;
-        variance:alloc mmu alphaC mmu alloc;
-        vol:sqrt variance;
-        score:$[objective=`maxSharpe; (ret - rf) % vol + 1e-10;
-                objective=`minVar; neg variance;
-                objective=`maxRet; ret;
-                objective=`riskParity; neg sum abs (alloc * alphaC mmu alloc) - variance%count alloc;
-                (ret - rf) % vol + 1e-10];
-        (score;alloc)};
-    sf:scoreAlloc[alphaMu;alphaC;(alphaPCExp;pcLo;pcHi);(lo;hi);objective;rf];
+        (sf alloc; alloc)};
+    ps:projectAndScore[alphaPCExp;pcLo;pcHi;lo;hi;sf];
 
     // Initialize with analytical solution
-    sa:sf analyticalW;
+    sa:ps analyticalW;
     allocBest:sa 1;
     bestScore:sa 0;
 
     // Also try equal weight
-    se:sf nAlphas#1f%nAlphas;
+    se:ps nAlphas#1f%nAlphas;
     if[se[0] > bestScore; bestScore:se 0; allocBest:se 1];
 
     // Search: local perturbations around best + random exploration
     i:0;
     while[i < nIter;
-        // First 25%: perturb around best-so-far (local hill-climbing)
-        // Remaining 75%: random exploration
         alloc:$[i < nIter div 4;
             allocBest + (0.1 * nAlphas?1f) - 0.05;
             lo + (hi-lo) * nAlphas?1f];
         alloc:lo | hi & alloc;
         if[0 < sum alloc; alloc:alloc % sum alloc];
-
-        // Project to PC constraints
         alloc:alphaProjectPC[alloc;alphaPCExp;pcLo;pcHi;10];
-
-        // Enforce bounds and renormalize
         alloc:lo | hi & alloc;
         if[0 < sum alloc; alloc:alloc % sum alloc];
 
-        // Compute objective
-        ret:sum alloc * alphaMu;
-        variance:alloc mmu alphaC mmu alloc;
-        vol:sqrt variance;
-
-        score:$[objective=`maxSharpe; (ret - rf) % vol + 1e-10;
-                objective=`minVar; neg variance;
-                objective=`maxRet; ret;
-                objective=`riskParity; neg sum abs (alloc * alphaC mmu alloc) - variance%nAlphas;
-                (ret - rf) % vol + 1e-10];
+        score:sf alloc;
 
         if[score > bestScore;
             bestScore:score;
@@ -593,10 +597,19 @@ alphaOptimize:{[alphas;R;p;pcLimits;cfg]
     ];
 
     // Compute final portfolio characteristics
-    finalRet:sum allocBest * alphaMu;
-    finalVar:allocBest mmu alphaC mmu allocBest;
-    finalVol:sqrt finalVar;
-    finalSharpe:(finalRet - cfg`rf) % finalVol + 1e-10;
+    // Use normalized returns when signal data available
+    $[hasSignals & objective=`maxSharpe;
+        [cSig:sum {x*y}'[allocBest;signalMats];
+         rawRet:sum each cSig * pxMat;
+         gross:sum each abs cSig;
+         normRet:rawRet % gross + 1e-20;
+         finalRet:avg normRet;
+         finalVol:dev normRet;
+         finalSharpe:finalRet % finalVol + 1e-10];
+        [finalRet:sum allocBest * alphaMu;
+         finalVar:allocBest mmu alphaC mmu allocBest;
+         finalVol:sqrt finalVar;
+         finalSharpe:(finalRet - rf) % finalVol + 1e-10]];
 
     // Combined asset weights
     // Convert alpha weights to matrix (nAlphas x nAssets), then weight by allocation
@@ -928,8 +941,22 @@ alphaListOptimize:{[alphaList;alphaNames;pcLimits;cfg]
     // Extract actual alpha return matrix (T x nAlphas) for optimization
     alphaRetMat:flip 0f^value alphaNames#flip alphaRetWide;
 
-    // Run optimization with actual alpha returns
-    optCfg:`objective`nIter`alphaRetMat!(cfg`objective;cfg`nIter;alphaRetMat);
+    // Build signal matrices for gross-normalized scoring
+    // sigMats: list of nAlphas T x S matrices (prevSig per alpha)
+    // pxMat: T x S matrix (shared asset returns)
+    buildSigMat:{[dc;pc;yc;allDates;allSyms;t]
+        long:0!?[t;();(dc,yc)!(dc;yc);(enlist`v)!enlist(last;pc)];
+        gidx:group long dc;
+        pRow:{[t;yc;allSyms;idx]
+            r:t[yc][idx]!t[`v][idx];
+            allSyms#(allSyms!count[allSyms]#0f),r};
+        dicts:pRow[long;yc;allSyms] each gidx allDates;
+        0f^value each dicts};  // T x S matrix
+    sigMats:buildSigMat[dc;pc;yc;allDates;allSyms] each alphaList;
+    pxMat:flip 0f^value allSyms#flip R;  // T x S matrix
+
+    // Run optimization with actual alpha returns + signal matrices
+    optCfg:`objective`nIter`alphaRetMat`signalMats`pxMat!(cfg`objective;cfg`nIter;alphaRetMat;sigMats;pxMat);
     result:alphaOptimize[alphas;R;p;pcLimits;optCfg];
 
     // Compute stats for each alpha's return column
