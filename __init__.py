@@ -38,6 +38,8 @@ from .core import (
 from .optimizer import (
     AlphaOptimizerConfig,
     alpha_tables_to_returns_df,
+    optimize_portfolio,
+    optimize_portfolio_cvar,
     optimize_portfolio_with_pca,
     optimizer_result_to_dict,
     optimizer_result_table,
@@ -82,6 +84,8 @@ __all__ = [
     "add_alpha_metrics_df",
     "AlphaOptimizerConfig",
     "alpha_tables_to_returns_df",
+    "optimize_portfolio",
+    "optimize_portfolio_cvar",
     "optimize_portfolio_with_pca",
     "optimizer_result_to_dict",
     "optimizer_result_table",
