@@ -409,7 +409,7 @@ def validate_options_df(df: "pd.DataFrame") -> "pd.DataFrame":  # type: ignore[n
         if not np.isfinite(out[col].to_numpy(dtype=float)).all():
             raise ValueError(f"options table column '{col}' must be finite.")
     for col in OPTIONS_DATE_COLS:
-        out[col] = pd.to_datetime(out[col], errors="raise")  # type: ignore[union-attr]
+        out[col] = _normalize_date_series(out[col])  # type: ignore[arg-type]
 
     out["put_call"] = out["put_call"].astype(str).str.upper()
     bad_pc = ~out["put_call"].isin(["C", "P"])
@@ -1162,6 +1162,31 @@ def _curve_arrays_from(curve: Union[ZeroCurve, "pd.DataFrame"]) -> Tuple[np.ndar
     return curve_df["term"].to_numpy(dtype=float), curve_df["rate"].to_numpy(dtype=float)
 
 
+def _normalize_date_series(series: "pd.Series") -> "pd.Series":  # type: ignore[name-defined]
+    if not HAVE_PANDAS:
+        raise RuntimeError("pandas is required for date normalization.")
+    ser = series
+    dt: "pd.Series"  # type: ignore[name-defined]
+    if pd.api.types.is_integer_dtype(ser):  # type: ignore[union-attr]
+        vals = ser.to_numpy()
+        if vals.size > 0 and np.all((vals >= 19000101) & (vals <= 21001231)):
+            dt = pd.to_datetime(ser.astype(str), format="%Y%m%d", errors="raise")  # type: ignore[union-attr]
+        else:
+            dt = pd.to_datetime(ser, errors="raise")  # type: ignore[union-attr]
+    else:
+        if ser.dtype == object:  # type: ignore[union-attr]
+            sample = ser.dropna().astype(str).head(10)  # type: ignore[union-attr]
+            if len(sample) and all(s.isdigit() and len(s) == 8 for s in sample):
+                dt = pd.to_datetime(ser.astype(str), format="%Y%m%d", errors="raise")  # type: ignore[union-attr]
+            else:
+                dt = pd.to_datetime(ser, errors="raise")  # type: ignore[union-attr]
+        else:
+            dt = pd.to_datetime(ser, errors="raise")  # type: ignore[union-attr]
+    if getattr(dt.dt, "tz", None) is not None:  # type: ignore[union-attr]
+        dt = dt.dt.tz_localize(None)  # type: ignore[union-attr]
+    return dt.dt.normalize()  # type: ignore[union-attr]
+
+
 def _iv_greeks_vector_py(
     F: np.ndarray,
     K: np.ndarray,
@@ -1227,8 +1252,8 @@ def compute_analytics_df(
                 raise ValueError(f"curve table missing curve_date_col '{curve_date_col_use}'.")
             curve_has_date = True
 
-    date_ser = pd.to_datetime(opts["date"], errors="raise")  # type: ignore[union-attr]
-    expiry_ser = pd.to_datetime(opts["expiry"], errors="raise")  # type: ignore[union-attr]
+    date_ser = _normalize_date_series(opts["date"])  # type: ignore[arg-type]
+    expiry_ser = _normalize_date_series(opts["expiry"])  # type: ignore[arg-type]
     T = (expiry_ser - date_ser).dt.days.to_numpy(dtype=float) / 365.0
     if np.any(T < 0.0):
         raise ValueError("options table has expiry earlier than date.")
@@ -1239,10 +1264,8 @@ def compute_analytics_df(
     is_call = (opts["put_call"] == "C").to_numpy(dtype=np.int8)
     if curve_has_date:
         curve_df = curve.copy()  # type: ignore[union-attr]
-        curve_df["_date_key"] = pd.to_datetime(  # type: ignore[union-attr]
-            curve_df[curve_date_col_use], errors="raise"
-        ).dt.normalize()
-        date_key = date_ser.dt.normalize()
+        curve_df["_date_key"] = _normalize_date_series(curve_df[curve_date_col_use])  # type: ignore[arg-type]
+        date_key = date_ser
         r = np.empty(len(opts), dtype=float)
         cache: Dict[object, Tuple[np.ndarray, np.ndarray]] = {}
         groups = date_key.groupby(date_key).groups
@@ -1250,7 +1273,12 @@ def compute_analytics_df(
             if dt_val not in cache:
                 sub = curve_df[curve_df["_date_key"] == dt_val]
                 if sub.empty:
-                    raise ValueError(f"curve table missing date {dt_val}.")
+                    unique_dates = curve_df["_date_key"].drop_duplicates().sort_values()
+                    sample = ", ".join(str(x) for x in unique_dates.head(5).tolist())
+                    raise ValueError(
+                        f"curve table missing date {dt_val}. "
+                        f"curve dates sample: [{sample}]"
+                    )
                 # Allow duplicate terms per date by averaging rates.
                 if sub["term"].duplicated().any():  # type: ignore[index]
                     sub = sub.groupby("term", as_index=False)["rate"].mean()  # type: ignore[union-attr]
