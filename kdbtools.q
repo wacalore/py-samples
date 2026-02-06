@@ -1604,26 +1604,32 @@ classifyCorRegimeAdaptive:{[w;X;mode;pctile]
 // @return original table + corRegime + corMetric columns
 corRegimeTable:{[t;bycol;xc;w;mode;thresh]
     isAdaptive:99h = type thresh;
-    helper:{[xc;w;mode;thresh;isAdaptive;g]
-        X:flip g xc;
+    n:count t;
+    // Pre-extract feature columns as vectors (avoids table indexing ambiguity)
+    fv:{[t;c] t c}[t] each xc;
+    // Get group index lists
+    grpIdxs:$[(::)~bycol; enlist til n; value group t bycol];
+    // Process one group: takes index list, returns dict with results
+    proc:{[fv;w;mode;isAdaptive;thresh;idxs]
+        X:flip fv[;idxs];
         $[isAdaptive;
             [res:classifyCorRegimeAdaptive[w;X;mode;thresh`pctile];
-             g,'flip `corRegime`corMetric`corThreshold!(res`regime;res`metric;res`threshold)];
+             `idxs`regime`metric`threshold!(idxs;res`regime;res`metric;res`threshold)];
             [metric:$[mode~`absorption; rollingAbsorption[w;X;1]; rollingAvgAbsCor[w;X]];
              regime:`int$(metric > thresh);
              regime:@[regime; where null metric; :; 0Ni];
-             g,'flip `corRegime`corMetric!(regime;metric)]]
-    }[xc;w;mode;thresh;isAdaptive];
-    if[(::)~bycol;
-        :helper t];
-    // Add row index to preserve original order after group/raze
-    t:update corIdx__:i from t;
-    // Group using built-in group, process each subtable
-    grp:group t bycol;
-    parts:helper each t value grp;
-    result:`corIdx__ xasc raze parts;
-    // Functional delete (safe inside functions)
-    ![result;();0b;enlist `corIdx__]}
+             `idxs`regime`metric!(idxs;regime;metric)]]
+    }[fv;w;mode;isAdaptive;thresh];
+    results:proc each grpIdxs;
+    // Reconstruct in original row order
+    allIdx:raze results[;`idxs];
+    allRegime:raze results[;`regime];
+    allMetric:raze results[;`metric];
+    ord:iasc allIdx;
+    $[isAdaptive;
+        [allThresh:raze results[;`threshold];
+         t,'flip `corRegime`corMetric`corThreshold!(allRegime ord;allMetric ord;allThresh ord)];
+        t,'flip `corRegime`corMetric!(allRegime ord;allMetric ord)]}
 
 // =============================================================================
 // ROLLING REGRESSION METHODS
@@ -1842,7 +1848,7 @@ rollingRidgeTable:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
     grp:group t bycol;
-    groups:t value grp;
+    groups:{[t;idx] t idx}[t] each value grp;
     nGroups:count groups;
     // Choose parallelization strategy based on number of groups
     result:$[nGroups >= 4;
@@ -1867,7 +1873,7 @@ rollingRidgeTableIntercept:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
     grp:group t bycol;
-    groups:t value grp;
+    groups:{[t;idx] t idx}[t] each value grp;
     nGroups:count groups;
     // Choose parallelization strategy based on number of groups
     result:$[nGroups >= 4;
@@ -2004,7 +2010,7 @@ rollingRidgeTableInterceptZscore:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
     grp:group t bycol;
-    groups:t value grp;
+    groups:{[t;idx] t idx}[t] each value grp;
     nGroups:count groups;
     result:$[nGroups >= 4;
         raze rollingRidgeHelperInterceptZscore[xc;ycol;window;lam] peach groups;
@@ -2128,7 +2134,7 @@ rollingRidgeTablePCA:{[t;bycol;xc;ycol;window;lam;nComp]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
     grp:group t bycol;
-    groups:t value grp;
+    groups:{[t;idx] t idx}[t] each value grp;
     result:raze rollingRidgeHelperPCA[xc;ycol;window;lam;nComp] each groups;
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
@@ -2246,7 +2252,7 @@ rollingRidgeTableRegime:{[t;bycol;xc;ycol;window;lam;volWindow]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
     grp:group t bycol;
-    groups:t value grp;
+    groups:{[t;idx] t idx}[t] each value grp;
     result:raze rollingRidgeHelperRegime[xc;ycol;window;lam;volWindow] each groups;
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
@@ -2553,7 +2559,7 @@ msRegTable:{[t;bycol;xc;ycol;window;lam;maxIter;tol]
     }[xc;ycol;window;lam;maxIter;tol];
     t:update msRegIdx__:i from t;
     grp:group t bycol;
-    result:raze helper each t value grp;
+    result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`msRegIdx__ xasc result;
     ![result;();0b;enlist `msRegIdx__]}
 
@@ -2818,7 +2824,7 @@ cpTableCusum:{[t;bycol;col;params]
     }[col;w;k;h];
     t:update cpIdx__:i from t;
     grp:group t bycol;
-    result:raze helper each t value grp;
+    result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
 
@@ -2842,7 +2848,7 @@ cpTablePelt:{[t;bycol;col;params]
     }[col;pen;ms];
     t:update cpIdx__:i from t;
     grp:group t bycol;
-    result:raze helper each t value grp;
+    result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
 
@@ -2865,7 +2871,7 @@ cpTableBinseg:{[t;bycol;col;params]
     }[col;pen;ms;mc];
     t:update cpIdx__:i from t;
     grp:group t bycol;
-    result:raze helper each t value grp;
+    result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
 
@@ -2877,7 +2883,7 @@ bocpdTable:{[t;bycol;col;hazard]
     }[col;hazard];
     t:update cpIdx__:i from t;
     grp:group t bycol;
-    result:raze helper each t value grp;
+    result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
 
