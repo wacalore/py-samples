@@ -425,28 +425,40 @@ optimize_weights_cvar:{[tbls; cfg; dm; ep; libpath]
 analyze_chain_df:{[options; curve; cfg; libpath]
   .oca.ensure_init libpath;
   c: .oca.normalize_cfg cfg;
-  res: .oca.analyze_chain_wrapper[options; curve; c];
+  opt: options;
+  if[99h=type opt; opt:.oca.to_table opt];
+  cur: curve;
+  if[99h=type cur; cur:.oca.to_table cur];
+  res: .oca.analyze_chain_wrapper[opt; cur; c];
   .p.py2q .oca.unwrap res
  }
 
 build_strategy_book_df:{[analytics; cfg; libpath]
   .oca.ensure_init libpath;
   c: .oca.normalize_cfg cfg;
-  res: .oca.strategy_book_wrapper[analytics; c];
+  a: analytics;
+  if[99h=type a; a:.oca.to_table a];
+  res: .oca.strategy_book_wrapper[a; c];
   .p.py2q .oca.unwrap res
  }
 
 strategy_screener_df:{[strategy_tbl; analytics_tbl; cfg; libpath]
   .oca.ensure_init libpath;
   c: .oca.normalize_cfg cfg;
-  res: .oca.strategy_screener_wrapper[strategy_tbl; analytics_tbl; c];
+  st: strategy_tbl;
+  if[99h=type st; st:.oca.to_table st];
+  at: analytics_tbl;
+  if[99h=type at; at:.oca.to_table at];
+  res: .oca.strategy_screener_wrapper[st; at; c];
   .p.py2q .oca.unwrap res
  }
 
 scenario_pnl_strategy_df:{[strategy_tbl; cfg; libpath]
   .oca.ensure_init libpath;
   c: .oca.normalize_cfg cfg;
-  res: .oca.scenario_pnl_strategy_wrapper[strategy_tbl; c];
+  st: strategy_tbl;
+  if[99h=type st; st:.oca.to_table st];
+  res: .oca.scenario_pnl_strategy_wrapper[st; c];
   .p.py2q .oca.unwrap res
  }
 
