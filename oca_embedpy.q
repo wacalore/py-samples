@@ -56,6 +56,7 @@ ensure_init:{[libpath]
 fix_dt:{[t]
   dm_str:$[10h=type .oca.date_mode; .oca.date_mode; string .oca.date_mode];
   if[99h=type t;
+    if[98h=type key t; :fix_dt 0!t];
     k:key t;
     ksym:$[11h=type k; k; 10h=type k; enlist `$k; `$string each k];
     if[not `dt in ksym; :t];
@@ -74,7 +75,7 @@ fix_dt:{[t]
     ];
     :t;
   ];
-  if[98h=type key t; t:0!t];
+  if[98h<>type t; :t];
   if[not `dt in cols t; :t];
   dty: abs type t`dt;
   if[dty in 14 12 15h; :t];
@@ -98,7 +99,7 @@ to_table:{[v]
     if[10h=type k; :fix_dt flip ((`$k)!value v)];
     sym_key:{[x] $[11h=type x; x; 10h=type x; `$x; `$string x]};
     ksym: sym_key each k;
-    if[count distinct ksym <> count ksym; '"non-unique keys after symbolization"];
+    if[(count distinct ksym) <> count ksym; '"non-unique keys after symbolization"];
     :fix_dt flip (ksym!value v);
   ];
   v
