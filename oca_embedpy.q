@@ -37,14 +37,16 @@ init:{[libpath; dm; ep]
   .p.e "sys.modules.pop('options_chain_analyzer.optimizer', None)";
   .p.e "sys.modules.pop('options_chain_analyzer', None)";
   .p.e "import options_chain_analyzer as oca";
+  .p.e "def oca_as_df(x):\n  try:\n    import pandas as pd\n  except Exception:\n    return x\n  if isinstance(x, pd.DataFrame):\n    return x\n  if isinstance(x, dict) or isinstance(x, (list, tuple)):\n    try:\n      return pd.DataFrame(x)\n    except Exception:\n      return x\n  return x";
+  .p.e "def oca_df_to_dict(x):\n  try:\n    import pandas as pd\n  except Exception:\n    return x\n  if isinstance(x, pd.DataFrame):\n    return x.to_dict(orient='list')\n  return x";
   .p.e "def oca_opt_wrapper(tables, cfg=None): return oca.optimize_portfolio_with_pca(tables, cfg)";
   .p.e "def oca_opt_simple_wrapper(tables, cfg=None): return oca.optimize_portfolio(tables, cfg)";
   .p.e "def oca_opt_cvar_wrapper(tables, cfg=None): return oca.optimize_portfolio_cvar(tables, cfg)";
   .p.e "def oca_opt_to_dict(res, date_mode='days', epoch='2000-01-01'): return oca.optimizer_result_to_dict(res, date_mode=date_mode, epoch=epoch)";
-  .p.e "def oca_analyze_chain_df(options_df, curve, cfg=None):\n  cfg = {} if cfg is None else cfg\n  return oca.analyze_chain_df(options_df, curve, use_numba=cfg.get('use_numba'), group_by_date=cfg.get('group_by_date'), curve_date_col=cfg.get('curve_date_col'))";
-  .p.e "def oca_build_strategy_book_df(analytics_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  widths = cfg.get('widths', (0.5, 1.0, 2.0))\n  templates = cfg.get('strategy_templates')\n  return oca.build_strategy_book_df(analytics_df, widths=widths, strategy_templates=templates)";
-  .p.e "def oca_strategy_screener_df(strategy_df, analytics_df=None, cfg=None):\n  cfg = {} if cfg is None else cfg\n  return oca.strategy_screener_df(\n    strategy_df,\n    analytics_df=analytics_df,\n    vol_col=cfg.get('vol_col', 'iv_atm'),\n    vol_fallback=cfg.get('vol_fallback'),\n    pop_samples=cfg.get('pop_samples', 5000),\n    pop_seed=cfg.get('pop_seed', 7),\n    mispricing_metric=cfg.get('mispricing_metric', 'edge_per_vega'),\n    mispricing_quantile=cfg.get('mispricing_quantile', 0.9),\n    pop_threshold=cfg.get('pop_threshold', 0.6),\n    ev_threshold=cfg.get('ev_threshold', 0.0),\n    upside_metric=cfg.get('upside_metric', 'upside_p95'),\n    upside_quantile=cfg.get('upside_quantile', 0.8),\n    upside_threshold=cfg.get('upside_threshold'),\n    credit_debit_tolerance=cfg.get('credit_debit_tolerance', 1.0e-8),\n    filter_only=cfg.get('filter_only', True),\n    top_n=cfg.get('top_n'),\n    weight_mispricing=cfg.get('weight_mispricing', 1.0),\n    weight_ev=cfg.get('weight_ev', 0.5),\n    weight_pop=cfg.get('weight_pop', 0.5)\n  )";
-  .p.e "def oca_scenario_pnl_strategy_df(strategy_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  return oca.scenario_pnl_strategy_df(\n    strategy_df,\n    dF=cfg.get('dF', 0.0),\n    dVol=cfg.get('dVol', 0.0),\n    dRate=cfg.get('dRate', 0.0),\n    dt_days=cfg.get('dt_days', 0.0)\n  )";
+  .p.e "def oca_analyze_chain_df(options_df, curve, cfg=None):\n  cfg = {} if cfg is None else cfg\n  options_df = oca_as_df(options_df)\n  curve = oca_as_df(curve)\n  out = oca.analyze_chain_df(options_df, curve, use_numba=cfg.get('use_numba'), group_by_date=cfg.get('group_by_date'), curve_date_col=cfg.get('curve_date_col'))\n  return oca_df_to_dict(out)";
+  .p.e "def oca_build_strategy_book_df(analytics_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  analytics_df = oca_as_df(analytics_df)\n  widths = cfg.get('widths', (0.5, 1.0, 2.0))\n  templates = cfg.get('strategy_templates')\n  out = oca.build_strategy_book_df(analytics_df, widths=widths, strategy_templates=templates)\n  return oca_df_to_dict(out)";
+  .p.e "def oca_strategy_screener_df(strategy_df, analytics_df=None, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  if analytics_df is not None:\n    analytics_df = oca_as_df(analytics_df)\n  out = oca.strategy_screener_df(\n    strategy_df,\n    analytics_df=analytics_df,\n    vol_col=cfg.get('vol_col', 'iv_atm'),\n    vol_fallback=cfg.get('vol_fallback'),\n    pop_samples=cfg.get('pop_samples', 5000),\n    pop_seed=cfg.get('pop_seed', 7),\n    mispricing_metric=cfg.get('mispricing_metric', 'edge_per_vega'),\n    mispricing_quantile=cfg.get('mispricing_quantile', 0.9),\n    pop_threshold=cfg.get('pop_threshold', 0.6),\n    ev_threshold=cfg.get('ev_threshold', 0.0),\n    upside_metric=cfg.get('upside_metric', 'upside_p95'),\n    upside_quantile=cfg.get('upside_quantile', 0.8),\n    upside_threshold=cfg.get('upside_threshold'),\n    credit_debit_tolerance=cfg.get('credit_debit_tolerance', 1.0e-8),\n    filter_only=cfg.get('filter_only', True),\n    top_n=cfg.get('top_n'),\n    weight_mispricing=cfg.get('weight_mispricing', 1.0),\n    weight_ev=cfg.get('weight_ev', 0.5),\n    weight_pop=cfg.get('weight_pop', 0.5)\n  )\n  return oca_df_to_dict(out)";
+  .p.e "def oca_scenario_pnl_strategy_df(strategy_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  out = oca.scenario_pnl_strategy_df(\n    strategy_df,\n    dF=cfg.get('dF', 0.0),\n    dVol=cfg.get('dVol', 0.0),\n    dRate=cfg.get('dRate', 0.0),\n    dt_days=cfg.get('dt_days', 0.0)\n  )\n  return oca_df_to_dict(out)";
   opt_wrapper::.p.get[`oca_opt_wrapper];
   opt_wrapper_simple::.p.get[`oca_opt_simple_wrapper];
   opt_wrapper_cvar::.p.get[`oca_opt_cvar_wrapper];
@@ -103,6 +105,7 @@ to_table:{[v]
   if[99h=type v;
     if[98h=type key v; :fix_dt 0!v];
     k:key v;
+    if[0=count k; :([])];
     if[11h=type k; :fix_dt flip v];
     if[10h=type k; :fix_dt flip ((`$k)!value v)];
     sym_key:{[x] $[11h=type x; x; 10h=type x; `$x; `$string x]};
@@ -430,7 +433,8 @@ analyze_chain_df:{[options; curve; cfg; libpath]
   cur: curve;
   if[99h=type cur; cur:.oca.to_table cur];
   res: .oca.analyze_chain_wrapper[opt; cur; c];
-  .p.py2q .oca.unwrap res
+  out: .p.py2q .oca.unwrap res;
+  $[99h=type out; .oca.to_table out; out]
  }
 
 build_strategy_book_df:{[analytics; cfg; libpath]
@@ -439,7 +443,8 @@ build_strategy_book_df:{[analytics; cfg; libpath]
   a: analytics;
   if[99h=type a; a:.oca.to_table a];
   res: .oca.strategy_book_wrapper[a; c];
-  .p.py2q .oca.unwrap res
+  out: .p.py2q .oca.unwrap res;
+  $[99h=type out; .oca.to_table out; out]
  }
 
 strategy_screener_df:{[strategy_tbl; analytics_tbl; cfg; libpath]
@@ -450,7 +455,8 @@ strategy_screener_df:{[strategy_tbl; analytics_tbl; cfg; libpath]
   at: analytics_tbl;
   if[99h=type at; at:.oca.to_table at];
   res: .oca.strategy_screener_wrapper[st; at; c];
-  .p.py2q .oca.unwrap res
+  out: .p.py2q .oca.unwrap res;
+  $[99h=type out; .oca.to_table out; out]
  }
 
 scenario_pnl_strategy_df:{[strategy_tbl; cfg; libpath]
@@ -459,7 +465,8 @@ scenario_pnl_strategy_df:{[strategy_tbl; cfg; libpath]
   st: strategy_tbl;
   if[99h=type st; st:.oca.to_table st];
   res: .oca.scenario_pnl_strategy_wrapper[st; c];
-  .p.py2q .oca.unwrap res
+  out: .p.py2q .oca.unwrap res;
+  $[99h=type out; .oca.to_table out; out]
  }
 
 \d .
