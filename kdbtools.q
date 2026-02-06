@@ -1475,6 +1475,146 @@ pcaInverse:{[model;scores]
     mm[scores;mT model`loadings] +\: model`mean}
 
 // =============================================================================
+// ROLLING FACTOR CORRELATION / ABSORPTION RATIO
+// =============================================================================
+// Detect correlation regimes: periods when factor correlations converge toward
+// +/-1 (crisis/risk-off) vs normal diversified periods. Uses rolling windows,
+// fully causal (no lookahead).
+
+// Absorption ratio: fraction of total variance explained by top k eigenvectors
+// Uses power iteration + deflation (no QML required)
+// @param w   - rolling window size
+// @param X   - factor matrix (T x p): list of T row-vectors, each of length p
+// @param k   - number of top PCs (default 1)
+// @return T-vector of absorption ratios in [0,1]
+rollingAbsorption:{[w;X;k]
+    n:count X;
+    p:count first X;
+    k:k & p;
+    idx:swin[w;til n];
+    {[X;p;k;widx]
+        if[any null widx; :0n];
+        Xw:X widx;
+        if[(k + 2) > count Xw; :0n];
+        // Center
+        mu:avg each flip Xw;
+        Xc:Xw -\: mu;
+        C:((flip Xc) mmu Xc) % (count Xw) - 1;
+        trC:sum C[;til p]@'til p;
+        if[trC < 1e-15; :0n];
+        // Power iteration + deflation for top k eigenvalues
+        Cw:C;
+        eigSum:0f;
+        j:0;
+        while[j < k;
+            v:p?1.0;
+            v:v % sqrt sum v * v;
+            do[50; v2:Cw mmu v; nrm:sqrt sum v2 * v2; v:$[nrm > 1e-15; v2 % nrm; v]];
+            lam:sum v * Cw mmu v;
+            eigSum+:lam | 0f;
+            Cw:Cw - (lam | 0f) * v */:\: v;
+            j+:1];
+        eigSum % trC
+    }[X;p;k] each idx}
+
+// Mean absolute off-diagonal correlation (simpler alternative to absorption)
+// @param w - rolling window size
+// @param X - factor matrix (T x p): list of T row-vectors, each of length p
+// @return T-vector of mean |correlation| in [0,1]
+rollingAvgAbsCor:{[w;X]
+    n:count X;
+    p:count first X;
+    if[p < 2; :n#0n];
+    idx:swin[w;til n];
+    {[X;p;widx]
+        if[any null widx; :0n];
+        Xw:X widx;
+        nw:count Xw;
+        if[3 > nw; :0n];
+        // Compute pairwise correlations directly (avoids cormat edge cases)
+        fCols:flip Xw;  // p columns of nw values
+        total:0f; cnt:0;
+        i:0;
+        while[i < p - 1;
+            j:i + 1;
+            while[j < p;
+                total+:abs cor[fCols i; fCols j];
+                cnt+:1;
+                j+:1];
+            i+:1];
+        total % cnt
+    }[X;p] each idx}
+
+// Classify correlation regime: 0 = normal, 1 = crisis (high correlation)
+// @param w     - rolling window for correlation measurement
+// @param X     - factor matrix (T x p)
+// @param mode  - `absorption (PC1 share) or `avgcor (mean |corr|)
+// @param thresh - threshold for crisis regime (e.g., 0.6 for absorption, 0.7 for avgcor)
+// @return T-vector of regime labels (0=normal, 1=crisis), null for warmup
+classifyCorRegime:{[w;X;mode;thresh]
+    metric:$[mode~`absorption; rollingAbsorption[w;X;1];
+             mode~`avgcor;     rollingAvgAbsCor[w;X];
+             '"mode must be `absorption or `avgcor"];
+    regime:`int$(metric > thresh);
+    regime:@[regime; where null metric; :; 0Ni];
+    regime}
+
+// Correlation regime with adaptive threshold (expanding percentile)
+// @param w       - rolling window for correlation measurement
+// @param X       - factor matrix (T x p)
+// @param mode    - `absorption or `avgcor
+// @param pctile  - percentile threshold (e.g., 0.8 = crisis when metric > 80th pctile)
+// @return `regime`metric dict (regime: 0/1, metric: raw absorption or avgcor)
+classifyCorRegimeAdaptive:{[w;X;mode;pctile]
+    metric:$[mode~`absorption; rollingAbsorption[w;X;1];
+             mode~`avgcor;     rollingAvgAbsCor[w;X];
+             '"mode must be `absorption or `avgcor"];
+    n:count metric;
+    // Expanding percentile (no lookahead)
+    expPct:{[metric;pctile;i]
+        if[i < 2; :0n];
+        vals:metric til i;
+        vals:vals where not null vals;
+        if[0 = count vals; :0n];
+        sorted:asc vals;
+        idx:0 | `int$pctile * (count sorted) - 1;
+        sorted idx
+    }[metric;pctile] each til n;
+    regime:`int$(metric > expPct);
+    regime:@[regime; where null metric; :; 0Ni];
+    `regime`metric`threshold!(regime;metric;expPct)}
+
+// Table interface for correlation regime detection
+// Adds corRegime, corMetric columns to table
+// @param t       - table (sorted by bycol, time)
+// @param bycol   - group column (e.g., `sym); use (::) for no grouping
+// @param xc      - list of factor column names
+// @param w       - rolling window
+// @param mode    - `absorption or `avgcor
+// @param thresh  - fixed threshold, or `adaptive`pctile (e.g., 0.8)
+// @return original table + corRegime + corMetric columns
+corRegimeTable:{[t;bycol;xc;w;mode;thresh]
+    isAdaptive:99h = type thresh;
+    helper:{[xc;w;mode;thresh;isAdaptive;g]
+        X:flip g xc;
+        $[isAdaptive;
+            [res:classifyCorRegimeAdaptive[w;X;mode;thresh`pctile];
+             g,'flip `corRegime`corMetric`corThreshold!(res`regime;res`metric;res`threshold)];
+            [metric:$[mode~`absorption; rollingAbsorption[w;X;1]; rollingAvgAbsCor[w;X]];
+             regime:`int$(metric > thresh);
+             regime:@[regime; where null metric; :; 0Ni];
+             g,'flip `corRegime`corMetric!(regime;metric)]]
+    }[xc;w;mode;thresh;isAdaptive];
+    if[(::)~bycol;
+        :helper t];
+    t:update corIdx__:i from t;
+    vals:distinct t bycol;
+    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    result:raze helper each groups;
+    result:`corIdx__ xasc result;
+    delete corIdx__ from result}
+
+// =============================================================================
 // ROLLING REGRESSION METHODS
 // =============================================================================
 
