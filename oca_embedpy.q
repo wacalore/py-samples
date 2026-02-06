@@ -54,26 +54,54 @@ ensure_init:{[libpath]
  }
 
 fix_dt:{[t]
-  if[not `dt in cols t; :t];
   dm_str:$[10h=type .oca.date_mode; .oca.date_mode; string .oca.date_mode];
+  if[99h=type t;
+    k:key t;
+    ksym:$[11h=type k; k; 10h=type k; enlist `$k; `$string each k];
+    if[not `dt in ksym; :t];
+    idx:first where ksym=`dt;
+    dt_key:$[11h=type k; `dt; 10h=type k; k; k idx];
+    dtv:t dt_key;
+    dty: abs type dtv;
+    if[dty in 14 12 15h; :t];
+    if[dm_str in ("days";"day");
+      if[dty in 6 7h; t[dt_key]: .oca.epoch_date + `int$dtv];
+      :t;
+    ];
+    if[dm_str in ("ns";"nanoseconds";"timestamp";"datetime64[ns]");
+      if[dty in 6 7h; t[dt_key]: .oca.epoch_ts + `long$dtv];
+      :t;
+    ];
+    :t;
+  ];
+  if[98h=type key t; t:0!t];
+  if[not `dt in cols t; :t];
+  dty: abs type t`dt;
+  if[dty in 14 12 15h; :t];
   if[dm_str in ("days";"day");
-    if[6h=type t`dt; :update dt:.oca.epoch_date + dt from t];
-    if[7h=type t`dt; :update dt:.oca.epoch_date + `int$dt from t];
+    if[dty in 6 7h; :update dt:.oca.epoch_date + `int$dt from t];
     :t;
   ];
   if[dm_str in ("ns";"nanoseconds";"timestamp";"datetime64[ns]");
-    if[6h=type t`dt; :update dt:.oca.epoch_ts + `long$dt from t];
-    if[7h=type t`dt; :update dt:.oca.epoch_ts + dt from t];
+    if[dty in 6 7h; :update dt:.oca.epoch_ts + `long$dt from t];
     :t;
   ];
   :t;
  }
 
 to_table:{[v]
-  $[98h=type v; fix_dt v;
-    99h=type v;
-      $[98h=type key v; fix_dt 0!v; fix_dt[flip v]];
-    v]
+  if[98h=type v; :fix_dt v];
+  if[99h=type v;
+    if[98h=type key v; :fix_dt 0!v];
+    k:key v;
+    if[11h=type k; :fix_dt flip v];
+    if[10h=type k; :fix_dt flip ((`$k)!value v)];
+    sym_key:{[x] $[11h=type x; x; 10h=type x; `$x; `$string x]};
+    ksym: sym_key each k;
+    if[count distinct ksym <> count ksym; '"non-unique keys after symbolization"];
+    :fix_dt flip (ksym!value v);
+  ];
+  v
  }
 
 args_dict:{[args]
@@ -117,6 +145,104 @@ full_cfg:{[tbls; cfg]
   c[`window]: n;
   c[`min_periods]: n;
   c
+ }
+
+atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; strategy; side]
+  r: $[rebalance_days~(::); 5; rebalance_days];
+  td: $[target_dte~(::); 30; target_dte];
+  mind: $[min_dte~(::); 7; min_dte];
+  maxd: $[max_dte~(::); ::; max_dte];
+  pm: $[price_mode~(::); `market; price_mode];
+  strat: $[strategy~(::); `straddle; strategy];
+  s: $[side~(::); 1f; side];
+  price_col: $[pm in (`market;`mkt;`settle); `settle; `theo];
+  req: `date`expiry`strike`put_call`underlying;
+  if[not all req in cols t; '"analytics table missing required columns"];
+  if[not price_col in cols t; '"analytics table missing price column"];
+  r: max 1, `int$r;
+  if[r < 1; '"rebalance_days must be >= 1"];
+  tt: t;
+  dty: abs type (tt`date);
+  if[dty in 12 15h; tt: update date:date date from tt];
+  if[not dty in 14 12 15h; '"date column must be date or timestamp/datetime"];
+  ety: abs type (tt`expiry);
+  if[ety in 12 15h; tt: update expiry:date expiry from tt];
+  if[not ety in 14 12 15h; '"expiry column must be date or timestamp/datetime"];
+  tt: update price_sel: tt[;price_col] from tt;
+  tt: update dte: expiry - date from tt;
+  dates: asc distinct tt`date;
+  idx: til `int$count dates;
+  reb_dates: dates where (idx mod r) = 0;
+
+  pick:{[d; td; mind; maxd; tt]
+    sub: tt where (tt`date)=d;
+    sub: sub where (sub`dte) >= mind;
+    if[not maxd~(::); sub: sub where (sub`dte) <= maxd];
+    if[0=count sub; :()];
+    exp_tbl: 0!select dte:first dte by expiry from sub;
+    diffs: abs ((exp_tbl`dte) - td);
+    md: exec min d from ([] d: diffs);
+    exp_exp: exp_tbl`expiry;
+    exp_sel: exp_exp where diffs = md;
+    if[0=count exp_sel; :()];
+    exp_sel: exp_sel 0;
+    sub2: sub where (sub`expiry)=exp_sel;
+    u: first sub2`underlying;
+    sub2: update m: abs(strike - u) from sub2;
+    m0: exec min m from sub2;
+    k: first ((sub2`strike) where (sub2`m)=m0);
+    (`reb_date`expiry`strike`underlying)! (d; exp_sel; k; u)
+  };
+
+  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt];
+  picks: picks except enlist ();
+  if[0=count picks; '"no valid rebalance dates"];
+  picks_tbl: flip (`reb_date`expiry`strike`underlying)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying);
+
+  reb: picks_tbl`reb_date;
+  end_dates: 1 _ reb, enlist (1 + last dates);
+  pc_set: $[strat=`call; enlist `C; strat=`put; enlist `P; `C`P];
+
+  seg_tbl: update end_date:end_dates from picks_tbl;
+  env: (`tt`dates`pc_set`strat`side`price_mode)!(tt; dates; pc_set; strat; s; pm);
+
+  seg_fn:{[seg; env]
+    rb: seg`reb_date;
+    re: seg`end_date;
+    exp_date: seg`expiry;
+    strike: seg`strike;
+    tt: env`tt;
+    dates: env`dates;
+    pc_set: env`pc_set;
+    strat: env`strat;
+    s: env`side;
+    pm: env`price_mode;
+    seg_dates: dates where (dates>=rb) & (dates<re);
+    if[0=count seg_dates; :()];
+    mask: (tt`date) in seg_dates;
+    mask: mask & (tt`expiry)=exp_date;
+    mask: mask & (tt`strike)=strike;
+    mask: mask & (tt`put_call) in pc_set;
+    leg: select date, put_call, price: price_sel from tt where mask;
+    if[strat=`straddle;
+      cnt_map: count each group leg`date;
+      ncol: cnt_map leg`date;
+      mask2: ncol = 2;
+      leg: leg where mask2;
+    ];
+    if[0=count leg; :()];
+    px: 0!select price: sum price by date from leg;
+    px: px @ iasc px`date;
+    px: update reb_date:rb, expiry:exp_date, strike:strike, strategy:strat, price_mode:pm, side:s from px;
+    px: update pnl: s * (price - prev price) from px;
+    px: update ret: pnl % abs prev price from px;
+    px
+  };
+
+  segs: seg_fn'[seg_tbl; (count seg_tbl)#enlist env];
+  segs: segs where 0 < count each segs;
+  if[0=count segs; '"no pricing rows for selected ATM strategy"];
+  raze segs
  }
 
 optimize_raw1:{[args]
