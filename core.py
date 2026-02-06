@@ -1207,11 +1207,25 @@ def compute_analytics_df(
     options_df: "pd.DataFrame",  # type: ignore[name-defined]
     curve: Union[ZeroCurve, "pd.DataFrame"],  # type: ignore[name-defined]
     use_numba: Optional[bool] = None,
+    curve_date_col: Optional[str] = None,
 ) -> "pd.DataFrame":  # type: ignore[name-defined]
     _ensure_pandas()
     opts = validate_options_df(options_df)
     curve_is_df = HAVE_PANDAS and isinstance(curve, pd.DataFrame)  # type: ignore[union-attr]
-    curve_has_date = bool(curve_is_df and "date" in curve.columns)  # type: ignore[union-attr]
+    curve_has_date = False
+    curve_date_col_use: Optional[str] = None
+    if curve_is_df:
+        if curve_date_col is not None:
+            curve_date_col_use = curve_date_col
+        else:
+            for candidate in ("date", "dt", "asof"):
+                if candidate in curve.columns:  # type: ignore[union-attr]
+                    curve_date_col_use = candidate
+                    break
+        if curve_date_col_use is not None:
+            if curve_date_col_use not in curve.columns:  # type: ignore[union-attr]
+                raise ValueError(f"curve table missing curve_date_col '{curve_date_col_use}'.")
+            curve_has_date = True
 
     date_ser = pd.to_datetime(opts["date"], errors="raise")  # type: ignore[union-attr]
     expiry_ser = pd.to_datetime(opts["expiry"], errors="raise")  # type: ignore[union-attr]
@@ -1225,7 +1239,9 @@ def compute_analytics_df(
     is_call = (opts["put_call"] == "C").to_numpy(dtype=np.int8)
     if curve_has_date:
         curve_df = curve.copy()  # type: ignore[union-attr]
-        curve_df["_date_key"] = pd.to_datetime(curve_df["date"], errors="raise").dt.normalize()  # type: ignore[union-attr]
+        curve_df["_date_key"] = pd.to_datetime(  # type: ignore[union-attr]
+            curve_df[curve_date_col_use], errors="raise"
+        ).dt.normalize()
         date_key = date_ser.dt.normalize()
         r = np.empty(len(opts), dtype=float)
         cache: Dict[object, Tuple[np.ndarray, np.ndarray]] = {}
@@ -1235,6 +1251,9 @@ def compute_analytics_df(
                 sub = curve_df[curve_df["_date_key"] == dt_val]
                 if sub.empty:
                     raise ValueError(f"curve table missing date {dt_val}.")
+                # Allow duplicate terms per date by averaging rates.
+                if sub["term"].duplicated().any():  # type: ignore[index]
+                    sub = sub.groupby("term", as_index=False)["rate"].mean()  # type: ignore[union-attr]
                 terms, rates = _curve_arrays_from(sub)
                 cache[dt_val] = (terms, rates)
             terms, rates = cache[dt_val]
@@ -2163,8 +2182,11 @@ def analyze_chain_df(
     curve: Union[ZeroCurve, "pd.DataFrame"],  # type: ignore[name-defined]
     use_numba: Optional[bool] = None,
     group_by_date: Optional[bool] = None,
+    curve_date_col: Optional[str] = None,
 ) -> "pd.DataFrame":  # type: ignore[name-defined]
-    analytics_df = compute_analytics_df(options_df, curve, use_numba=use_numba)
+    analytics_df = compute_analytics_df(
+        options_df, curve, use_numba=use_numba, curve_date_col=curve_date_col
+    )
     return annotate_surface_df(analytics_df, use_numba=use_numba, group_by_date=group_by_date)
 
 
