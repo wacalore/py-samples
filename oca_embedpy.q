@@ -150,7 +150,25 @@ to_sym:{[x]
   t:type x;
   $[t=-11h; x;
     t=11h; first x;
+    t=10h; first `$enlist x;
     `$string x]
+ }
+
+norm_put_call:{[v]
+  / Normalize put/call tags to `C/`P so downstream masks are type-stable.
+  t:abs type v;
+  to_s1:{[x]
+    tx:abs type x;
+    $[tx=10h; x; tx=11h; string x; string x]
+   };
+  s:$[t=11h; string each v;
+      t=10h; enlist v;
+      t=0h; to_s1 each v;
+      ::];
+  if[s~(::); :v];
+  u:upper each s;
+  map1:{[x] $[(x~"C") or (x~"CALL"); `C; (x~"P") or (x~"PUT"); `P; .oca.to_sym x]};
+  map1 each u
  }
 
 as_tables:{[tbls]
@@ -198,6 +216,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   ety: abs type (tt`expiry);
   if[ety in 12 15h; tt: update expiry:date expiry from tt];
   if[not ety in 14 12 15h; '"expiry column must be date or timestamp/datetime"];
+  tt: update put_call:.oca.norm_put_call put_call from tt;
+  if[not all ((tt`put_call) in `C`P); '"put_call column must contain C/P (or call/put)"];
   tt: update price_sel: tt[;price_col] from tt;
   tt: update dte: expiry - date from tt;
   dates: asc distinct tt`date;
