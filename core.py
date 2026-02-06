@@ -1210,7 +1210,8 @@ def compute_analytics_df(
 ) -> "pd.DataFrame":  # type: ignore[name-defined]
     _ensure_pandas()
     opts = validate_options_df(options_df)
-    terms, rates = _curve_arrays_from(curve)
+    curve_is_df = HAVE_PANDAS and isinstance(curve, pd.DataFrame)  # type: ignore[union-attr]
+    curve_has_date = bool(curve_is_df and "date" in curve.columns)  # type: ignore[union-attr]
 
     date_ser = pd.to_datetime(opts["date"], errors="raise")  # type: ignore[union-attr]
     expiry_ser = pd.to_datetime(opts["expiry"], errors="raise")  # type: ignore[union-attr]
@@ -1222,7 +1223,25 @@ def compute_analytics_df(
     K = opts["strike"].to_numpy(dtype=float)
     price = opts["settle"].to_numpy(dtype=float)
     is_call = (opts["put_call"] == "C").to_numpy(dtype=np.int8)
-    r = np.interp(T, terms, rates)
+    if curve_has_date:
+        curve_df = curve.copy()  # type: ignore[union-attr]
+        curve_df["_date_key"] = pd.to_datetime(curve_df["date"], errors="raise").dt.normalize()  # type: ignore[union-attr]
+        date_key = date_ser.dt.normalize()
+        r = np.empty(len(opts), dtype=float)
+        cache: Dict[object, Tuple[np.ndarray, np.ndarray]] = {}
+        groups = date_key.groupby(date_key).groups
+        for dt_val, idx in groups.items():
+            if dt_val not in cache:
+                sub = curve_df[curve_df["_date_key"] == dt_val]
+                if sub.empty:
+                    raise ValueError(f"curve table missing date {dt_val}.")
+                terms, rates = _curve_arrays_from(sub)
+                cache[dt_val] = (terms, rates)
+            terms, rates = cache[dt_val]
+            r[idx] = np.interp(T[idx], terms, rates)
+    else:
+        terms, rates = _curve_arrays_from(curve)
+        r = np.interp(T, terms, rates)
 
     use_nb = resolve_numba(use_numba)
     if use_nb:
