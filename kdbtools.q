@@ -958,6 +958,149 @@ squeeze:{[bb_n;bb_k;kc_n;kc_k;h;l;c]
     `squeeze`momentum!(sqzOn;mom)}
 
 // =============================================================================
+// RENKO
+// =============================================================================
+
+// Renko brick generation
+// @param x  - price series (vector)
+// @param bs - brick size: scalar (fixed) or vector same length as x (adaptive)
+// @return table: ([] idx:int; dir:int; lvl:float)
+//   idx = source bar index that triggered the brick
+//   dir = 1 (up) or -1 (down)
+//   lvl = brick close level
+// Reversal requires 2x brick size; continuation requires 1x
+// Multiple bricks can form on a single bar if price moves enough
+renko:{[x;bs]
+    n:count x;
+    if[n < 2; :([] idx:`int$(); dir:`int$(); lvl:`float$())];
+    bsv:$[0h > type bs; n#bs; bs];
+    bs0:bsv 0;
+    lvl:bs0 * floor (x 0) % bs0;
+    dir:0i;
+    bricks:();
+    i:0;
+    while[i < n;
+        p:x i;
+        b:bsv i;
+        moved:1b;
+        while[moved;
+            moved:0b;
+            // Up: 2x if reversing from down, 1x otherwise
+            upTh:$[dir = -1i; lvl + 2 * b; lvl + b];
+            if[p >= upTh;
+                lvl:upTh;
+                dir:1i;
+                bricks,:enlist (i;1i;lvl);
+                moved:1b];
+            if[not moved;
+                // Down: 2x if reversing from up, 1x otherwise
+                dnTh:$[dir = 1i; lvl - 2 * b; lvl - b];
+                if[p <= dnTh;
+                    lvl:dnTh;
+                    dir:-1i;
+                    bricks,:enlist (i;-1i;lvl);
+                    moved:1b]]];
+        i+:1];
+    $[0 = count bricks;
+        ([] idx:`int$(); dir:`int$(); lvl:`float$());
+        flip `idx`dir`lvl!flip bricks]}
+
+// Renko direction signal mapped to original time series
+// @param x  - price series
+// @param bs - brick size (scalar or vector)
+// @return int vector same length as x: null (no signal yet), 1 (up), -1 (down)
+renkoSignal:{[x;bs]
+    bricks:renko[x;bs];
+    n:count x;
+    if[0 = count bricks; :n#0Ni];
+    sig:n#0Ni;
+    sig[bricks`idx]:bricks`dir;
+    fills sig}
+
+// Consecutive Renko brick count mapped to original time series
+// Positive for consecutive up bricks, negative for consecutive down
+// e.g., 1 2 3 (three up bricks) then -1 -2 (two down bricks)
+// @param x  - price series
+// @param bs - brick size (scalar or vector)
+// @return int vector same length as x
+renkoCount:{[x;bs]
+    bricks:renko[x;bs];
+    n:count x;
+    if[0 = count bricks; :n#0Ni];
+    dirs:bricks`dir;
+    nd:count dirs;
+    cnt:nd#0i;
+    cnt[0]:dirs 0;
+    j:1;
+    while[j < nd;
+        cnt[j]:$[dirs[j] = dirs j - 1; cnt[j - 1] + dirs j; dirs j];
+        j+:1];
+    sig:n#0Ni;
+    sig[bricks`idx]:cnt;
+    fills sig}
+
+// Renko table interface - adds renkoDir and renkoCount columns
+// @param t        - table sorted by bycol, time
+// @param bycol    - group column (e.g. `sym) or (::) for no grouping
+// @param priceCol - price column name (e.g. `close)
+// @param bs       - brick size:
+//   float scalar  - fixed brick size
+//   symbol        - column name for pre-computed adaptive brick size
+//   float vector  - adaptive brick size (same length as t)
+//   dict          - ATR-based: `n`mult!(20;2.0) uses 2x ATR(20) from high/low/close columns
+//                   optional `high`low`close keys override column names (default `high`low`close)
+// @return original table + renkoDir + renkoCount columns
+renkoTable:{[t;bycol;priceCol;bs]
+    n:count t;
+    prices:t priceCol;
+    isATR:99h = type bs;
+    // Pre-resolve non-ATR brick sizes; ATR computed per group below
+    bsVec:$[isATR; 0n;
+        -11h = type bs; t bs;
+        bs];
+    // For ATR mode, extract h/l/c column vectors
+    atrCfg:$[isATR;
+        [hCol:$[`high in key bs; bs`high; `high];
+         lCol:$[`low in key bs; bs`low; `low];
+         cCol:$[`close in key bs; bs`close; `close];
+         `n`mult`h`l`c!(bs`n;bs`mult;t hCol;t lCol;t cCol)];
+        ()!()];
+    grpIdxs:$[(::)~bycol; enlist til n; value group t bycol];
+    proc:{[prices;bsVec;isATR;atrCfg;idxs]
+        p:prices idxs;
+        b:$[isATR;
+            (atrCfg`mult) * atr[atrCfg`n; (atrCfg`h) idxs; (atrCfg`l) idxs; (atrCfg`c) idxs];
+            0h > type bsVec; bsVec;
+            bsVec idxs];
+        bricks:renko[p;b];
+        ng:count idxs;
+        if[0 = count bricks; :`idxs`dir`cnt!(idxs;ng#0Ni;ng#0Ni)];
+        // Direction signal
+        dirSig:ng#0Ni;
+        dirSig[bricks`idx]:bricks`dir;
+        dirSig:fills dirSig;
+        // Consecutive count
+        dirs:bricks`dir;
+        nd:count dirs;
+        cntV:nd#0i;
+        cntV[0]:dirs 0;
+        j:1;
+        while[j < nd;
+            cntV[j]:$[dirs[j] = dirs j - 1; cntV[j - 1] + dirs j; dirs j];
+            j+:1];
+        cntSig:ng#0Ni;
+        cntSig[bricks`idx]:cntV;
+        cntSig:fills cntSig;
+        `idxs`dir`cnt!(idxs;dirSig;cntSig)
+    }[prices;bsVec;isATR;atrCfg];
+    results:proc each grpIdxs;
+    allIdx:raze results[;`idxs];
+    allDir:raze results[;`dir];
+    allCnt:raze results[;`cnt];
+    ord:iasc allIdx;
+    t,'flip `renkoDir`renkoCount!(allDir ord;allCnt ord)}
+
+// =============================================================================
 // DIGITAL FILTERS & SIGNAL PROCESSING
 // =============================================================================
 
