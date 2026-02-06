@@ -1496,18 +1496,25 @@ rollingAbsorption:{[w;X;k]
         if[any null widx; :0n];
         Xw:X widx;
         if[(k + 2) > count Xw; :0n];
+        // Filter out constant/zero-variance columns
+        fCols:flip Xw;
+        live:where {(dev x) > 1e-15} each fCols;
+        if[2 > count live; :0n];
+        Xw:flip fCols live;
+        pLive:count live;
+        kLive:k & pLive;
         // Center
         mu:avg each flip Xw;
         Xc:Xw -\: mu;
         C:((flip Xc) mmu Xc) % (count Xw) - 1;
-        trC:sum C[;til p]@'til p;
+        trC:sum C[;til pLive]@'til pLive;
         if[trC < 1e-15; :0n];
         // Power iteration + deflation for top k eigenvalues
         Cw:C;
         eigSum:0f;
         j:0;
-        while[j < k;
-            v:p?1.0;
+        while[j < kLive;
+            v:pLive?1.0;
             v:v % sqrt sum v * v;
             do[50; v2:Cw mmu v; nrm:sqrt sum v2 * v2; v:$[nrm > 1e-15; v2 % nrm; v]];
             lam:sum v * Cw mmu v;
@@ -1531,18 +1538,20 @@ rollingAvgAbsCor:{[w;X]
         Xw:X widx;
         nw:count Xw;
         if[3 > nw; :0n];
-        // Compute pairwise correlations directly (avoids cormat edge cases)
+        // Compute pairwise correlations, skipping constant columns
         fCols:flip Xw;  // p columns of nw values
+        live:where {(dev x) > 1e-15} each fCols;  // columns with nonzero variance
+        if[2 > count live; :0n];
         total:0f; cnt:0;
-        i:0;
-        while[i < p - 1;
-            j:i + 1;
-            while[j < p;
-                total+:abs cor[fCols i; fCols j];
-                cnt+:1;
-                j+:1];
-            i+:1];
-        total % cnt
+        ii:0;
+        while[ii < (count live) - 1;
+            jj:ii + 1;
+            while[jj < count live;
+                c:cor[fCols live ii; fCols live jj];
+                if[not null c; total+:abs c; cnt+:1];
+                jj+:1];
+            ii+:1];
+        $[cnt = 0; 0n; total % cnt]
     }[X;p] each idx}
 
 // Classify correlation regime: 0 = normal, 1 = crisis (high correlation)
@@ -1607,12 +1616,14 @@ corRegimeTable:{[t;bycol;xc;w;mode;thresh]
     }[xc;w;mode;thresh;isAdaptive];
     if[(::)~bycol;
         :helper t];
+    // Add row index to preserve original order after group/raze
     t:update corIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
-    result:raze helper each groups;
-    result:`corIdx__ xasc result;
-    delete corIdx__ from result}
+    // Group using built-in group, process each subtable
+    grp:group t bycol;
+    parts:helper each t value grp;
+    result:`corIdx__ xasc raze parts;
+    // Functional delete (safe inside functions)
+    ![result;();0b;enlist `corIdx__]}
 
 // =============================================================================
 // ROLLING REGRESSION METHODS
@@ -1830,8 +1841,8 @@ rollingRidgeHelperInterceptParallel:{[xc;ycol;w;lam;g]
 rollingRidgeTable:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    grp:group t bycol;
+    groups:t value grp;
     nGroups:count groups;
     // Choose parallelization strategy based on number of groups
     result:$[nGroups >= 4;
@@ -1841,7 +1852,7 @@ rollingRidgeTable:{[t;bycol;xc;ycol;window;lam]
         raze rollingRidgeHelperParallel[xc;ycol;window;lam] each groups];
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
-    delete ridgeIdx__ from result}
+    ![result;();0b;enlist `ridgeIdx__]}
 
 // Rolling ridge regression with intercept by group
 // Returns original columns + b_intercept + b_<feature> columns + yhat
@@ -1855,8 +1866,8 @@ rollingRidgeTable:{[t;bycol;xc;ycol;window;lam]
 rollingRidgeTableIntercept:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    grp:group t bycol;
+    groups:t value grp;
     nGroups:count groups;
     // Choose parallelization strategy based on number of groups
     result:$[nGroups >= 4;
@@ -1866,7 +1877,7 @@ rollingRidgeTableIntercept:{[t;bycol;xc;ycol;window;lam]
         raze rollingRidgeHelperInterceptParallel[xc;ycol;window;lam] each groups];
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
-    delete ridgeIdx__ from result}
+    ![result;();0b;enlist `ridgeIdx__]}
 
 // Rolling Ridge with intercept AND z-scoring of features within each window
 // Features are z-scored using only data within the rolling window (no lookahead)
@@ -1992,15 +2003,15 @@ rollingRidgeHelperInterceptZscoreParallel:{[xc;ycol;w;lam;g]
 rollingRidgeTableInterceptZscore:{[t;bycol;xc;ycol;window;lam]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    grp:group t bycol;
+    groups:t value grp;
     nGroups:count groups;
     result:$[nGroups >= 4;
         raze rollingRidgeHelperInterceptZscore[xc;ycol;window;lam] peach groups;
         raze rollingRidgeHelperInterceptZscoreParallel[xc;ycol;window;lam] each groups];
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
-    delete ridgeIdx__ from result}
+    ![result;();0b;enlist `ridgeIdx__]}
 
 // ============================================================================
 // PCA-BASED ROLLING RIDGE REGRESSION
@@ -2116,12 +2127,12 @@ rollingRidgeHelperPCA:{[xc;ycol;w;lam;nComp;g]
 rollingRidgeTablePCA:{[t;bycol;xc;ycol;window;lam;nComp]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    grp:group t bycol;
+    groups:t value grp;
     result:raze rollingRidgeHelperPCA[xc;ycol;window;lam;nComp] each groups;
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
-    delete ridgeIdx__ from result}
+    ![result;();0b;enlist `ridgeIdx__]}
 
 // ============================================================================
 // VOLATILITY REGIME-BASED ROLLING RIDGE REGRESSION
@@ -2234,12 +2245,12 @@ rollingRidgeHelperRegime:{[xc;ycol;w;lam;volWindow;g]
 rollingRidgeTableRegime:{[t;bycol;xc;ycol;window;lam;volWindow]
     // Add row index to preserve original order
     t:update ridgeIdx__:i from t;
-    vals:distinct t bycol;
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
+    grp:group t bycol;
+    groups:t value grp;
     result:raze rollingRidgeHelperRegime[xc;ycol;window;lam;volWindow] each groups;
     // Restore original row order and remove index column
     result:`ridgeIdx__ xasc result;
-    delete ridgeIdx__ from result}
+    ![result;();0b;enlist `ridgeIdx__]}
 
 // Forward N-period simple return: sum(ret[t+1]..ret[t+N])
 // @param N - number of periods forward
@@ -2531,7 +2542,6 @@ msRegPredict:{[X;b0;b1;fp0;fp1]
 // @param tol - EM convergence tolerance
 // @return - original table + fp0,fp1,s0,s1,p00,p11,yhat,regime,b0_*,b1_* columns
 msRegTable:{[t;bycol;xc;ycol;window;lam;maxIter;tol]
-    vals:distinct t bycol;
     helper:{[xc;ycol;w;lam;mi;tol;g]
         X:flip g xc; y:g ycol;
         r:msRegRolling[w;X;y;lam;mi;tol];
@@ -2541,8 +2551,11 @@ msRegTable:{[t;bycol;xc;ycol;window;lam;maxIter;tol]
             r`fp0;r`fp1;r`s0;r`s1;r`p00;r`p11;r`yhat;r`regime);
         g,'(flip main),'flip bcols
     }[xc;ycol;window;lam;maxIter;tol];
-    groups:{[t;col;s] ?[t;enlist (=;col;enlist s);0b;()]}[t;bycol] each vals;
-    raze helper each groups}
+    t:update msRegIdx__:i from t;
+    grp:group t bycol;
+    result:raze helper each t value grp;
+    result:`msRegIdx__ xasc result;
+    ![result;();0b;enlist `msRegIdx__]}
 
 // =============================================================================
 // CHANGEPOINT DETECTION
@@ -2799,18 +2812,19 @@ bocpdAuto:{[x;hazard]
 // CUSUM table interface
 cpTableCusum:{[t;bycol;col;params]
     w:params`window; k:params`k; h:params`h;
-    vals:distinct t bycol;
     helper:{[col;w;k;h;g]
         r:cusumr[w;g col;k;h];
         g,'flip `cusumStat`cusumAlarm!(r`stat;r`alarm)
     }[col;w;k;h];
-    groups:{[t;c;s] ?[t;enlist (=;c;enlist s);0b;()]}[t;bycol] each vals;
-    raze helper each groups}
+    t:update cpIdx__:i from t;
+    grp:group t bycol;
+    result:raze helper each t value grp;
+    result:`cpIdx__ xasc result;
+    ![result;();0b;enlist `cpIdx__]}
 
 // PELT table interface
 cpTablePelt:{[t;bycol;col;params]
     pen:params`pen; ms:params`minSize;
-    vals:distinct t bycol;
     helper:{[col;pen;ms;g]
         x:g col; n:count x;
         cps:pelt[x;pen;ms];
@@ -2826,13 +2840,15 @@ cpTablePelt:{[t;bycol;col;params]
             j+:1];
         g,'flip `isChangepoint`segMean`segVar!(isCP;segMu;segVar)
     }[col;pen;ms];
-    groups:{[t;c;s] ?[t;enlist (=;c;enlist s);0b;()]}[t;bycol] each vals;
-    raze helper each groups}
+    t:update cpIdx__:i from t;
+    grp:group t bycol;
+    result:raze helper each t value grp;
+    result:`cpIdx__ xasc result;
+    ![result;();0b;enlist `cpIdx__]}
 
 // BinSeg table interface
 cpTableBinseg:{[t;bycol;col;params]
     pen:params`pen; ms:params`minSize; mc:params`maxCP;
-    vals:distinct t bycol;
     helper:{[col;pen;ms;mc;g]
         x:g col; n:count x;
         cps:binseg[x;pen;ms;mc];
@@ -2847,18 +2863,23 @@ cpTableBinseg:{[t;bycol;col;params]
             j+:1];
         g,'flip `isChangepoint`segMean`segVar!(isCP;segMu;segVar)
     }[col;pen;ms;mc];
-    groups:{[t;c;s] ?[t;enlist (=;c;enlist s);0b;()]}[t;bycol] each vals;
-    raze helper each groups}
+    t:update cpIdx__:i from t;
+    grp:group t bycol;
+    result:raze helper each t value grp;
+    result:`cpIdx__ xasc result;
+    ![result;();0b;enlist `cpIdx__]}
 
 // BOCPD table interface
 bocpdTable:{[t;bycol;col;hazard]
-    vals:distinct t bycol;
     helper:{[col;hazard;g]
         r:bocpdAuto[g col;hazard];
         g,'flip `cpProb`cpScore`runLength`cpDetect`postMean`postVar!(r`cpProb;r`cpScore;r`runLength;r`cpDetect;r`postMean;r`postVar)
     }[col;hazard];
-    groups:{[t;c;s] ?[t;enlist (=;c;enlist s);0b;()]}[t;bycol] each vals;
-    raze helper each groups}
+    t:update cpIdx__:i from t;
+    grp:group t bycol;
+    result:raze helper each t value grp;
+    result:`cpIdx__ xasc result;
+    ![result;();0b;enlist `cpIdx__]}
 
 // Unified changepoint detection table interface
 // @param t - table (sorted by bycol, time)
