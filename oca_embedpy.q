@@ -240,25 +240,32 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   if[not ety in 14 12 15h; '"expiry column must be date or timestamp/datetime"];
   tt: update put_call:.oca.norm_put_call put_call from tt;
   if[not all ((tt`put_call) in `C`P); '"put_call column must contain C/P (or call/put)"];
+  use_mkt_anchor: (price_col=`theo) and (`settle in cols tt);
   tt: update price_sel: tt[;price_col] from tt;
   tt: update dte: expiry - date from tt;
   dates: asc distinct tt`date;
   idx: til `int$count dates;
   reb_dates: dates where (idx mod r) = 0;
 
-  pick:{[d; td; mind; maxd; tt; strat]
+  pick:{[d; td; mind; maxd; tt; strat; use_mkt_anchor]
     sub: tt where (tt`date)=d;
     sub: sub where (sub`dte) >= mind;
     if[not maxd~(::); sub: sub where (sub`dte) <= maxd];
     if[0=count sub; :()];
-    exp_tbl: 0!select dte:first dte by expiry from sub;
+    sub_pick: sub;
+    if[use_mkt_anchor;
+      sub_mkt: sub where not null sub`settle;
+      if[0<count sub_mkt; sub_pick: sub_mkt];
+    ];
+    if[0=count sub_pick; :()];
+    exp_tbl: 0!select dte:first dte by expiry from sub_pick;
     diffs: abs ((exp_tbl`dte) - td);
     md: exec min d from ([] d: diffs);
     exp_exp: exp_tbl`expiry;
     exp_sel: exp_exp where diffs = md;
     if[0=count exp_sel; :()];
     exp_sel: exp_sel 0;
-    sub2: sub where (sub`expiry)=exp_sel;
+    sub2: sub_pick where (sub_pick`expiry)=exp_sel;
     if[strat=`straddle;
       avail: select hasC:any put_call=`C, hasP:any put_call=`P by strike from sub2;
       good: exec strike from avail where hasC & hasP;
@@ -274,7 +281,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     (`reb_date`expiry`strike`underlying)! (d; exp_sel; k; u)
   };
 
-  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat];
+  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat; (count reb_dates)#enlist use_mkt_anchor];
   picks: picks except enlist ();
   if[0=count picks; '"no valid rebalance dates"];
   picks_tbl: flip (`reb_date`expiry`strike`underlying)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying);
@@ -307,7 +314,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     mask: mask & ((tt`put_call) in pc_set);
     mask: 0 <> mask;
     leg: select date, put_call, price: price_sel from tt where mask;
-    if[0<count leg; leg: 0!select price: sum price by date, put_call from leg];
+    if[0<count leg; leg: 0!select price: avg price by date, put_call from leg];
     if[strat=`straddle;
       cnt_map: count each group leg`date;
       ncol: cnt_map leg`date;
