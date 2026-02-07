@@ -302,8 +302,10 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     mask: (tt`date) in seg_dates;
     mask: mask & (tt`expiry)=exp_date;
     sty:abs type tt`strike;
-    mask: mask & $[sty in 8 9h; abs((tt`strike) - strike) <= (1e-8 + 1e-10 * abs strike); (tt`strike)=strike];
-    mask: mask & (tt`put_call) in pc_set;
+    tol:0.00000001 + 0.0000000001 * abs strike;
+    mask: mask & $[sty in 8 9h; abs((tt`strike) - strike) <= tol; (tt`strike)=strike];
+    mask: mask & ((tt`put_call) in pc_set);
+    mask: 0 <> mask;
     leg: select date, put_call, price: price_sel from tt where mask;
     if[0<count leg; leg: 0!select price: sum price by date, put_call from leg];
     if[strat=`straddle;
