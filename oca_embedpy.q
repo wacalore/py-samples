@@ -222,10 +222,14 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   td: $[target_dte~(::); 30; target_dte];
   mind: $[min_dte~(::); 7; min_dte];
   maxd: $[max_dte~(::); ::; max_dte];
-  pm: $[price_mode~(::); `market; price_mode];
+  pm_in: $[price_mode~(::); `market; .oca.to_sym price_mode];
+  known_pm:`market`mkt`settle`theo`market_cont`mkt_cont`settle_cont`theo_cont`market_reset`mkt_reset`settle_reset`theo_reset;
+  if[not pm_in in known_pm; '"unknown price_mode"];
+  cont_mode: not pm_in in `market_reset`mkt_reset`settle_reset`theo_reset;
+  pm: $[pm_in in `market`mkt`settle`market_cont`mkt_cont`settle_cont`market_reset`mkt_reset`settle_reset; `market; `theo];
   strat: $[strategy~(::); `straddle; strategy];
   s: .oca.norm_side side;
-  price_col: $[pm in (`market;`mkt;`settle); `settle; `theo];
+  price_col: $[pm=`market; `settle; `theo];
   req: `date`expiry`strike`put_call`underlying;
   if[not all req in cols t; '"analytics table missing required columns"];
   if[not price_col in cols t; '"analytics table missing price column"];
@@ -291,7 +295,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   pc_set: $[strat=`call; enlist `C; strat=`put; enlist `P; `C`P];
 
   seg_tbl: update end_date:end_dates from picks_tbl;
-  env: (`tt`dates`pc_set`strat`side`price_mode)!(tt; dates; pc_set; strat; s; pm);
+  env: (`tt`dates`pc_set`strat`side`price_mode`cont_mode)!(tt; dates; pc_set; strat; s; pm; cont_mode);
 
   seg_fn:{[seg; env]
     rb: seg`reb_date;
@@ -304,7 +308,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     strat: env`strat;
     s: env`side;
     pm: env`price_mode;
-    seg_dates: dates where (dates>=rb) & (dates<re);
+    cont: env`cont_mode;
+    seg_dates: $[cont; dates where (dates>=rb) & (dates<=re); dates where (dates>=rb) & (dates<re)];
     if[0=count seg_dates; :()];
     mask: (tt`date) in seg_dates;
     mask: mask & (tt`expiry)=exp_date;
@@ -313,7 +318,11 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     mask: mask & $[sty in 8 9h; abs((tt`strike) - strike) <= tol; (tt`strike)=strike];
     mask: mask & ((tt`put_call) in pc_set);
     mask: 0 <> mask;
-    leg: select date, put_call, price: price_sel from tt where mask;
+    leg0: tt where mask;
+    if[`quote_perm_id in cols leg0;
+      leg0: 0!select price_sel:first price_sel by quote_perm_id,date,put_call from leg0;
+    ];
+    leg: select date, put_call, price: price_sel from leg0;
     if[0<count leg; leg: 0!select price: avg price by date, put_call from leg];
     if[strat=`straddle;
       cnt_map: count each group leg`date;
@@ -336,7 +345,13 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   segs: seg_fn'[seg_tbl; (count seg_tbl)#enlist env];
   segs: segs where 0 < count each segs;
   if[0=count segs; '"no pricing rows for selected ATM strategy"];
-  raze segs
+  out: raze segs;
+  if[cont_mode;
+    overlap: 1 _ reb;
+    keep: (not ((out`date) in overlap)) or ((out`reb_date) < out`date);
+    out: out where keep;
+  ];
+  out
  }
 
 optimize_raw1:{[args]
