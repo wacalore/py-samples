@@ -193,6 +193,26 @@ norm_put_call:{[v]
   map1 each u
  }
 
+norm_quote_perm_id:{[v]
+  to1:{[x]
+    tx:abs type x;
+    if[x~(::); :`];
+    if[tx in 8 9h;
+      if[null x; :`];
+    ];
+    if[tx=11h; :x];
+    if[tx=10h; :$[0=count x; `; `$x]];
+    sx:lower string x;
+    if[(sx~"0n") or (sx~"0w") or (sx~"nan") or (sx~"none") or (sx~"null") or (sx~""); :`];
+    `$sx
+  };
+  t:abs type v;
+  $[t=11h; v;
+    t=10h; enlist to1 v;
+    t=0h; to1 each v;
+    to1 each enlist v]
+ }
+
 as_tables:{[tbls]
   $[98h=type tbls; enlist tbls;
     99h=type tbls; enlist 0!tbls;
@@ -438,6 +458,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     legs: .oca.strategy_legs[sub_rb; strike; strat];
     if[(98h<>type legs) or (0=count legs); :()];
     leg_desc: `$ .oca.legs_desc legs;
+    have_qid:(`quote_perm_id in cols tt) and (11h=type tt`quote_perm_id);
     leg_tbls:();
     i:0;
     while[i<count legs;
@@ -446,16 +467,44 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       q: (legs`qty) i;
       sty: abs type tt`strike;
       tol: 0.00000001 + 0.0000000001 * abs k;
-      mask: (tt`date) in seg_dates;
-      mask: mask & (tt`expiry)=exp_date;
-      mask: mask & ((tt`put_call)=pc);
-      mask: mask & $[sty in 8 9h; abs((tt`strike) - k) <= tol; (tt`strike)=k];
-      mask: 0 <> mask;
-      leg0: tt where mask;
-      if[`quote_perm_id in cols leg0;
-        leg0: 0!select price_sel:first price_sel by quote_perm_id,date,put_call,strike from leg0;
+      qid:(::);
+      if[have_qid;
+        rb_mask:(sub_rb`put_call)=pc;
+        rb_mask: rb_mask & $[sty in 8 9h; abs((sub_rb`strike) - k) <= tol; (sub_rb`strike)=k];
+        rb_leg: sub_rb where rb_mask;
+        if[0<count rb_leg;
+          rb_leg: rb_leg where (rb_leg`quote_perm_id)<>`;
+          if[0<count rb_leg;
+            qid:first asc distinct rb_leg`quote_perm_id;
+          ];
+        ];
       ];
-      leg1:$[0=count leg0; ([] date:seg_dates; leg_price:(count seg_dates)#0n); 0!select leg_price:avg price_sel by date from leg0];
+      mask0: (tt`date) in seg_dates;
+      mask0: mask0 & (tt`expiry)=exp_date;
+      mask0: mask0 & ((tt`put_call)=pc);
+      mask0: mask0 & $[sty in 8 9h; abs((tt`strike) - k) <= tol; (tt`strike)=k];
+      mask0: 0 <> mask0;
+      leg0_all: tt where mask0;
+      leg0: leg0_all;
+      anchored:0b;
+      if[(not qid~(::)) and have_qid;
+        leg_q: leg0_all where (leg0_all`quote_perm_id)=qid;
+        if[0<count leg_q;
+          n_cov: count distinct leg_q`date;
+          if[n_cov>1;
+            leg0: leg_q;
+            anchored:1b;
+          ];
+        ];
+      ];
+      leg1:([] date:seg_dates; leg_price:(count seg_dates)#0n);
+      if[0<count leg0;
+        if[(not anchored) and have_qid;
+          leg0: leg0 @ iasc leg0`quote_perm_id;
+          leg0: 0!select price_sel:first price_sel by quote_perm_id,date from leg0;
+        ];
+        leg1: 0!select leg_price:first price_sel by date from leg0;
+      ];
       scaffold:([] date:seg_dates);
       leg1: scaffold lj `date xkey leg1;
       leg1: update leg_price:fills leg_price from leg1;
@@ -503,6 +552,96 @@ atm_strategy_suite_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; pr
   ];
   if[0=count outs; '"no pricing rows for selected ATM strategy suite"];
   raze outs
+ }
+
+atm_strategy_pnl_diagnostics:{[rets; top_n]
+  t:rets;
+  if[99h=type t; t:0!t];
+  if[98h<>type t; '"returns input must be a table"];
+  req:`date`reb_date`price`pnl;
+  if[not all req in cols t; '"returns table missing required columns (`date`reb_date`price`pnl)"];
+  if[0=count t;
+    e:([]);
+    :(`summary`by_trade`daily`top_days`worst_days`top_trades`worst_trades)!(e;e;e;e;e;e;e);
+  ];
+
+  dty: abs type t`date;
+  if[dty in 12 15h; t:update date:date date from t];
+  if[not dty in 14 12 15h; '"date column must be date or timestamp/datetime"];
+  rty: abs type t`reb_date;
+  if[rty in 12 15h; t:update reb_date:date reb_date from t];
+  if[not rty in 14 12 15h; '"reb_date column must be date or timestamp/datetime"];
+
+  tn: $[top_n~(::); 10; top_n];
+  tn: max 1, `int$tn;
+
+  if[not `strategy in cols t; t:update strategy:`all from t];
+  if[not `side in cols t; t:update side:1f from t];
+  if[not `price_mode in cols t; t:update price_mode:`unknown from t];
+  if[not `expiry in cols t; t:update expiry:0Nd from t];
+  if[not `strike in cols t; t:update strike:0n from t];
+
+  trade:0!select
+    entry_date:first date,
+    exit_date:last date,
+    hold_days:count i,
+    entry_price:first price,
+    exit_price:last price,
+    segment_pnl:sum pnl,
+    segment_abs_pnl:sum abs pnl,
+    max_day_pnl:max pnl,
+    min_day_pnl:min pnl
+    by reb_date,strategy,side,price_mode,expiry,strike from t;
+  trade:update segment_ret: segment_pnl % abs entry_price from trade;
+  trade:update segment_pnl:0f^segment_pnl, segment_ret:0f^segment_ret from trade;
+
+  svals: distinct trade`strategy;
+  out_trade:();
+  i:0;
+  while[i<count svals;
+    s1:(svals i);
+    sub: trade where (trade`strategy)=s1;
+    sub: sub @ iasc sub`reb_date;
+    sub: update cum_pnl:sums segment_pnl from sub;
+    sub: update cum_peak:maxs cum_pnl from sub;
+    sub: update drawdown:cum_pnl - cum_peak from sub;
+    out_trade,:enlist sub;
+    i+:1;
+  ];
+  trade: raze out_trade;
+
+  daily:$[
+    `ret in cols t;
+    0!select day_pnl:sum pnl, day_abs_ret:sum abs ret by date,strategy from t;
+    0!select day_pnl:sum pnl by date,strategy from t
+  ];
+  if[not `day_pnl in cols daily; '"internal error: daily summary missing day_pnl"];
+  daily: daily @ reverse iasc daily`day_pnl;
+  top_days: tn#daily;
+  worst_days: tn#(daily @ iasc daily`day_pnl);
+
+  top_trades: tn#(trade @ reverse iasc trade`segment_pnl);
+  worst_trades: tn#(trade @ iasc trade`segment_pnl);
+
+  summary:0!select
+    start_date:min date,
+    end_date:max date,
+    n_days:count distinct date,
+    rebalance_count:count distinct reb_date,
+    total_pnl:sum pnl,
+    avg_day_pnl:avg pnl,
+    pnl_stdev:dev pnl,
+    win_rate:avg pnl>0f,
+    best_day:max pnl,
+    worst_day:min pnl
+    by strategy from t;
+
+  (`summary`by_trade`daily`top_days`worst_days`top_trades`worst_trades)!(summary; trade; daily; top_days; worst_days; top_trades; worst_trades)
+ }
+
+atm_strategy_trade_table:{[rets]
+  d: .oca.atm_strategy_pnl_diagnostics[rets; 10];
+  d`by_trade
  }
 
 optimize_raw1:{[args]
@@ -685,6 +824,7 @@ analyze_chain_df:{[options; curve; cfg; libpath]
   out:$[99h=type out; .oca.to_table out; out];
   if[98h=type out;
     if[`put_call in cols out; out:update put_call:.oca.norm_put_call put_call from out];
+    if[`quote_perm_id in cols out; out:update quote_perm_id:.oca.norm_quote_perm_id quote_perm_id from out];
   ];
   out
  }
