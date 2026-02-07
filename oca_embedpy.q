@@ -154,6 +154,28 @@ to_sym:{[x]
     `$string x]
  }
 
+norm_side:{[side]
+  if[side~(::); :1f];
+  ts:type side;
+  ats:abs ts;
+  if[(ts<0h) and (ats in 1 4 5 6 7 8 9h); :1f*side];
+  if[(ts>0h) and (ats in 1 4 5 6 7 8 9h);
+    if[0=count side; '"side must be non-empty"];
+    :1f*first side;
+  ];
+  if[ts=0h;
+    if[0=count side; '"side must be non-empty"];
+    :.oca.norm_side first side;
+  ];
+  s:$[ats=11h; lower string $[ts<0h; side; first side];
+      ats=10h; lower $[ts<0h; side; first side];
+      ""];
+  sy:.oca.to_sym s;
+  if[(sy~`1) or (sy~`long) or (sy~`buy) or (sy~`b) or (sy~`l) or (sy~`pos) or (sy~`positive) or (sy~`f) or (s~"+1") or (s~"1"); :1f];
+  if[(sy~`short) or (sy~`sell) or (sy~`s) or (sy~`neg) or (sy~`negative) or (s~"-1"); :-1f];
+  '"side must be numeric (+/-1) or one of `long/`short/`buy/`sell"
+ }
+
 norm_put_call:{[v]
   / Normalize put/call tags to `C/`P so downstream masks are type-stable.
   t:abs type v;
@@ -202,7 +224,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   maxd: $[max_dte~(::); ::; max_dte];
   pm: $[price_mode~(::); `market; price_mode];
   strat: $[strategy~(::); `straddle; strategy];
-  s: $[side~(::); 1f; side];
+  s: .oca.norm_side side;
   price_col: $[pm in (`market;`mkt;`settle); `settle; `theo];
   req: `date`expiry`strike`put_call`underlying;
   if[not all req in cols t; '"analytics table missing required columns"];
@@ -224,7 +246,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   idx: til `int$count dates;
   reb_dates: dates where (idx mod r) = 0;
 
-  pick:{[d; td; mind; maxd; tt]
+  pick:{[d; td; mind; maxd; tt; strat]
     sub: tt where (tt`date)=d;
     sub: sub where (sub`dte) >= mind;
     if[not maxd~(::); sub: sub where (sub`dte) <= maxd];
@@ -237,6 +259,14 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[0=count exp_sel; :()];
     exp_sel: exp_sel 0;
     sub2: sub where (sub`expiry)=exp_sel;
+    if[strat=`straddle;
+      avail: select hasC:any put_call=`C, hasP:any put_call=`P by strike from sub2;
+      good: exec strike from avail where hasC & hasP;
+      sub2: sub2 where (sub2`strike) in good;
+    ];
+    if[strat=`call; sub2: sub2 where (sub2`put_call)=`C];
+    if[strat=`put; sub2: sub2 where (sub2`put_call)=`P];
+    if[0=count sub2; :()];
     u: first sub2`underlying;
     sub2: update m: abs(strike - u) from sub2;
     m0: exec min m from sub2;
@@ -244,7 +274,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     (`reb_date`expiry`strike`underlying)! (d; exp_sel; k; u)
   };
 
-  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt];
+  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat];
   picks: picks except enlist ();
   if[0=count picks; '"no valid rebalance dates"];
   picks_tbl: flip (`reb_date`expiry`strike`underlying)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying);
@@ -271,21 +301,26 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[0=count seg_dates; :()];
     mask: (tt`date) in seg_dates;
     mask: mask & (tt`expiry)=exp_date;
-    mask: mask & (tt`strike)=strike;
+    sty:abs type tt`strike;
+    mask: mask & $[sty in 8 9h; abs(tt`strike - strike) <= (1e-8 + 1e-10 * abs strike); (tt`strike)=strike];
     mask: mask & (tt`put_call) in pc_set;
     leg: select date, put_call, price: price_sel from tt where mask;
+    if[0<count leg; leg: 0!select price: sum price by date, put_call from leg];
     if[strat=`straddle;
       cnt_map: count each group leg`date;
       ncol: cnt_map leg`date;
       mask2: ncol = 2;
       leg: leg where mask2;
     ];
-    if[0=count leg; :()];
-    px: 0!select price: sum price by date from leg;
+    px:$[0=count leg; ([] date:seg_dates; price:(count seg_dates)#0n); 0!select price: sum price by date from leg];
     px: px @ iasc px`date;
+    scaffold:([] date:seg_dates);
+    px: scaffold lj `date xkey px;
+    px: update price:fills price from px;
     px: update reb_date:rb, expiry:exp_date, strike:strike, strategy:strat, price_mode:pm, side:s from px;
     px: update pnl: s * (price - prev price) from px;
     px: update ret: pnl % abs prev price from px;
+    px: update pnl:0f^pnl, ret:0f^ret from px;
     px
   };
 
