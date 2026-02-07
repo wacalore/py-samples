@@ -382,6 +382,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   if[not ety in 14 12 15h; '"expiry column must be date or timestamp/datetime"];
   tt: update put_call:.oca.norm_put_call put_call from tt;
   if[not all ((tt`put_call) in `C`P); '"put_call column must contain C/P (or call/put)"];
+  have_ric:`underlying_ric in cols tt;
+  if[have_ric; tt:update underlying_ric:.oca.to_sym each underlying_ric from tt];
   use_mkt_anchor: (price_col=`theo) and (`settle in cols tt);
   tt: update price_sel: tt[;price_col] from tt;
   tt: update dte: expiry - date from tt;
@@ -389,7 +391,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   idx: til `int$count dates;
   reb_dates: dates where (idx mod r) = 0;
 
-  pick:{[d; td; mind; maxd; tt; strat; use_mkt_anchor]
+  pick:{[d; td; mind; maxd; tt; strat; use_mkt_anchor; have_ric]
     sub: tt where (tt`date)=d;
     sub: sub where (sub`dte) >= mind;
     if[not maxd~(::); sub: sub where (sub`dte) <= maxd];
@@ -409,6 +411,39 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     exp_sel: exp_sel 0;
     sub2: sub_pick where (sub_pick`expiry)=exp_sel;
     if[0=count sub2; :()];
+    if[have_ric;
+      ric_vals: asc distinct sub2`underlying_ric;
+      k:(::);
+      u:(::);
+      ric_sel:`;
+      j:0;
+      while[j<count ric_vals;
+        r1:(ric_vals j);
+        subr: sub2 where (sub2`underlying_ric)=r1;
+        if[0<count subr;
+          u1:first subr`underlying;
+          cand_tbl:([] strike:asc distinct subr`strike);
+          cand_tbl: update m:abs(strike - u1) from cand_tbl;
+          cand_tbl: cand_tbl @ iasc cand_tbl`m;
+          i:0;
+          while[i<count cand_tbl;
+            k0:(cand_tbl`strike) i;
+            legs:.oca.strategy_legs[subr; k0; strat];
+            if[(98h=type legs) and (0<count legs);
+              k:k0;
+              u:u1;
+              ric_sel:r1;
+              i:count cand_tbl;
+              j:count ric_vals;
+            ];
+            i+:1;
+          ];
+        ];
+        j+:1;
+      ];
+      if[(k~(::)) or (ric_sel~`); :()];
+      :(`reb_date`expiry`strike`underlying`underlying_ric)! (d; exp_sel; k; u; ric_sel);
+    ];
     u: first sub2`underlying;
     cand_tbl: ([] strike:asc distinct sub2`strike);
     if[0=count cand_tbl; :()];
@@ -426,13 +461,13 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       i+:1;
     ];
     if[k~(::); :()];
-    (`reb_date`expiry`strike`underlying)! (d; exp_sel; k; u)
+    (`reb_date`expiry`strike`underlying`underlying_ric)! (d; exp_sel; k; u; `)
   };
 
-  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat; (count reb_dates)#enlist use_mkt_anchor];
+  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat; (count reb_dates)#enlist use_mkt_anchor; (count reb_dates)#enlist have_ric];
   picks: picks except enlist ();
   if[0=count picks; '"no valid rebalance dates"];
-  picks_tbl: flip (`reb_date`expiry`strike`underlying)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying);
+  picks_tbl: flip (`reb_date`expiry`strike`underlying`underlying_ric)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying; picks`underlying_ric);
 
   reb: picks_tbl`reb_date;
   end_dates: 1 _ reb, enlist (1 + last dates);
@@ -445,6 +480,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     re: seg`end_date;
     exp_date: seg`expiry;
     strike: seg`strike;
+    ric: seg`underlying_ric;
     tt: env`tt;
     dates: env`dates;
     strat: env`strat;
@@ -455,6 +491,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[0=count seg_dates; :()];
     sub_rb: tt where (tt`date)=rb;
     sub_rb: sub_rb where (sub_rb`expiry)=exp_date;
+    if[ric<>`; sub_rb: sub_rb where (sub_rb`underlying_ric)=ric];
     legs: .oca.strategy_legs[sub_rb; strike; strat];
     if[(98h<>type legs) or (0=count legs); :()];
     leg_desc: `$ .oca.legs_desc legs;
@@ -481,6 +518,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       ];
       mask0: (tt`date) in seg_dates;
       mask0: mask0 & (tt`expiry)=exp_date;
+      if[ric<>`; mask0: mask0 & ((tt`underlying_ric)=ric)];
       mask0: mask0 & ((tt`put_call)=pc);
       mask0: mask0 & $[sty in 8 9h; abs((tt`strike) - k) <= tol; (tt`strike)=k];
       mask0: 0 <> mask0;
@@ -532,7 +570,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     scaffold:([] date:seg_dates);
     px: scaffold lj `date xkey px;
     px: update price:fills price from px;
-    px: update reb_date:rb, expiry:exp_date, strike:strike, strategy:strat, legs:leg_desc, price_mode:pm, side:s from px;
+    px: update reb_date:rb, expiry:exp_date, strike:strike, underlying_ric:ric, strategy:strat, legs:leg_desc, price_mode:pm, side:s from px;
     px: update pnl: s * (price - prev price) from px;
     px: update ret: pnl % abs prev price from px;
     px: update pnl:0f^pnl, ret:0f^ret from px;
