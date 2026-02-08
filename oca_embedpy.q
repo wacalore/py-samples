@@ -384,12 +384,21 @@ rep_underlying:{[sub]
   first u
  }
 
+strike_eq_mask:{[x; k; tol]
+  t:abs type x;
+  if[t in 8 9h; :(abs(x-k))<=tol];
+  if[t=0h;
+    xf: .[`float$; enlist x; {::}];
+    if[not xf~(::); :(abs(xf-k))<=tol];
+  ];
+  x=k
+ }
+
 atm_pick_score:{[sub; k; u; strat]
   m:abs(k-u);
   if[strat in `call`put; :m];
-  sty:abs type sub`strike;
   tol:0.00000001 + 0.0000000001 * abs k;
-  mask:$[sty in 8 9h; abs((sub`strike)-k) <= tol; (sub`strike)=k];
+  mask:.oca.strike_eq_mask[sub`strike; k; tol];
   leg0: sub where mask;
   if[0=count leg0; :0w];
   if[`quote_perm_id in cols leg0;
@@ -580,64 +589,77 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       pc: (legs`put_call) i;
       k: (legs`strike) i;
       q: (legs`qty) i;
-      sty: abs type tt`strike;
       tol: 0.00000001 + 0.0000000001 * abs k;
       mask0: (tt`date) in seg_dates;
       mask0: mask0 & (tt`expiry)=exp_date;
       if[ric<>`; mask0: mask0 & ((tt`underlying_ric)=ric)];
       mask0: mask0 & ((tt`put_call)=pc);
-      mask0: mask0 & $[sty in 8 9h; abs((tt`strike) - k) <= tol; (tt`strike)=k];
+      mask0: mask0 & .oca.strike_eq_mask[tt`strike; k; tol];
       mask0: 0 <> mask0;
       leg0_all: tt where mask0;
-      leg0: leg0_all;
-      qid:(::);
-      anchored:0b;
-      if[have_qid;
-        qcov: 0!select n_cov:count distinct date by quote_perm_id from leg0_all where (leg0_all`quote_perm_id)<>`;
-        rb_leg: leg0_all where (leg0_all`date)=rb;
-        rb_leg: rb_leg where (rb_leg`quote_perm_id)<>`;
-        if[(0<count rb_leg) and (0<count qcov);
-          qpx: 0!select rb_px:med price_sel by quote_perm_id from rb_leg;
-          qtab: 0!((`quote_perm_id xkey qpx) lj (`quote_perm_id xkey qcov));
-          qtab: qtab where not null qtab`rb_px;
-          if[0<count qtab;
-            rb_med: med rb_leg`price_sel;
-            qtab: update rb_gap:abs(rb_px-rb_med) from qtab;
-            qtab: qtab @ iasc qtab`quote_perm_id;
-            if[`n_cov in cols qtab; qtab: qtab @ reverse iasc qtab`n_cov];
-            qtab: qtab @ iasc qtab`rb_gap;
-            qid: first qtab`quote_perm_id;
-          ];
-        ];
-        if[not qid~(::);
-          leg_q: leg0_all where (leg0_all`quote_perm_id)=qid;
-          if[0<count leg_q;
-            / Only anchor to a quote id when it spans multiple dates in the segment.
-            / Otherwise use per-date aggregation so day-level quote ids can roll naturally.
-            n_cov: count distinct leg_q`date;
-            if[n_cov>1;
-              leg0: leg_q;
-              anchored:1b;
+      if[not `quote_perm_id in cols leg0_all;
+        leg0_all:update quote_perm_id:(count leg0_all)#` from leg0_all;
+      ];
+      leg_pick:([] date:`date$(); leg_price:`float$(); leg_qid:`symbol$());
+      if[0<count leg0_all;
+        if[have_qid;
+          cand: leg0_all where (leg0_all`quote_perm_id)<>`;
+          if[0<count cand;
+            cand: 0!select px:med price_sel by date,quote_perm_id from cand;
+            qcov: 0!select n_cov:count distinct date by quote_perm_id from cand;
+            cand: cand lj `quote_perm_id xkey qcov;
+            dmed: 0!select day_med:med px by date from cand;
+            cand: cand lj `date xkey dmed;
+            cand: update gap:abs(px-day_med) from cand;
+
+            qid_anchor:`;
+            rb_c: cand where (cand`date)=rb;
+            if[0<count rb_c;
+              rb_c: rb_c @ iasc rb_c`quote_perm_id;
+              if[`n_cov in cols rb_c; rb_c: rb_c @ reverse iasc rb_c`n_cov];
+              rb_c: rb_c @ iasc rb_c`gap;
+              qid_anchor: first rb_c`quote_perm_id;
+            ];
+
+            if[qid_anchor<>`;
+              leg_a: cand where (cand`quote_perm_id)=qid_anchor;
+              if[0<count leg_a;
+                / Hard-anchor only when the quote id spans multiple days.
+                if[(count distinct leg_a`date)>1;
+                  leg_pick: 0!select leg_price:first px, leg_qid:first quote_perm_id by date from leg_a;
+                ];
+              ];
+            ];
+
+            miss_dates: seg_dates except $[0<count leg_pick; asc distinct leg_pick`date; `date$()];
+            if[0<count miss_dates;
+              rest: cand where (cand`date) in miss_dates;
+              if[0<count rest;
+                rest: rest @ iasc rest`quote_perm_id;
+                if[`n_cov in cols rest; rest: rest @ reverse iasc rest`n_cov];
+                rest: rest @ iasc rest`gap;
+                rest: 0!select leg_price:first px, leg_qid:first quote_perm_id by date from rest;
+                leg_pick: $[0<count leg_pick; leg_pick,rest; rest];
+              ];
             ];
           ];
         ];
-      ];
-      leg1:([] date:seg_dates; leg_price:(count seg_dates)#0n);
-      if[0<count leg0;
-        if[have_qid;
-          / Collapse exact quote/date duplicates, then use per-date median across quote ids.
-          leg0: 0!select px:first price_sel by quote_perm_id,date from leg0;
-          leg1: 0!select leg_price:med px by date from leg0;
+        if[0=count leg_pick;
+          / No usable quote-id anchoring: choose an actual row nearest each day's center.
+          base: update row_i:til count leg0_all from leg0_all;
+          dmed0: 0!select day_med:med price_sel by date from base;
+          base: base lj `date xkey dmed0;
+          base: update gap:abs(price_sel-day_med) from base;
+          base: base @ iasc base`row_i;
+          base: base @ iasc base`gap;
+          leg_pick: 0!select leg_price:first price_sel, leg_qid:first quote_perm_id by date from base;
         ];
-        if[not have_qid;
-          leg1: 0!select leg_price:med price_sel by date from leg0;
-        ];
       ];
+      leg1:([] date:seg_dates; leg_price:(count seg_dates)#0n; leg_qid:(count seg_dates)#`);
       scaffold:([] date:seg_dates);
-      leg1: scaffold lj `date xkey leg1;
-      leg1: update leg_price:fills leg_price from leg1;
-      qid1:$[qid~(::); `; qid];
-      leg1: update put_call:pc, leg_qty:q, leg_strike:k, leg_qid:qid1 from leg1;
+      if[0<count leg_pick; leg1: scaffold lj `date xkey leg_pick];
+      leg1: update leg_price:fills leg_price, leg_qid:fills leg_qid from leg1;
+      leg1: update put_call:pc, leg_qty:q, leg_strike:k from leg1;
       leg1: update contrib:q*leg_price from leg1;
       leg_tbls,: enlist leg1;
       i+:1;
@@ -782,6 +804,66 @@ atm_strategy_pnl_diagnostics:{[rets; top_n]
 atm_strategy_trade_table:{[rets]
   d: .oca.atm_strategy_pnl_diagnostics[rets; 10];
   d`by_trade
+ }
+
+min_abs_diff:{[vals; p]
+  if[p~(::); :0w];
+  if[null p; :0w];
+  t:type vals;
+  xs:$[t=0h; vals; t>0h; vals; enlist vals];
+  if[0=count xs; :0w];
+  to_f:{[x] .[`float$; enlist x; {0n}]};
+  pf:to_f p;
+  if[null pf; :0w];
+  xf:to_f each xs;
+  xf:xf where not null xf;
+  if[0=count xf; :0w];
+  min abs(xf - pf)
+ }
+
+atm_strategy_price_check:{[adf; rets; price_col; tol]
+  a:adf;
+  r:rets;
+  if[99h=type a; a:0!a];
+  if[99h=type r; r:0!r];
+  if[98h<>type a; '"adf must be a table"];
+  if[98h<>type r; '"returns must be a table"];
+  pc:$[price_col~(::); `settle; .oca.to_sym price_col];
+  eps:$[tol~(::); 0.000000001f; 1f*tol];
+
+  req_a:`date`expiry`strike`put_call;
+  if[not all req_a in cols a; '"adf missing required columns (`date`expiry`strike`put_call)"];
+  if[not pc in cols a; '"adf missing selected price column"];
+  req_r:`date`expiry`strike`call_leg_price`put_leg_price;
+  if[not all req_r in cols r; '"returns missing required leg columns"];
+
+  a:update put_call:.oca.norm_put_call put_call from a;
+  a:update price_chk:a[;pc] from a;
+  if[not `underlying_ric in cols a; a:update underlying_ric:(count a)#` from a];
+  if[not `underlying_ric in cols r; r:update underlying_ric:(count r)#` from r];
+  a:update underlying_ric:.oca.to_sym each underlying_ric from a;
+  r:update underlying_ric:.oca.to_sym each underlying_ric from r;
+  if[not `strategy in cols r; r:update strategy:(count r)#`unknown from r];
+  if[not `price_mode in cols r; r:update price_mode:(count r)#$[pc=`settle;`market;`theo] from r];
+
+  calls:0!select call_vals:price_chk by date,expiry,strike,underlying_ric from a where (a`put_call)=`C;
+  puts:0!select put_vals:price_chk by date,expiry,strike,underlying_ric from a where (a`put_call)=`P;
+  out:r lj `date`expiry`strike`underlying_ric xkey calls;
+  out:out lj `date`expiry`strike`underlying_ric xkey puts;
+
+  out:update call_min_diff:.oca.min_abs_diff'[call_vals; call_leg_price], put_min_diff:.oca.min_abs_diff'[put_vals; put_leg_price] from out;
+  out:update call_match:call_min_diff<=eps, put_match:put_min_diff<=eps from out;
+  out:update legs_match:call_match & put_match from out;
+
+  summary:0!select
+    n_rows:count i,
+    n_match:sum legs_match,
+    n_mismatch:sum not legs_match,
+    max_call_diff:max call_min_diff,
+    max_put_diff:max put_min_diff
+    by strategy,price_mode from out;
+  mism: out where not out`legs_match;
+  (`summary`mismatches`joined)! (summary; mism; out)
  }
 
 scale_strategy_returns:{[rets; scale]
