@@ -44,7 +44,7 @@ init:{[libpath; dm; ep]
   .p.e "def oca_opt_simple_wrapper(tables, cfg=None): return oca.optimize_portfolio(tables, cfg)";
   .p.e "def oca_opt_cvar_wrapper(tables, cfg=None): return oca.optimize_portfolio_cvar(tables, cfg)";
   .p.e "def oca_opt_to_dict(res, date_mode='days', epoch='2000-01-01'): return oca.optimizer_result_to_dict(res, date_mode=date_mode, epoch=epoch)";
-  .p.e "def oca_analyze_chain_df(options_df, curve, cfg=None):\n  cfg = {} if cfg is None else cfg\n  options_df = oca_as_df(options_df)\n  curve = oca_as_df(curve)\n  out = oca.analyze_chain_df(options_df, curve, use_numba=cfg.get('use_numba'), group_by_date=cfg.get('group_by_date'), curve_date_col=cfg.get('curve_date_col'))\n  return oca_df_to_dict(out)";
+  .p.e "def oca_analyze_chain_df(options_df, curve, cfg=None):\n  cfg = {} if cfg is None else cfg\n  options_df = oca_as_df(options_df)\n  curve = oca_as_df(curve)\n  out = oca.analyze_chain_df(options_df, curve, use_numba=cfg.get('use_numba'), group_by_date=cfg.get('group_by_date', cfg.get('group_by_dt')), curve_date_col=cfg.get('curve_date_col'), surface_mode=cfg.get('surface_mode', 'separate'), stitch_contract_col=cfg.get('stitch_contract_col', 'underlying_ric'))\n  return oca_df_to_dict(out)";
   .p.e "def oca_build_strategy_book_df(analytics_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  analytics_df = oca_as_df(analytics_df)\n  widths = cfg.get('widths', (0.5, 1.0, 2.0))\n  templates = cfg.get('strategy_templates')\n  out = oca.build_strategy_book_df(analytics_df, widths=widths, strategy_templates=templates)\n  return oca_df_to_dict(out)";
   .p.e "def oca_strategy_screener_df(strategy_df, analytics_df=None, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  if analytics_df is not None:\n    analytics_df = oca_as_df(analytics_df)\n  out = oca.strategy_screener_df(\n    strategy_df,\n    analytics_df=analytics_df,\n    vol_col=cfg.get('vol_col', 'iv_atm'),\n    vol_fallback=cfg.get('vol_fallback'),\n    pop_samples=cfg.get('pop_samples', 5000),\n    pop_seed=cfg.get('pop_seed', 7),\n    mispricing_metric=cfg.get('mispricing_metric', 'edge_per_vega'),\n    mispricing_quantile=cfg.get('mispricing_quantile', 0.9),\n    pop_threshold=cfg.get('pop_threshold', 0.6),\n    ev_threshold=cfg.get('ev_threshold', 0.0),\n    upside_metric=cfg.get('upside_metric', 'upside_p95'),\n    upside_quantile=cfg.get('upside_quantile', 0.8),\n    upside_threshold=cfg.get('upside_threshold'),\n    credit_debit_tolerance=cfg.get('credit_debit_tolerance', 1.0e-8),\n    filter_only=cfg.get('filter_only', True),\n    top_n=cfg.get('top_n'),\n    weight_mispricing=cfg.get('weight_mispricing', 1.0),\n    weight_ev=cfg.get('weight_ev', 0.5),\n    weight_pop=cfg.get('weight_pop', 0.5)\n  )\n  return oca_df_to_dict(out)";
   .p.e "def oca_scenario_pnl_strategy_df(strategy_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  out = oca.scenario_pnl_strategy_df(\n    strategy_df,\n    dF=cfg.get('dF', 0.0),\n    dVol=cfg.get('dVol', 0.0),\n    dRate=cfg.get('dRate', 0.0),\n    dt_days=cfg.get('dt_days', 0.0)\n  )\n  return oca_df_to_dict(out)";
@@ -376,6 +376,38 @@ atm_strike_order:{[sub; u; strat]
   cand`strike
  }
 
+rep_underlying:{[sub]
+  if[0=count sub; :0n];
+  u:sub`underlying;
+  ok:u where not null u;
+  if[0<count ok; :med ok];
+  first u
+ }
+
+atm_pick_score:{[sub; k; u; strat]
+  m:abs(k-u);
+  if[strat in `call`put; :m];
+  sty:abs type sub`strike;
+  tol:0.00000001 + 0.0000000001 * abs k;
+  mask:$[sty in 8 9h; abs((sub`strike)-k) <= tol; (sub`strike)=k];
+  leg0: sub where mask;
+  if[0=count leg0; :0w];
+  if[`quote_perm_id in cols leg0;
+    legq: leg0 where (leg0`quote_perm_id)<>`;
+    if[0<count legq;
+      leg0: 0!select price_sel:first price_sel by quote_perm_id,put_call from legq;
+    ];
+  ];
+  leg0: 0!select px:med price_sel by put_call from leg0;
+  ct: leg0 where (leg0`put_call)=`C;
+  pt: leg0 where (leg0`put_call)=`P;
+  if[(0=count ct) or (0=count pt); :0w];
+  c:first ct`px;
+  p:first pt`px;
+  if[(null c) or (null p); :0w];
+  abs(c-p) + 0.000001*m
+ }
+
 legs_desc:{[legs]
   if[(98h<>type legs) or (0=count legs); :""];
   d:();
@@ -451,23 +483,27 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       k:(::);
       u:(::);
       ric_sel:`;
+      best_sc:0w;
       j:0;
       while[j<count ric_vals;
         r1:(ric_vals j);
         subr: sub2 where (sub2`underlying_ric)=r1;
         if[0<count subr;
-          u1:first subr`underlying;
+          u1:.oca.rep_underlying subr;
           ks: .oca.atm_strike_order[subr; u1; strat];
           i:0;
           while[i<count ks;
             k0:(ks i);
             legs:.oca.strategy_legs[subr; k0; strat];
             if[(98h=type legs) and (0<count legs);
-              k:k0;
-              u:u1;
-              ric_sel:r1;
+              sc:.oca.atm_pick_score[subr; k0; u1; strat];
+              if[(ric_sel~`) or (sc<best_sc);
+                best_sc:sc;
+                k:k0;
+                u:u1;
+                ric_sel:r1;
+              ];
               i:count ks;
-              j:count ric_vals;
             ];
             i+:1;
           ];
@@ -477,7 +513,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       if[(k~(::)) or (ric_sel~`); :()];
       :(`reb_date`expiry`strike`underlying`underlying_ric)! (d; exp_sel; k; u; ric_sel);
     ];
-    u: first sub2`underlying;
+    u: .oca.rep_underlying sub2;
     ks: .oca.atm_strike_order[sub2; u; strat];
     if[0=count ks; :()];
     k:(::);
@@ -920,6 +956,7 @@ analyze_chain_df:{[options; curve; cfg; libpath]
   if[98h=type out;
     if[`put_call in cols out; out:update put_call:.oca.norm_put_call put_call from out];
     if[`quote_perm_id in cols out; out:update quote_perm_id:.oca.norm_quote_perm_id quote_perm_id from out];
+    if[`underlying_ric in cols out; out:update underlying_ric:.oca.to_sym each underlying_ric from out];
   ];
   out
  }
