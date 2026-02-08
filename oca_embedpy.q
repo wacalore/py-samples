@@ -341,6 +341,41 @@ strategy_legs:{[sub; atm; strat]
   legs
  }
 
+atm_strike_order:{[sub; u; strat]
+  if[0=count sub; :`float$()];
+  cand:([] strike:asc distinct sub`strike);
+  cand:update m:abs(strike-u) from cand;
+  if[not strat in `call`put;
+    leg0:sub;
+    if[`quote_perm_id in cols leg0;
+      leg0: 0!select price_sel:first price_sel by quote_perm_id,strike,put_call from leg0;
+    ];
+    leg0: 0!select px:avg price_sel by strike,put_call from leg0;
+    ct: 0!select c:first px by strike from leg0 where (leg0`put_call)=`C;
+    pt: 0!select p:first px by strike from leg0 where (leg0`put_call)=`P;
+    if[(0<count ct) and (0<count pt);
+      cp: 0!((`strike xkey ct) lj (`strike xkey pt));
+      cp: cp where (not null cp`c) & (not null cp`p);
+      if[0<count cp;
+        cp: update cpd:abs(c-p) from cp;
+        cp:cp @ iasc cp`cpd;
+        cp:0!select cpd:first cpd by strike from cp;
+        cand: cand lj `strike xkey cp;
+        cpdv:cand`cpd;
+        if[any null cpdv;
+          cpdv:@[cpdv; where null cpdv; :; 0w];
+        ];
+        cand:update cpd:cpdv from cand;
+        ord:iasc cpdv + 0.000001*cand`m;
+        cand:cand @ ord;
+        : cand`strike;
+      ];
+    ];
+  ];
+  cand: cand @ iasc cand`m;
+  cand`strike
+ }
+
 legs_desc:{[legs]
   if[(98h<>type legs) or (0=count legs); :""];
   d:();
@@ -422,18 +457,16 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
         subr: sub2 where (sub2`underlying_ric)=r1;
         if[0<count subr;
           u1:first subr`underlying;
-          cand_tbl:([] strike:asc distinct subr`strike);
-          cand_tbl: update m:abs(strike - u1) from cand_tbl;
-          cand_tbl: cand_tbl @ iasc cand_tbl`m;
+          ks: .oca.atm_strike_order[subr; u1; strat];
           i:0;
-          while[i<count cand_tbl;
-            k0:(cand_tbl`strike) i;
+          while[i<count ks;
+            k0:(ks i);
             legs:.oca.strategy_legs[subr; k0; strat];
             if[(98h=type legs) and (0<count legs);
               k:k0;
               u:u1;
               ric_sel:r1;
-              i:count cand_tbl;
+              i:count ks;
               j:count ric_vals;
             ];
             i+:1;
@@ -445,18 +478,16 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       :(`reb_date`expiry`strike`underlying`underlying_ric)! (d; exp_sel; k; u; ric_sel);
     ];
     u: first sub2`underlying;
-    cand_tbl: ([] strike:asc distinct sub2`strike);
-    if[0=count cand_tbl; :()];
-    cand_tbl: update m:abs(strike - u) from cand_tbl;
-    cand_tbl: cand_tbl @ iasc cand_tbl`m;
+    ks: .oca.atm_strike_order[sub2; u; strat];
+    if[0=count ks; :()];
     k:(::);
     i:0;
-    while[i<count cand_tbl;
-      k0:(cand_tbl`strike) i;
+    while[i<count ks;
+      k0:(ks i);
       legs:.oca.strategy_legs[sub2; k0; strat];
       if[(98h=type legs) and (0<count legs);
         k:k0;
-        i:count cand_tbl;
+        i:count ks;
       ];
       i+:1;
     ];
