@@ -265,7 +265,7 @@ default_atm_strategies:{
 as_strategy_list:{[strategies]
   if[strategies~(::); : .oca.default_atm_strategies[]];
   t:type strategies;
-  if[t=11h; : enlist .oca.norm_strategy strategies];
+  if[t=11h; : .oca.norm_strategy each strategies];
   if[t=10h; : enlist .oca.norm_strategy `$strategies];
   if[t=0h; : .oca.norm_strategy each strategies];
   enlist .oca.norm_strategy strategies
