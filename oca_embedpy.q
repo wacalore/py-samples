@@ -225,6 +225,19 @@ norm_put_call:{[v]
 
 norm_quote_perm_id:{[v]
   to1:{[x]
+    to_s1:{[y]
+      ty:abs type y;
+      if[ty=10h; :y];
+      if[ty=11h; :string y];
+      if[ty=0h;
+        if[0=count y; :""];
+        ys:.z.s each y;
+        if[10h=type ys; :ys];
+        if[0h=type ys; :raze ys];
+        :string ys;
+      ];
+      string y
+    };
     tx:abs type x;
     if[x~(::); :`];
     if[tx in 8 9h;
@@ -232,7 +245,7 @@ norm_quote_perm_id:{[v]
     ];
     if[tx=11h; :x];
     if[tx=10h; :$[0=count x; `; `$x]];
-    sx:lower string x;
+    sx:lower to_s1 x;
     if[(sx~"0n") or (sx~"0w") or (sx~"nan") or (sx~"none") or (sx~"null") or (sx~""); :`];
     `$sx
   };
@@ -497,6 +510,18 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   if[not ety in 14 12 15h; '"expiry column must be date or timestamp/datetime"];
   tt: update put_call:.oca.norm_put_call put_call from tt;
   if[not all ((tt`put_call) in `C`P); '"put_call column must contain C/P (or call/put)"];
+  if[`quote_perm_id in cols tt;
+    tt:update quote_perm_id:.oca.norm_quote_perm_id quote_perm_id from tt;
+    / Collapse duplicate quote rows so each date+quote_perm_id contributes once.
+    t_nn: tt where (tt`quote_perm_id)<>`;
+    t_n0: tt where (tt`quote_perm_id)=`;
+    if[0<count t_nn;
+      ix:0!select i:first i by date,quote_perm_id from update i:til count t_nn from t_nn;
+      t_nn: t_nn ix`i;
+    ];
+    if[0<count t_n0; t_n0: distinct t_n0];
+    tt:$[0<count t_nn; $[0<count t_n0; t_nn,t_n0; t_nn]; t_n0];
+  ];
   have_ric:`underlying_ric in cols tt;
   if[have_ric; tt:update underlying_ric:.oca.to_sym each underlying_ric from tt];
   use_mkt_anchor: (price_col=`theo) and (`settle in cols tt);
@@ -623,7 +648,20 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     legs: .oca.strategy_legs_wing[sub_rb; strike; strat; ws];
     if[(98h<>type legs) or (0=count legs); :()];
     leg_desc: `$ .oca.legs_desc legs;
-    have_qid:(`quote_perm_id in cols tt) and (11h=type tt`quote_perm_id);
+    have_qid:`quote_perm_id in cols tt;
+    ord_cand:{[x; pref]
+      if[0=count x; :x];
+      x: x @ iasc x`quote_perm_id;
+      x: update qrank:til count x from x;
+      nc:$[`n_cov in cols x; x`n_cov; (count x)#1];
+      nmx:$[0<count nc; max nc; 1];
+      pf: .[`float$; enlist pref; {0n}];
+      pgap: x`gap;
+      if[not null pf; pgap:abs((`float$x`px) - pf)];
+      sc:(1f*pgap) + 0.000000001f*(1f*(nmx - nc)) + 0.000000000001f*(1f*x`qrank);
+      x: x @ iasc sc;
+      x
+    };
     leg_tbls:();
     i:0;
     while[i<count legs;
@@ -646,7 +684,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
         if[have_qid;
           cand: leg0_all where (leg0_all`quote_perm_id)<>`;
           if[0<count cand;
-            cand: 0!select px:med price_sel by date,quote_perm_id from cand;
+            cand: 0!select px:first price_sel by date,quote_perm_id from cand;
             qcov: 0!select n_cov:count distinct date by quote_perm_id from cand;
             cand: cand lj `quote_perm_id xkey qcov;
             dmed: 0!select day_med:med px by date from cand;
@@ -656,9 +694,19 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
             qid_anchor:`;
             rb_c: cand where (cand`date)=rb;
             if[0<count rb_c;
-              rb_c: rb_c @ iasc rb_c`quote_perm_id;
-              if[`n_cov in cols rb_c; rb_c: rb_c @ reverse iasc rb_c`n_cov];
-              rb_c: rb_c @ iasc rb_c`gap;
+              px_ref:0n;
+              if[strat=`straddle;
+                other_pc:$[pc=`C; `P; `C];
+                mref:(tt`date)=rb;
+                mref:mref & (tt`expiry)=exp_date;
+                if[ric<>`; mref:mref & ((tt`underlying_ric)=ric)];
+                mref:mref & ((tt`put_call)=other_pc);
+                mref:mref & .oca.strike_eq_mask[tt`strike; k; tol];
+                mref:0<>mref;
+                oth:tt where mref;
+                if[0<count oth; px_ref:med oth`price_sel];
+              ];
+              rb_c: ord_cand[rb_c; px_ref];
               qid_anchor: first rb_c`quote_perm_id;
             ];
 
@@ -676,9 +724,12 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
             if[0<count miss_dates;
               rest: cand where (cand`date) in miss_dates;
               if[0<count rest;
-                rest: rest @ iasc rest`quote_perm_id;
-                if[`n_cov in cols rest; rest: rest @ reverse iasc rest`n_cov];
-                rest: rest @ iasc rest`gap;
+                pref_rest:0n;
+                if[0<count leg_pick;
+                  rbp: leg_pick where (leg_pick`date)=rb;
+                  if[0<count rbp; pref_rest:first rbp`leg_price];
+                ];
+                rest: ord_cand[rest; pref_rest];
                 rest: 0!select leg_price:first px, leg_qid:first quote_perm_id by date from rest;
                 leg_pick: $[0<count leg_pick; leg_pick,rest; rest];
               ];
@@ -712,12 +763,18 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[strat=`straddle;
       cp:0!select call_leg_price:first leg_price by date from leg_all where (leg_all`put_call)=`C;
       pp:0!select put_leg_price:first leg_price by date from leg_all where (leg_all`put_call)=`P;
+      cq:0!select call_leg_qid:first leg_qid by date from leg_all where (leg_all`put_call)=`C;
+      pq:0!select put_leg_qid:first leg_qid by date from leg_all where (leg_all`put_call)=`P;
       px: px lj `date xkey cp;
       px: px lj `date xkey pp;
+      px: px lj `date xkey cq;
+      px: px lj `date xkey pq;
       px: update straddle_leg_sum:call_leg_price + put_leg_price from px;
     ];
     if[not `call_leg_price in cols px; px:update call_leg_price:(count px)#0n from px];
     if[not `put_leg_price in cols px; px:update put_leg_price:(count px)#0n from px];
+    if[not `call_leg_qid in cols px; px:update call_leg_qid:(count px)#` from px];
+    if[not `put_leg_qid in cols px; px:update put_leg_qid:(count px)#` from px];
     if[not `straddle_leg_sum in cols px; px:update straddle_leg_sum:(count px)#0n from px];
     px: px @ iasc px`date;
     scaffold:([] date:seg_dates);
@@ -738,6 +795,13 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     overlap: 1 _ reb;
     keep: (not ((out`date) in overlap)) or ((out`reb_date) < out`date);
     out: out where keep;
+  ];
+  out: out @ iasc out`reb_date;
+  out: out @ iasc out`date;
+  if[(count out) > count distinct out`date;
+    ix:exec first i by date from update i:til count out from out;
+    out: out ix;
+    out: out @ iasc out`date;
   ];
   out
  }
