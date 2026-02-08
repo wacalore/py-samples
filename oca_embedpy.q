@@ -366,7 +366,8 @@ atm_strike_order:{[sub; u; strat]
           cpdv:@[cpdv; where null cpdv; :; 0w];
         ];
         cand:update cpd:cpdv from cand;
-        ord:iasc cpdv + 0.000001*cand`m;
+        / ATM selection is distance-first; parity is only a tie-breaker.
+        ord:iasc (1f*cand`m) + 0.000001*(1f*cpdv);
         cand:cand @ ord;
         : cand`strike;
       ];
@@ -414,7 +415,8 @@ atm_pick_score:{[sub; k; u; strat]
   c:first ct`px;
   p:first pt`px;
   if[(null c) or (null p); :0w];
-  abs(c-p) + 0.000001*m
+  / Score is distance-first to avoid non-ATM strikes; parity is tie-breaker.
+  m + 0.000001*abs(c-p)
  }
 
 legs_desc:{[legs]
