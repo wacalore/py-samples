@@ -311,10 +311,58 @@ def _ensure_pandas() -> None:
         raise RuntimeError("pandas is required for DataFrame inputs.")
 
 
-def _surface_group_cols(df: "pd.DataFrame") -> List[str]:  # type: ignore[name-defined]
-    if "date" in df.columns and df["date"].nunique() > 1:
-        return ["date", "expiry"]
-    return ["expiry"]
+def _normalize_surface_mode(surface_mode: Optional[str]) -> str:
+    mode = "separate" if surface_mode is None else str(surface_mode).strip().lower()
+    if mode not in {"separate", "blend", "stitch"}:
+        raise ValueError("surface_mode must be one of: 'separate', 'blend', 'stitch'.")
+    return mode
+
+
+def _surface_group_cols(  # type: ignore[name-defined]
+    df: "pd.DataFrame",
+    surface_mode: str = "separate",
+    group_by_date: Optional[bool] = None,
+) -> List[str]:
+    mode = _normalize_surface_mode(surface_mode)
+    cols: List[str] = []
+    if group_by_date is None:
+        include_date = "date" in df.columns and df["date"].nunique() > 1
+    else:
+        include_date = bool(group_by_date) and ("date" in df.columns)
+    if include_date:
+        cols.append("date")
+    if mode == "separate" and "underlying_ric" in df.columns and df["underlying_ric"].nunique() > 1:
+        cols.append("underlying_ric")
+    cols.append("expiry")
+    return cols
+
+
+def _stitch_contract_rows(
+    df: "pd.DataFrame", contract_col: str = "underlying_ric"  # type: ignore[name-defined]
+) -> "pd.DataFrame":  # type: ignore[name-defined]
+    if contract_col not in df.columns:
+        return df
+    required = {"date", "expiry", "strike"}
+    missing = _missing_columns(df.columns, required)
+    if missing:
+        raise ValueError(f"stitch mode requires columns: {', '.join(missing)}")
+
+    work = df.copy()
+    work[contract_col] = work[contract_col].astype(str)
+    grp = (
+        work.groupby(["date", "expiry", contract_col], as_index=False)
+        .agg(n_strikes=("strike", "nunique"), n_rows=("strike", "size"))
+        .sort_values(
+            ["date", "expiry", "n_strikes", "n_rows", contract_col],
+            ascending=[True, True, False, False, True],
+        )
+    )
+    chosen = grp.drop_duplicates(["date", "expiry"], keep="first")[["date", "expiry", contract_col]]
+    tagged = work.merge(chosen.assign(_keep=True), on=["date", "expiry", contract_col], how="left", sort=False)
+    # `_keep` is True for chosen rows and NaN otherwise after the left merge.
+    # Using notna avoids object-dtype fillna downcast warnings in newer pandas.
+    mask = tagged["_keep"].notna().to_numpy(dtype=bool)
+    return df.loc[df.index[mask]].copy()
 
 
 def _prepare_spline_inputs(
@@ -1171,6 +1219,9 @@ def _normalize_date_series(series: "pd.Series") -> "pd.Series":  # type: ignore[
         vals = ser.to_numpy()
         if vals.size > 0 and np.all((vals >= 19000101) & (vals <= 21001231)):
             dt = pd.to_datetime(ser.astype(str), format="%Y%m%d", errors="raise")  # type: ignore[union-attr]
+        elif vals.size > 0 and np.all((vals >= -50000) & (vals <= 50000)):
+            # Heuristic for q dates: days since 2000-01-01.
+            dt = pd.to_datetime(ser, unit="D", origin="2000-01-01", errors="raise")  # type: ignore[union-attr]
         else:
             dt = pd.to_datetime(ser, errors="raise")  # type: ignore[union-attr]
     else:
@@ -1275,9 +1326,11 @@ def compute_analytics_df(
                 if sub.empty:
                     unique_dates = curve_df["_date_key"].drop_duplicates().sort_values()
                     sample = ", ".join(str(x) for x in unique_dates.head(5).tolist())
+                    opt_sample = ", ".join(str(x) for x in date_key.drop_duplicates().sort_values().head(5).tolist())
                     raise ValueError(
                         f"curve table missing date {dt_val}. "
-                        f"curve dates sample: [{sample}]"
+                        f"curve dates sample: [{sample}]. "
+                        f"options dates sample: [{opt_sample}]"
                     )
                 # Allow duplicate terms per date by averaging rates.
                 if sub["term"].duplicated().any():  # type: ignore[index]
@@ -1315,14 +1368,19 @@ def annotate_surface_df(
     analytics_df: "pd.DataFrame",  # type: ignore[name-defined]
     use_numba: Optional[bool] = None,
     group_by_date: Optional[bool] = None,
+    surface_mode: str = "separate",
+    stitch_contract_col: str = "underlying_ric",
 ) -> "pd.DataFrame":  # type: ignore[name-defined]
-    surface, df = fit_surface_df(analytics_df, return_df=True, group_by_date=group_by_date)
+    surface, df = fit_surface_df(
+        analytics_df,
+        return_df=True,
+        group_by_date=group_by_date,
+        surface_mode=surface_mode,
+        stitch_contract_col=stitch_contract_col,
+    )
     df["iv_resid"] = df["iv"] - df["iv_fit"]
 
-    if group_by_date is None:
-        group_cols = _surface_group_cols(df)
-    else:
-        group_cols = ["date", "expiry"] if group_by_date else ["expiry"]
+    group_cols = _surface_group_cols(df, surface_mode=surface_mode, group_by_date=group_by_date)
 
     def _zscore(series):
         mu = series.mean()
@@ -1337,27 +1395,32 @@ def annotate_surface_df(
 
     metrics_rows: List[Dict[str, object]] = []
     for exp in surface.expiries:
-        if isinstance(exp.expiry, tuple) and len(exp.expiry) == 2:
-            dt_key, exp_key = exp.expiry
+        row: Dict[str, object] = {
+            "iv_atm": exp.iv_atm,
+            "skew": exp.skew,
+            "curvature": exp.curvature,
+            "surface_rmse": exp.rmse,
+            "surface_n": exp.n,
+        }
+        key_vals = exp.expiry if isinstance(exp.expiry, tuple) else (exp.expiry,)
+        if len(key_vals) == len(group_cols):
+            for c, v in zip(group_cols, key_vals):
+                row[c] = v
+        elif len(group_cols) == 1:
+            row[group_cols[0]] = key_vals[-1]
         else:
-            dt_key, exp_key = None, exp.expiry
-        metrics_rows.append(
-            {
-                "date": dt_key,
-                "expiry": exp_key,
-                "iv_atm": exp.iv_atm,
-                "skew": exp.skew,
-                "curvature": exp.curvature,
-                "surface_rmse": exp.rmse,
-                "surface_n": exp.n,
-            }
-        )
+            for c in group_cols:
+                row[c] = None
+            if "expiry" in group_cols:
+                row["expiry"] = key_vals[-1]
+            if "date" in group_cols and len(key_vals) >= 2:
+                row["date"] = key_vals[0]
+            if "underlying_ric" in group_cols and len(key_vals) >= 3:
+                row["underlying_ric"] = key_vals[1]
+        metrics_rows.append(row)
     if metrics_rows:
         metrics_df = pd.DataFrame(metrics_rows)
-        if group_cols == ["expiry"]:
-            df = df.merge(metrics_df.drop(columns=["date"]), on="expiry", how="left", sort=False)
-        else:
-            df = df.merge(metrics_df, on=["date", "expiry"], how="left", sort=False)
+        df = df.merge(metrics_df, on=group_cols, how="left", sort=False)
 
     F = df["underlying"].to_numpy(dtype=float)
     K = df["strike"].to_numpy(dtype=float)
@@ -1393,16 +1456,18 @@ def fit_surface_df(
     analytics_df: "pd.DataFrame",  # type: ignore[name-defined]
     return_df: bool = False,
     group_by_date: Optional[bool] = None,
+    surface_mode: str = "separate",
+    stitch_contract_col: str = "underlying_ric",
 ) -> Union[VolSurface, Tuple[VolSurface, "pd.DataFrame"]]:  # type: ignore[name-defined]
     _ensure_pandas()
+    mode = _normalize_surface_mode(surface_mode)
     df = validate_analytics_df(analytics_df)
+    if mode == "stitch":
+        df = _stitch_contract_rows(df, contract_col=stitch_contract_col)
     out = df.copy()
     out["iv_fit"] = np.nan
 
-    if group_by_date is None:
-        group_cols = _surface_group_cols(out)
-    else:
-        group_cols = ["date", "expiry"] if group_by_date else ["expiry"]
+    group_cols = _surface_group_cols(out, surface_mode=mode, group_by_date=group_by_date)
 
     expiries: List[ExpirySurface] = []
     grouped = out.groupby(group_cols)
@@ -2211,11 +2276,19 @@ def analyze_chain_df(
     use_numba: Optional[bool] = None,
     group_by_date: Optional[bool] = None,
     curve_date_col: Optional[str] = None,
+    surface_mode: str = "separate",
+    stitch_contract_col: str = "underlying_ric",
 ) -> "pd.DataFrame":  # type: ignore[name-defined]
     analytics_df = compute_analytics_df(
         options_df, curve, use_numba=use_numba, curve_date_col=curve_date_col
     )
-    return annotate_surface_df(analytics_df, use_numba=use_numba, group_by_date=group_by_date)
+    return annotate_surface_df(
+        analytics_df,
+        use_numba=use_numba,
+        group_by_date=group_by_date,
+        surface_mode=surface_mode,
+        stitch_contract_col=stitch_contract_col,
+    )
 
 
 def compute_analytics(
@@ -2319,16 +2392,47 @@ def analyze_chain(
     curve: Union[ZeroCurve, TableLike],
     use_numba: Optional[bool] = None,
     return_df: bool = False,
+    group_by_date: Optional[bool] = None,
+    curve_date_col: Optional[str] = None,
+    surface_mode: str = "separate",
+    stitch_contract_col: str = "underlying_ric",
 ) -> Union[List[Dict[str, str]], "pd.DataFrame"]:  # type: ignore[name-defined]
-    if HAVE_PANDAS and hasattr(chain_rows, "columns"):
+    use_df_path = (
+        HAVE_PANDAS
+        and (
+            hasattr(chain_rows, "columns")
+            or (group_by_date is not None)
+            or (curve_date_col is not None)
+            or (surface_mode != "separate")
+            or (stitch_contract_col != "underlying_ric")
+        )
+    )
+    if use_df_path:
+        if hasattr(chain_rows, "columns"):
+            chain_df = chain_rows
+        else:
+            chain_df = _records_to_df(_table_to_records(chain_rows))
         if isinstance(curve, ZeroCurve) or (HAVE_PANDAS and hasattr(curve, "columns")):
             curve_input = curve
         else:
-            curve_input = curve_from_rows(curve)
-        df = analyze_chain_df(chain_rows, curve_input, use_numba=use_numba)  # type: ignore[arg-type]
+            curve_input = _records_to_df(_table_to_records(curve))
+        df = analyze_chain_df(
+            chain_df,
+            curve_input,  # type: ignore[arg-type]
+            use_numba=use_numba,
+            group_by_date=group_by_date,
+            curve_date_col=curve_date_col,
+            surface_mode=surface_mode,
+            stitch_contract_col=stitch_contract_col,
+        )
         if return_df:
             return df
         return df.to_dict(orient="records")
+
+    if (group_by_date is not None) or (curve_date_col is not None) or (surface_mode != "separate") or (
+        stitch_contract_col != "underlying_ric"
+    ):
+        raise RuntimeError("surface/grouping kwargs require pandas-enabled DataFrame execution.")
 
     curve_obj = curve if isinstance(curve, ZeroCurve) else curve_from_rows(curve)
     analytics = compute_analytics(chain_rows, curve_obj, use_numba=use_numba)
@@ -2343,6 +2447,18 @@ def analyze_chain_rows(
     curve_rows: TableLike,
     use_numba: Optional[bool] = None,
     return_df: bool = False,
+    group_by_date: Optional[bool] = None,
+    curve_date_col: Optional[str] = None,
+    surface_mode: str = "separate",
+    stitch_contract_col: str = "underlying_ric",
 ) -> Union[List[Dict[str, str]], "pd.DataFrame"]:  # type: ignore[name-defined]
-    curve = curve_from_rows(curve_rows)
-    return analyze_chain(chain_rows, curve, use_numba=use_numba, return_df=return_df)
+    return analyze_chain(
+        chain_rows,
+        curve_rows,
+        use_numba=use_numba,
+        return_df=return_df,
+        group_by_date=group_by_date,
+        curve_date_col=curve_date_col,
+        surface_mode=surface_mode,
+        stitch_contract_col=stitch_contract_col,
+    )
