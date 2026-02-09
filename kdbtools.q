@@ -2028,6 +2028,258 @@ rollingRidgeTableIntercept:{[t;bycol;xc;ycol;window;lam]
     result:`ridgeIdx__ xasc result;
     ![result;();0b;enlist `ridgeIdx__]}
 
+// ==================== Bayesian Predictive Variance ====================
+// Bayesian interpretation of ridge regression:
+//   Prior: beta ~ N(0, (1/lam)*I)
+//   Likelihood: y|X,beta ~ N(X*beta, sigma2*I)
+//   Posterior: beta|X,y ~ N(beta_ridge, sigma2 * (X'X + lam*I)^-1)
+//   Predictive: y_new|x_new ~ N(yhat, yhatVar)
+//     yhat = x_new' @ beta_ridge
+//     yhatVar = sigma2 * (1 + x_new' @ (X'X + lam*I)^-1 @ x_new)
+//     sigma2 = RSS / (n - p)
+
+// Rolling Ridge with Bayesian posterior - returns (beta; sigma2; iM) per window
+// iM = (X'X + lam*I)^-1, the posterior covariance scale matrix
+ridgerFastBayes:{[n;X;y;lam]
+    nObs:count y;
+    X:`float$X; y:`float$y;
+    p:count first X;
+    outerProds:{x */:\: x} each X;
+    cumXtX:sums outerProds;
+    cumXty:sums X *' y;
+    cumYtY:sums y * y;
+    reg:lam * eye p;
+    computeWindow:{[cumXtX;cumXty;cumYtY;reg;p;n;start]
+        if[null start; :(p#0n; 0n; (p;p)#0n)];
+        endIdx:start + n - 1;
+        XtX:$[start = 0; cumXtX endIdx; cumXtX[endIdx] - cumXtX[start - 1]];
+        Xty:$[start = 0; cumXty endIdx; cumXty[endIdx] - cumXty[start - 1]];
+        yty:$[start = 0; cumYtY endIdx; cumYtY[endIdx] - cumYtY[start - 1]];
+        iM:minv XtX + reg;
+        beta:iM mmu Xty;
+        bXty:sum beta * Xty;
+        bXXb:sum beta * XtX mmu beta;
+        rss:((yty - (2 * bXty)) + bXXb);
+        sigma2:0f | rss % 1 | n - p;
+        (beta; sigma2; iM)
+    }[cumXtX;cumXty;cumYtY;reg;p;n];
+    starts:((n-1)#0N),(til 1 + nObs - n);
+    computeWindow each starts}
+
+ridgerFastBayesParallel:{[n;X;y;lam]
+    nObs:count y;
+    X:`float$X; y:`float$y;
+    p:count first X;
+    outerProds:{x */:\: x} each X;
+    cumXtX:sums outerProds;
+    cumXty:sums X *' y;
+    cumYtY:sums y * y;
+    reg:lam * eye p;
+    computeWindow:{[cumXtX;cumXty;cumYtY;reg;p;n;start]
+        if[null start; :(p#0n; 0n; (p;p)#0n)];
+        endIdx:start + n - 1;
+        XtX:$[start = 0; cumXtX endIdx; cumXtX[endIdx] - cumXtX[start - 1]];
+        Xty:$[start = 0; cumXty endIdx; cumXty[endIdx] - cumXty[start - 1]];
+        yty:$[start = 0; cumYtY endIdx; cumYtY[endIdx] - cumYtY[start - 1]];
+        iM:minv XtX + reg;
+        beta:iM mmu Xty;
+        bXty:sum beta * Xty;
+        bXXb:sum beta * XtX mmu beta;
+        rss:((yty - (2 * bXty)) + bXXb);
+        sigma2:0f | rss % 1 | n - p;
+        (beta; sigma2; iM)
+    }[cumXtX;cumXty;cumYtY;reg;p;n];
+    starts:((n-1)#0N),(til 1 + nObs - n);
+    computeWindow peach starts}
+
+// Rolling Ridge with intercept + Bayesian posterior
+ridgerFastInterceptBayes:{[n;X;y;lam]
+    nObs:count y;
+    X:`float$X; y:`float$y;
+    X1:{(1f,x)} each X;
+    p:count first X1;
+    outerProds:{x */:\: x} each X1;
+    cumXtX:sums outerProds;
+    cumXty:sums X1 *' y;
+    cumYtY:sums y * y;
+    reg:lam * eye p;
+    reg[0;0]:0f;  // Don't regularize intercept
+    computeWindow:{[cumXtX;cumXty;cumYtY;reg;p;n;start]
+        if[null start; :(p#0n; 0n; (p;p)#0n)];
+        endIdx:start + n - 1;
+        XtX:$[start = 0; cumXtX endIdx; cumXtX[endIdx] - cumXtX[start - 1]];
+        Xty:$[start = 0; cumXty endIdx; cumXty[endIdx] - cumXty[start - 1]];
+        yty:$[start = 0; cumYtY endIdx; cumYtY[endIdx] - cumYtY[start - 1]];
+        iM:minv XtX + reg;
+        beta:iM mmu Xty;
+        bXty:sum beta * Xty;
+        bXXb:sum beta * XtX mmu beta;
+        rss:((yty - (2 * bXty)) + bXXb);
+        sigma2:0f | rss % 1 | n - p;
+        (beta; sigma2; iM)
+    }[cumXtX;cumXty;cumYtY;reg;p;n];
+    starts:((n-1)#0N),(til 1 + nObs - n);
+    computeWindow each starts}
+
+ridgerFastInterceptBayesParallel:{[n;X;y;lam]
+    nObs:count y;
+    X:`float$X; y:`float$y;
+    X1:{(1f,x)} each X;
+    p:count first X1;
+    outerProds:{x */:\: x} each X1;
+    cumXtX:sums outerProds;
+    cumXty:sums X1 *' y;
+    cumYtY:sums y * y;
+    reg:lam * eye p;
+    reg[0;0]:0f;
+    computeWindow:{[cumXtX;cumXty;cumYtY;reg;p;n;start]
+        if[null start; :(p#0n; 0n; (p;p)#0n)];
+        endIdx:start + n - 1;
+        XtX:$[start = 0; cumXtX endIdx; cumXtX[endIdx] - cumXtX[start - 1]];
+        Xty:$[start = 0; cumXty endIdx; cumXty[endIdx] - cumXty[start - 1]];
+        yty:$[start = 0; cumYtY endIdx; cumYtY[endIdx] - cumYtY[start - 1]];
+        iM:minv XtX + reg;
+        beta:iM mmu Xty;
+        bXty:sum beta * Xty;
+        bXXb:sum beta * XtX mmu beta;
+        rss:((yty - (2 * bXty)) + bXXb);
+        sigma2:0f | rss % 1 | n - p;
+        (beta; sigma2; iM)
+    }[cumXtX;cumXty;cumYtY;reg;p;n];
+    starts:((n-1)#0N),(til 1 + nObs - n);
+    computeWindow peach starts}
+
+// Bayesian Ridge Helper - adds yhat, yhatVar, yhatSd columns
+rollingRidgeHelperBayes:{[xc;ycol;w;lam;g]
+    X:flip g xc;
+    y:g ycol;
+    nf:count xc;
+    results:ridgerFastBayes[w;X;y;lam];
+    betas:results[;0]; sigma2s:results[;1]; invs:results[;2];
+    cleanBeta:{[nf;b]
+        $[(count b)<>nf; nf#0n;
+          any null b; nf#0n;
+          any (b=0w) or b=-0w; nf#0n;
+          b]}[nf];
+    betasCleaned:cleanBeta each betas;
+    prevBetas:prev betasCleaned;
+    prevSigma2:prev sigma2s;
+    prevInvs:prev invs;
+    pred:{[nf;x;b] $[(count b)<>nf; 0n; any null b; 0n; sum x*b]}[nf]'[X;prevBetas];
+    predVar:{[x;s2;iM]
+        if[null s2; :0n];
+        if[(::) ~ iM; :0n];
+        s2 * 1 + sum x * iM mmu x
+    }'[X;prevSigma2;prevInvs];
+    bcols:(`$"b_",/:string xc)!flip betasCleaned;
+    g,'flip bcols,'`yhat`yhatVar`yhatSd!(pred;predVar;sqrt predVar)}
+
+rollingRidgeHelperBayesParallel:{[xc;ycol;w;lam;g]
+    X:flip g xc;
+    y:g ycol;
+    nf:count xc;
+    results:ridgerFastBayesParallel[w;X;y;lam];
+    betas:results[;0]; sigma2s:results[;1]; invs:results[;2];
+    cleanBeta:{[nf;b]
+        $[(count b)<>nf; nf#0n;
+          any null b; nf#0n;
+          any (b=0w) or b=-0w; nf#0n;
+          b]}[nf];
+    betasCleaned:cleanBeta each betas;
+    prevBetas:prev betasCleaned;
+    prevSigma2:prev sigma2s;
+    prevInvs:prev invs;
+    pred:{[nf;x;b] $[(count b)<>nf; 0n; any null b; 0n; sum x*b]}[nf]'[X;prevBetas];
+    predVar:{[x;s2;iM]
+        if[null s2; :0n];
+        if[(::) ~ iM; :0n];
+        s2 * 1 + sum x * iM mmu x
+    }'[X;prevSigma2;prevInvs];
+    bcols:(`$"b_",/:string xc)!flip betasCleaned;
+    g,'flip bcols,'`yhat`yhatVar`yhatSd!(pred;predVar;sqrt predVar)}
+
+// Bayesian Ridge Helper with intercept
+rollingRidgeHelperInterceptBayes:{[xc;ycol;w;lam;g]
+    X:flip g xc;
+    y:g ycol;
+    nf:count xc;
+    results:ridgerFastInterceptBayes[w;X;y;lam];
+    betas:results[;0]; sigma2s:results[;1]; invs:results[;2];
+    cleanBeta:{[nf;b]
+        $[(count b)<>nf+1; (nf+1)#0n;
+          any null b; (nf+1)#0n;
+          any (b=0w) or b=-0w; (nf+1)#0n;
+          b]}[nf];
+    betasCleaned:cleanBeta each betas;
+    prevBetas:prev betasCleaned;
+    prevSigma2:prev sigma2s;
+    prevInvs:prev invs;
+    pred:{[nf;x;b] $[(count b)<>nf+1; 0n; any null b; 0n; b[0] + sum x * 1_ b]}[nf]'[X;prevBetas];
+    predVar:{[x;s2;iM]
+        if[null s2; :0n];
+        if[(::) ~ iM; :0n];
+        x1:1f,x;
+        s2 * 1 + sum x1 * iM mmu x1
+    }'[X;prevSigma2;prevInvs];
+    intercepts:betasCleaned[;0];
+    featBetas:1_/:betasCleaned;
+    bcols:(`$"b_",/:string xc)!flip featBetas;
+    g,'flip (enlist[`b_intercept]!enlist intercepts),bcols,'`yhat`yhatVar`yhatSd!(pred;predVar;sqrt predVar)}
+
+rollingRidgeHelperInterceptBayesParallel:{[xc;ycol;w;lam;g]
+    X:flip g xc;
+    y:g ycol;
+    nf:count xc;
+    results:ridgerFastInterceptBayesParallel[w;X;y;lam];
+    betas:results[;0]; sigma2s:results[;1]; invs:results[;2];
+    cleanBeta:{[nf;b]
+        $[(count b)<>nf+1; (nf+1)#0n;
+          any null b; (nf+1)#0n;
+          any (b=0w) or b=-0w; (nf+1)#0n;
+          b]}[nf];
+    betasCleaned:cleanBeta each betas;
+    prevBetas:prev betasCleaned;
+    prevSigma2:prev sigma2s;
+    prevInvs:prev invs;
+    pred:{[nf;x;b] $[(count b)<>nf+1; 0n; any null b; 0n; b[0] + sum x * 1_ b]}[nf]'[X;prevBetas];
+    predVar:{[x;s2;iM]
+        if[null s2; :0n];
+        if[(::) ~ iM; :0n];
+        x1:1f,x;
+        s2 * 1 + sum x1 * iM mmu x1
+    }'[X;prevSigma2;prevInvs];
+    intercepts:betasCleaned[;0];
+    featBetas:1_/:betasCleaned;
+    bcols:(`$"b_",/:string xc)!flip featBetas;
+    g,'flip (enlist[`b_intercept]!enlist intercepts),bcols,'`yhat`yhatVar`yhatSd!(pred;predVar;sqrt predVar)}
+
+// Bayesian rolling ridge table - adds yhat, yhatVar, yhatSd columns
+// yhatVar: predictive variance (sigma2 * (1 + x' inv x))
+// yhatSd: predictive standard deviation (sqrt of yhatVar)
+// Use for confidence intervals: yhat +/- 1.96 * yhatSd (~95%)
+rollingRidgeTableBayes:{[t;bycol;xc;ycol;window;lam]
+    t:update ridgeIdx__:i from t;
+    grp:group t bycol;
+    groups:{[t;idx] t idx}[t] each value grp;
+    nGroups:count groups;
+    result:$[nGroups >= 4;
+        raze rollingRidgeHelperBayes[xc;ycol;window;lam] peach groups;
+        raze rollingRidgeHelperBayesParallel[xc;ycol;window;lam] each groups];
+    result:`ridgeIdx__ xasc result;
+    ![result;();0b;enlist `ridgeIdx__]}
+
+// Bayesian rolling ridge with intercept
+rollingRidgeTableInterceptBayes:{[t;bycol;xc;ycol;window;lam]
+    t:update ridgeIdx__:i from t;
+    grp:group t bycol;
+    groups:{[t;idx] t idx}[t] each value grp;
+    nGroups:count groups;
+    result:$[nGroups >= 4;
+        raze rollingRidgeHelperInterceptBayes[xc;ycol;window;lam] peach groups;
+        raze rollingRidgeHelperInterceptBayesParallel[xc;ycol;window;lam] each groups];
+    result:`ridgeIdx__ xasc result;
+    ![result;();0b;enlist `ridgeIdx__]}
+
 // Rolling Ridge with intercept AND z-scoring of features within each window
 // Features are z-scored using only data within the rolling window (no lookahead)
 // This ensures ridge penalty treats all features equally regardless of original scale
