@@ -1492,6 +1492,15 @@ def fit_surface_df(
         spline = UnivariateSpline(k_sorted, w_sorted, w=wts_sorted, k=k_spline, s=smooth)
         w_fit = np.maximum(spline(k), 1.0e-8)
         iv_fit = np.sqrt(w_fit / T)
+        iv_obs = iv[np.isfinite(iv) & (iv > 0.0)]
+        if iv_obs.size:
+            iv_med = float(np.median(iv_obs))
+            iv_min = float(np.min(iv_obs))
+            iv_max = float(np.max(iv_obs))
+            # Guard against short-dated spline overshoots that can explode theo marks.
+            iv_lo = max(1.0e-4, min(0.5 * iv_min, 0.5 * iv_med))
+            iv_hi = max(2.0 * iv_max, 3.0 * iv_med, iv_lo * 1.1)
+            iv_fit = np.clip(iv_fit, iv_lo, iv_hi)
         rmse = float(np.sqrt(np.mean((iv - iv_fit) ** 2))) if len(iv) else 0.0
 
         out.loc[idx, "iv_fit"] = iv_fit

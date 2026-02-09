@@ -623,6 +623,23 @@ fallback_leg_price:{[tt; d; exp_date; ric; pc; k; fcol]
   .oca.lin_interp[`float$base`strike; `float$base`px; 1f*k]
  }
 
+fallback_leg_cap:{[tt; d; exp_date; ric; pc; k]
+  m:(tt`date)=d;
+  m:m & (tt`expiry)=exp_date;
+  if[ric<>`; m:m & ((tt`underlying_ric)=ric)];
+  m:0<>m;
+  sub:tt where m;
+  if[0=count sub; :0n];
+  u:.oca.rep_underlying sub;
+  uf: .[`float$; enlist u; {0n}];
+  kf:1f*k;
+  if[pc=`C;
+    if[null uf; :0n];
+    : max 0f, uf;
+  ];
+  max 0f, kf
+ }
+
 atm_pick_score:{[sub; k; u; strat]
   / Keep score strictly on ATM distance so strike choice is underlying-nearest only.
   abs(k-u)
@@ -947,6 +964,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
         leg1: scaffold lj `date xkey leg_pick;
         if[not `leg_model in cols leg1; leg1:update leg_model:(count leg1)#0b from leg1];
       ];
+      mkt_px:(count seg_dates)#0n;
       if[not rq;
         / Keep nearest-ATM leg set usable by interpolating missing market marks across strikes.
         mkt_px:.oca.fallback_leg_price'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k; (count seg_dates)#enlist `price_sel];
@@ -961,6 +979,33 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       ];
       if[fb_mode;
         mdl_px:.oca.fallback_leg_price'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k; (count seg_dates)#enlist fb_col];
+        ub_px:.oca.fallback_leg_cap'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k];
+        md0:`float$mdl_px;
+        neg_idx:where (not null md0) & (md0<0f);
+        if[0<count neg_idx;
+          repl:mkt_px neg_idx;
+          replf:`float$repl;
+          missr:where null replf;
+          if[0<count missr; repl:@[repl; missr; :; (count missr)#0f]];
+          mdl_px:@[mdl_px; neg_idx; :; repl];
+        ];
+        md0:`float$mdl_px;
+        ub_idx:where (not null md0) & (not null ub_px) & (md0>ub_px);
+        if[0<count ub_idx;
+          repl:mkt_px ub_idx;
+          replf:`float$repl;
+          ubv:ub_px ub_idx;
+          badr:where (null replf) | (replf>ubv);
+          if[0<count badr; repl:@[repl; badr; :; ubv badr]];
+          mdl_px:@[mdl_px; ub_idx; :; repl];
+        ];
+        if[fb_weird;
+          md0:`float$mdl_px;
+          mr0:`float$mkt_px;
+          rel_ok:(not null md0) & (not null mr0) & (abs mr0)>0.000000001f;
+          bad_rel: where rel_ok & ((md0 > fb_hi*mr0) | (md0 < fb_lo*mr0));
+          if[0<count bad_rel; mdl_px:@[mdl_px; bad_rel; :; mr0 bad_rel]];
+        ];
         miss_idx: where (null leg1`leg_price) & (not null mdl_px);
         if[0<count miss_idx;
           leg1:update
@@ -1038,6 +1083,13 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     ix:exec first i by date from update i:til count out from out;
     out: out ix;
     out: out @ iasc out`date;
+  ];
+  if[cont_mode;
+    / Recompute from final published series so prev price always matches emitted prior row.
+    out: out @ iasc out`date;
+    out: update pnl: s * (price - prev price) from out;
+    out: update ret: pnl % abs prev price from out;
+    out: update pnl:0f^pnl, ret:0f^ret from out;
   ];
   out
  }
