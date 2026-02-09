@@ -550,35 +550,9 @@ atm_strike_order:{[sub; u; strat]
   if[0=count sub; :`float$()];
   cand:([] strike:asc distinct sub`strike);
   cand:update m:abs(strike-u) from cand;
-  if[not strat in `call`put;
-    leg0:sub;
-    if[`quote_perm_id in cols leg0;
-      leg0: 0!select price_sel:first price_sel by quote_perm_id,strike,put_call from leg0;
-    ];
-    leg0: 0!select px:avg price_sel by strike,put_call from leg0;
-    ct: 0!select c:first px by strike from leg0 where (leg0`put_call)=`C;
-    pt: 0!select p:first px by strike from leg0 where (leg0`put_call)=`P;
-    if[(0<count ct) and (0<count pt);
-      cp: 0!((`strike xkey ct) lj (`strike xkey pt));
-      cp: cp where (not null cp`c) & (not null cp`p);
-      if[0<count cp;
-        cp: update cpd:abs(c-p) from cp;
-        cp:cp @ iasc cp`cpd;
-        cp:0!select cpd:first cpd by strike from cp;
-        cand: cand lj `strike xkey cp;
-        cpdv:cand`cpd;
-        if[any null cpdv;
-          cpdv:@[cpdv; where null cpdv; :; 0w];
-        ];
-        cand:update cpd:cpdv from cand;
-        / ATM selection is distance-first; parity is only a tie-breaker.
-        ord:iasc (1f*cand`m) + 0.000001*(1f*cpdv);
-        cand:cand @ ord;
-        : cand`strike;
-      ];
-    ];
-  ];
-  cand: cand @ iasc cand`m;
+  / ATM strike is nearest to underlying; tie-break by lower strike.
+  cand:cand @ iasc cand`strike;
+  cand:cand @ iasc cand`m;
   cand`strike
  }
 
@@ -648,27 +622,8 @@ fallback_leg_price:{[tt; d; exp_date; ric; pc; k; fcol]
  }
 
 atm_pick_score:{[sub; k; u; strat]
-  m:abs(k-u);
-  if[strat in `call`put; :m];
-  tol:0.00000001 + 0.0000000001 * abs k;
-  mask:.oca.strike_eq_mask[sub`strike; k; tol];
-  leg0: sub where mask;
-  if[0=count leg0; :0w];
-  if[`quote_perm_id in cols leg0;
-    legq: leg0 where (leg0`quote_perm_id)<>`;
-    if[0<count legq;
-      leg0: 0!select price_sel:first price_sel by quote_perm_id,put_call from legq;
-    ];
-  ];
-  leg0: 0!select px:med price_sel by put_call from leg0;
-  ct: leg0 where (leg0`put_call)=`C;
-  pt: leg0 where (leg0`put_call)=`P;
-  if[(0=count ct) or (0=count pt); :0w];
-  c:first ct`px;
-  p:first pt`px;
-  if[(null c) or (null p); :0w];
-  / Score is distance-first to avoid non-ATM strikes; parity is tie-breaker.
-  m + 0.000001*abs(c-p)
+  / Keep score strictly on ATM distance so strike choice is underlying-nearest only.
+  abs(k-u)
  }
 
 legs_desc:{[legs]
