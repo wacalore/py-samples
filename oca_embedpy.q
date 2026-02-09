@@ -659,9 +659,10 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   if[not pm_in in known_pm; '"unknown price_mode"];
   cont_mode: not pm_in in `market_reset`mkt_reset`settle_reset`theo_reset`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
   pm: $[pm_in in `market`mkt`settle`market_cont`mkt_cont`settle_cont`market_reset`mkt_reset`settle_reset`market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset; `market; `theo];
-  fallback_mode: pm_in in `market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
-  require_quotes:not fallback_mode;
   strat: .oca.norm_strategy strategy;
+  fallback_mode: pm_in in `market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
+  / For straddles, keep strict nearest-ATM strike and synthesize missing leg marks if needed.
+  require_quotes:not (fallback_mode or (strat=`straddle));
   swcfg:.oca.side_wing_cfg side;
   s:swcfg`side;
   ws:swcfg`wing_steps;
@@ -945,6 +946,18 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       if[0<count leg_pick;
         leg1: scaffold lj `date xkey leg_pick;
         if[not `leg_model in cols leg1; leg1:update leg_model:(count leg1)#0b from leg1];
+      ];
+      if[not rq;
+        / Keep nearest-ATM leg set usable by interpolating missing market marks across strikes.
+        mkt_px:.oca.fallback_leg_price'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k; (count seg_dates)#enlist `price_sel];
+        mkt_miss: where (null leg1`leg_price) & (not null mkt_px);
+        if[0<count mkt_miss;
+          leg1:update
+            leg_price:@[leg_price; mkt_miss; :; mkt_px mkt_miss],
+            leg_qid:@[leg_qid; mkt_miss; :; (count mkt_miss)#`interp],
+            leg_model:@[leg_model; mkt_miss; :; (count mkt_miss)#1b]
+            from leg1;
+        ];
       ];
       if[fb_mode;
         mdl_px:.oca.fallback_leg_price'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k; (count seg_dates)#enlist fb_col];
