@@ -214,14 +214,73 @@ norm_wing_steps:{[wing_steps]
   '"wing_steps must be an integer >= 1"
  }
 
+norm_wing_mode:{[wing_mode]
+  if[wing_mode~(::); :`rank];
+  ts:type wing_mode;
+  ats:abs ts;
+  if[(ts>0h) or (ts=0h);
+    if[0=count wing_mode; :`rank];
+    :.oca.norm_wing_mode first wing_mode;
+  ];
+  s:$[ats=11h; lower string wing_mode;
+      ats=10h; lower wing_mode;
+      lower string wing_mode];
+  if[(s~"rank") or (s~"step") or (s~"index") or (s~"ladder"); :`rank];
+  if[(s~"strict") or (s~"strict_symmetric") or (s~"symmetric") or (s~"sym"); :`strict_symmetric];
+  '"wing_mode must be `rank or `strict_symmetric"
+ }
+
 side_wing_cfg:{[side]
   if[99h=type side;
     ks:key side;
     s0:$[`side in ks; side`side; 1f];
     w0:$[`wing_steps in ks; side`wing_steps; 1];
-    :(`side`wing_steps)!(.oca.norm_side s0; .oca.norm_wing_steps w0);
+    m0:$[`wing_mode in ks; side`wing_mode; `rank];
+    :(`side`wing_steps`wing_mode)!(.oca.norm_side s0; .oca.norm_wing_steps w0; .oca.norm_wing_mode m0);
   ];
-  (`side`wing_steps)!(.oca.norm_side side; 1)
+  (`side`wing_steps`wing_mode)!(.oca.norm_side side; 1; `rank)
+ }
+
+norm_bool:{[v; d]
+  if[v~(::); :d];
+  tv:type v;
+  atv:abs tv;
+  if[(tv<0h) and (atv in 1 4 5 6 7 8 9h); :0<>v];
+  if[(tv>0h) and (atv in 1 4 5 6 7 8 9h);
+    if[0=count v; :d];
+    :0<>first v;
+  ];
+  if[tv=0h;
+    if[0=count v; :d];
+    :.oca.norm_bool[first v; d];
+  ];
+  s:lower string .oca.to_sym v;
+  if[(s~"1") or (s~"true") or (s~"t") or (s~"yes") or (s~"y") or (s~"on"); :1b];
+  if[(s~"0") or (s~"false") or (s~"f") or (s~"no") or (s~"n") or (s~"off"); :0b];
+  d
+ }
+
+price_cfg:{[price_mode]
+  if[99h<>type price_mode;
+    pm:$[price_mode~(::); `market; .oca.to_sym price_mode];
+    :(`mode`price_col`anchor_col`fallback_col`fallback_weird`weird_rel_lo`weird_rel_hi)!(pm; `settle; `settle; `theo; 1b; 0.2f; 5f);
+  ];
+  ks:key price_mode;
+  m0:$[`mode in ks; price_mode`mode; $[`price_mode in ks; price_mode`price_mode; `market]];
+  p0:$[`price_col in ks; price_mode`price_col; `settle];
+  a0:$[`anchor_col in ks; price_mode`anchor_col; $[`settle_col in ks; price_mode`settle_col; `settle]];
+  f0:$[`fallback_col in ks; price_mode`fallback_col; `theo];
+  fw0:$[`fallback_weird in ks; price_mode`fallback_weird; 1b];
+  lo0:$[`weird_rel_lo in ks; price_mode`weird_rel_lo; 0.2f];
+  hi0:$[`weird_rel_hi in ks; price_mode`weird_rel_hi; 5f];
+  (`mode`price_col`anchor_col`fallback_col`fallback_weird`weird_rel_lo`weird_rel_hi)!(
+    .oca.to_sym m0;
+    .oca.to_sym p0;
+    .oca.to_sym a0;
+    .oca.to_sym f0;
+    .oca.norm_bool[fw0; 1b];
+    1f*lo0;
+    1f*hi0)
  }
 
 norm_put_call:{[v]
@@ -338,21 +397,63 @@ strategy_strike_at:{[strikes; pos; off]
   strikes idx
  }
 
-strategy_legs_wing:{[sub; atm; strat; wing_steps]
+strategy_find_strike:{[strikes; target]
+  if[0=count strikes; :0n];
+  d: abs strikes - target;
+  md: exec min d from ([] d:d);
+  tol: 0.00000001 + 0.0000000001 * abs target;
+  if[md>tol; :0n];
+  first strikes where d=md
+ }
+
+strategy_sym_dists:{[strikes; k0]
+  if[0=count strikes; :0#0f];
+  ds0: asc distinct k0 - strikes where strikes < k0;
+  ds0: ds0 where ds0 > 0;
+  if[0=count ds0; :0#0f];
+  ds:0#0f;
+  i:0;
+  while[i<count ds0;
+    d:(ds0 i);
+    kl:.oca.strategy_find_strike[strikes; k0-d];
+    kr:.oca.strategy_find_strike[strikes; k0+d];
+    if[(not null kl) and (not null kr); ds,:enlist d];
+    i+:1;
+  ];
+  asc distinct ds
+ }
+
+strategy_legs_wing:{[sub; atm; strat; wing_steps; wing_mode]
   if[0=count sub; :()];
   ws:.oca.norm_wing_steps wing_steps;
+  wm:.oca.norm_wing_mode wing_mode;
   strikes: asc distinct sub`strike;
   if[0=count strikes; :()];
   d: abs strikes - atm;
   md: exec min d from ([] d:d);
   atm_k: first strikes where d=md;
   pos: first where strikes=atm_k;
-
-  km2: .oca.strategy_strike_at[strikes; pos; 0 - 2*ws];
-  km1: .oca.strategy_strike_at[strikes; pos; 0 - ws];
   k0: atm_k;
-  kp1: .oca.strategy_strike_at[strikes; pos; ws];
-  kp2: .oca.strategy_strike_at[strikes; pos; 2*ws];
+  use_sym:(wm=`strict_symmetric) and strat in `strangle`risk_reversal`collar`call_fly`put_fly`iron_fly`iron_condor;
+  km2:0n;
+  km1:0n;
+  kp1:0n;
+  kp2:0n;
+  if[use_sym;
+    sds:.oca.strategy_sym_dists[strikes; k0];
+    d1:$[ws<=count sds; sds (ws-1); 0n];
+    d2:$[(2*ws)<=count sds; sds ((2*ws)-1); 0n];
+    km1:$[null d1; 0n; .oca.strategy_find_strike[strikes; k0-d1]];
+    kp1:$[null d1; 0n; .oca.strategy_find_strike[strikes; k0+d1]];
+    km2:$[null d2; 0n; .oca.strategy_find_strike[strikes; k0-d2]];
+    kp2:$[null d2; 0n; .oca.strategy_find_strike[strikes; k0+d2]];
+  ];
+  if[not use_sym;
+    km2: .oca.strategy_strike_at[strikes; pos; 0 - 2*ws];
+    km1: .oca.strategy_strike_at[strikes; pos; 0 - ws];
+    kp1: .oca.strategy_strike_at[strikes; pos; ws];
+    kp2: .oca.strategy_strike_at[strikes; pos; 2*ws];
+  ];
 
   pcs:();
   ks:();
@@ -404,7 +505,7 @@ strategy_legs_wing:{[sub; atm; strat; wing_steps]
  }
 
 strategy_legs:{[sub; atm; strat]
-  .oca.strategy_legs_wing[sub; atm; strat; 1]
+  .oca.strategy_legs_wing[sub; atm; strat; 1; `rank]
  }
 
 atm_strike_order:{[sub; u; strat]
@@ -461,6 +562,53 @@ strike_eq_mask:{[x; k; tol]
   x=k
  }
 
+lin_interp:{[x; y; x0]
+  n:count x;
+  if[0=n; :0n];
+  if[1=n; : first y];
+  ord:iasc x;
+  xs:(`float$x) ord;
+  ys:(`float$y) ord;
+  if[x0<=first xs;
+    x1:first xs; x2:xs 1; y1:first ys; y2:ys 1;
+    if[x2=x1; :y1];
+    :y1 + (y2-y1)*(x0-x1)%(x2-x1);
+  ];
+  if[x0>=last xs;
+    x1:xs (n-2); x2:last xs; y1:ys (n-2); y2:last ys;
+    if[x2=x1; :y2];
+    :y1 + (y2-y1)*(x0-x1)%(x2-x1);
+  ];
+  i:first where xs>=x0;
+  if[(xs i)=x0; :ys i];
+  x1:xs (i-1); x2:xs i; y1:ys (i-1); y2:ys i;
+  if[x2=x1; :y1];
+  y1 + (y2-y1)*(x0-x1)%(x2-x1)
+ }
+
+fallback_leg_price:{[tt; d; exp_date; ric; pc; k; fcol]
+  m:(tt`date)=d;
+  m:m & (tt`expiry)=exp_date;
+  if[ric<>`; m:m & ((tt`underlying_ric)=ric)];
+  m:m & ((tt`put_call)=pc);
+  m:m & not null tt[;fcol];
+  m:0<>m;
+  sub:tt where m;
+  if[0=count sub; :0n];
+  tol: 0.00000001 + 0.0000000001 * abs k;
+  ex:sub where .oca.strike_eq_mask[sub`strike; k; tol];
+  if[0<count ex;
+    pxs:ex[;fcol];
+    pxs:pxs where not null pxs;
+    if[0<count pxs; :med `float$pxs];
+  ];
+  base:([] strike:`float$sub`strike; px:`float$sub[;fcol]);
+  base:base where not null base`px;
+  if[0=count base; :0n];
+  base:0!select px:med px by strike from base;
+  .oca.lin_interp[`float$base`strike; `float$base`px; 1f*k]
+ }
+
 atm_pick_score:{[sub; k; u; strat]
   m:abs(k-u);
   if[strat in `call`put; :m];
@@ -504,19 +652,33 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   td: $[target_dte~(::); 30; target_dte];
   mind: $[min_dte~(::); 7; min_dte];
   maxd: $[max_dte~(::); ::; max_dte];
-  pm_in: $[price_mode~(::); `market; .oca.to_sym price_mode];
-  known_pm:`market`mkt`settle`theo`market_cont`mkt_cont`settle_cont`theo_cont`market_reset`mkt_reset`settle_reset`theo_reset;
+  pcfg:.oca.price_cfg price_mode;
+  pm_in:pcfg`mode;
+  market_price_col:pcfg`price_col;
+  anchor_col:pcfg`anchor_col;
+  fallback_col:pcfg`fallback_col;
+  fallback_weird:pcfg`fallback_weird;
+  weird_rel_lo:pcfg`weird_rel_lo;
+  weird_rel_hi:pcfg`weird_rel_hi;
+  known_pm:`market`mkt`settle`theo`market_cont`mkt_cont`settle_cont`theo_cont`market_reset`mkt_reset`settle_reset`theo_reset`market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
   if[not pm_in in known_pm; '"unknown price_mode"];
-  cont_mode: not pm_in in `market_reset`mkt_reset`settle_reset`theo_reset;
-  pm: $[pm_in in `market`mkt`settle`market_cont`mkt_cont`settle_cont`market_reset`mkt_reset`settle_reset; `market; `theo];
+  cont_mode: not pm_in in `market_reset`mkt_reset`settle_reset`theo_reset`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
+  pm: $[pm_in in `market`mkt`settle`market_cont`mkt_cont`settle_cont`market_reset`mkt_reset`settle_reset`market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset; `market; `theo];
+  fallback_mode: pm_in in `market_fallback`mkt_fallback`settle_fallback`market_fallback_cont`mkt_fallback_cont`settle_fallback_cont`market_fallback_reset`mkt_fallback_reset`settle_fallback_reset;
   strat: .oca.norm_strategy strategy;
   swcfg:.oca.side_wing_cfg side;
   s:swcfg`side;
   ws:swcfg`wing_steps;
-  price_col: $[pm=`market; `settle; `theo];
+  wm:swcfg`wing_mode;
+  price_col: $[pm=`market; market_price_col; `theo];
   req: `date`expiry`strike`put_call`underlying;
   if[not all req in cols t; '"analytics table missing required columns"];
   if[not price_col in cols t; '"analytics table missing price column"];
+  if[fallback_mode;
+    if[not fallback_col in cols t; '"analytics table missing fallback_col required for market_fallback mode"];
+    if[weird_rel_lo<=0f; weird_rel_lo:0.2f];
+    if[weird_rel_hi<=weird_rel_lo; weird_rel_hi:5f];
+  ];
   r: max 1, `int$r;
   if[r < 1; '"rebalance_days must be >= 1"];
   tt: t;
@@ -542,14 +704,18 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   ];
   have_ric:`underlying_ric in cols tt;
   if[have_ric; tt:update underlying_ric:.oca.to_sym each underlying_ric from tt];
-  use_mkt_anchor: (price_col=`theo) and (`settle in cols tt);
+  use_mkt_anchor: (price_col=`theo) and (anchor_col in cols tt);
+  if[use_mkt_anchor; tt:update anchor_sel:tt[;anchor_col] from tt];
   tt: update price_sel: tt[;price_col] from tt;
+  if[fallback_mode; tt: update fallback_sel: tt[;fallback_col] from tt];
   tt: update dte: expiry - date from tt;
   dates: asc distinct tt`date;
   idx: til `int$count dates;
   reb_dates: dates where (idx mod r) = 0;
 
-  pick:{[d; td; mind; maxd; tt; strat; use_mkt_anchor; ws]
+  pick:{[d; td; mind; maxd; tt; strat; use_mkt_anchor; sw]
+    ws:sw`wing_steps;
+    wm:sw`wing_mode;
     have_ric:`underlying_ric in cols tt;
     sub: tt where (tt`date)=d;
     sub: sub where (sub`dte) >= mind;
@@ -557,7 +723,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[0=count sub; :()];
     sub_pick: sub;
     if[use_mkt_anchor;
-      sub_mkt: sub where not null sub`settle;
+      sub_mkt: sub where not null sub`anchor_sel;
       if[0<count sub_mkt; sub_pick: sub_mkt];
     ];
     if[0=count sub_pick; :()];
@@ -588,7 +754,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
           i:0;
           while[i<count ks;
             k0:(ks i);
-            legs:.oca.strategy_legs_wing[subr; k0; strat; ws];
+            legs:.oca.strategy_legs_wing[subr; k0; strat; ws; wm];
             if[(98h=type legs) and (0<count legs);
               sc:.oca.atm_pick_score[subr; k0; u1; strat];
               if[(best_k_r~(::)) or (sc<best_sc_r);
@@ -620,7 +786,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     i:0;
     while[i<count ks;
       k0:(ks i);
-      legs:.oca.strategy_legs_wing[sub2; k0; strat; ws];
+      legs:.oca.strategy_legs_wing[sub2; k0; strat; ws; wm];
       if[(98h=type legs) and (0<count legs);
         sc:.oca.atm_pick_score[sub2; k0; u; strat];
         if[(k~(::)) or (sc<best_sc_k);
@@ -634,7 +800,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     (`reb_date`expiry`strike`underlying`underlying_ric)! (d; exp_sel; k; u; `)
   };
 
-  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat; (count reb_dates)#enlist use_mkt_anchor; (count reb_dates)#enlist ws];
+  swpick:(`wing_steps`wing_mode)!(ws; wm);
+  picks: pick'[reb_dates; (count reb_dates)#enlist td; (count reb_dates)#enlist mind; (count reb_dates)#enlist maxd; (count reb_dates)#enlist tt; (count reb_dates)#enlist strat; (count reb_dates)#enlist use_mkt_anchor; (count reb_dates)#enlist swpick];
   picks: picks except enlist ();
   if[0=count picks; '"no valid rebalance dates"];
   picks_tbl: flip (`reb_date`expiry`strike`underlying`underlying_ric)! (picks`reb_date; picks`expiry; picks`strike; picks`underlying; picks`underlying_ric);
@@ -643,7 +810,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
   end_dates: 1 _ reb, enlist (1 + last dates);
 
   seg_tbl: update end_date:end_dates from picks_tbl;
-  env: (`tt`dates`strat`side`price_mode`cont_mode`wing_steps)!(tt; dates; strat; s; pm; cont_mode; ws);
+  env: (`tt`dates`strat`side`price_mode`cont_mode`wing_steps`wing_mode`fallback_mode`fallback_col`fallback_weird`weird_rel_lo`weird_rel_hi)!(
+    tt; dates; strat; s; pm; cont_mode; ws; wm; fallback_mode; fallback_col; fallback_weird; weird_rel_lo; weird_rel_hi);
 
   seg_fn:{[seg; env]
     rb: seg`reb_date;
@@ -658,12 +826,18 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     pm: env`price_mode;
     cont: env`cont_mode;
     ws: env`wing_steps;
+    wm: env`wing_mode;
+    fb_mode: env`fallback_mode;
+    fb_col: env`fallback_col;
+    fb_weird: env`fallback_weird;
+    fb_lo: env`weird_rel_lo;
+    fb_hi: env`weird_rel_hi;
     seg_dates: $[cont; dates where (dates>=rb) & (dates<=re); dates where (dates>=rb) & (dates<re)];
     if[0=count seg_dates; :()];
     sub_rb: tt where (tt`date)=rb;
     sub_rb: sub_rb where (sub_rb`expiry)=exp_date;
     if[ric<>`; sub_rb: sub_rb where (sub_rb`underlying_ric)=ric];
-    legs: .oca.strategy_legs_wing[sub_rb; strike; strat; ws];
+    legs: .oca.strategy_legs_wing[sub_rb; strike; strat; ws; wm];
     if[(98h<>type legs) or (0=count legs); :()];
     leg_desc: `$ .oca.legs_desc legs;
     have_qid:`quote_perm_id in cols tt;
@@ -697,7 +871,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
       if[not `quote_perm_id in cols leg0_all;
         leg0_all:update quote_perm_id:(count leg0_all)#` from leg0_all;
       ];
-      leg_pick:([] date:`date$(); leg_price:`float$(); leg_qid:`symbol$());
+      leg_pick:([] date:`date$(); leg_price:`float$(); leg_qid:`symbol$(); leg_model:`boolean$());
       if[0<count leg0_all;
         if[have_qid;
           cand: leg0_all where (leg0_all`quote_perm_id)<>`;
@@ -733,7 +907,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
               if[0<count leg_a;
                 / Hard-anchor only when the quote id spans multiple days.
                 if[(count distinct leg_a`date)>1;
-                  leg_pick: 0!select leg_price:first px, leg_qid:first quote_perm_id by date from leg_a;
+                  leg_pick: 0!select leg_price:first px, leg_qid:first quote_perm_id, leg_model:first 0b by date from leg_a;
                 ];
               ];
             ];
@@ -748,7 +922,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
                   if[0<count rbp; pref_rest:first rbp`leg_price];
                 ];
                 rest: ord_cand[rest; pref_rest];
-                rest: 0!select leg_price:first px, leg_qid:first quote_perm_id by date from rest;
+                rest: 0!select leg_price:first px, leg_qid:first quote_perm_id, leg_model:first 0b by date from rest;
                 leg_pick: $[0<count leg_pick; leg_pick,rest; rest];
               ];
             ];
@@ -762,12 +936,39 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
           base: update gap:abs(price_sel-day_med) from base;
           base: base @ iasc base`row_i;
           base: base @ iasc base`gap;
-          leg_pick: 0!select leg_price:first price_sel, leg_qid:first quote_perm_id by date from base;
+          leg_pick: 0!select leg_price:first price_sel, leg_qid:first quote_perm_id, leg_model:first 0b by date from base;
         ];
       ];
-      leg1:([] date:seg_dates; leg_price:(count seg_dates)#0n; leg_qid:(count seg_dates)#`);
+      leg1:([] date:seg_dates; leg_price:(count seg_dates)#0n; leg_qid:(count seg_dates)#`; leg_model:(count seg_dates)#0b);
       scaffold:([] date:seg_dates);
-      if[0<count leg_pick; leg1: scaffold lj `date xkey leg_pick];
+      if[0<count leg_pick;
+        leg1: scaffold lj `date xkey leg_pick;
+        if[not `leg_model in cols leg1; leg1:update leg_model:(count leg1)#0b from leg1];
+      ];
+      if[fb_mode;
+        mdl_px:.oca.fallback_leg_price'[ (count seg_dates)#enlist tt; seg_dates; (count seg_dates)#enlist exp_date; (count seg_dates)#enlist ric; (count seg_dates)#enlist pc; (count seg_dates)#enlist k; (count seg_dates)#enlist fb_col];
+        miss_idx: where (null leg1`leg_price) & (not null mdl_px);
+        if[0<count miss_idx;
+          leg1:update
+            leg_price:@[leg_price; miss_idx; :; mdl_px miss_idx],
+            leg_qid:@[leg_qid; miss_idx; :; (count miss_idx)#`model],
+            leg_model:@[leg_model; miss_idx; :; (count miss_idx)#1b]
+            from leg1;
+        ];
+        if[fb_weird;
+          px0:`float$leg1`leg_price;
+          md0:`float$mdl_px;
+          rel_ok:(not null px0) & (not null md0) & (abs md0)>0.000000001f;
+          bad_idx: where rel_ok & ((px0 > fb_hi*md0) | (px0 < fb_lo*md0) | (px0 < 0f));
+          if[0<count bad_idx;
+            leg1:update
+              leg_price:@[leg_price; bad_idx; :; mdl_px bad_idx],
+              leg_qid:@[leg_qid; bad_idx; :; (count bad_idx)#`model],
+              leg_model:@[leg_model; bad_idx; :; (count bad_idx)#1b]
+              from leg1;
+          ];
+        ];
+      ];
       leg1: update leg_price:fills leg_price, leg_qid:fills leg_qid from leg1;
       leg1: update put_call:pc, leg_qty:q, leg_strike:k from leg1;
       leg1: update contrib:q*leg_price from leg1;
@@ -777,6 +978,8 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[0=count leg_tbls; :()];
     leg_all: raze leg_tbls;
     px: 0!select price:sum contrib by date from leg_all;
+    mx: 0!select n_model_legs:sum leg_model by date from leg_all;
+    px: px lj `date xkey mx;
     if[0=count px; px:([] date:seg_dates; price:(count seg_dates)#0n)];
     if[strat=`straddle;
       cp:0!select call_leg_price:first leg_price by date from leg_all where (leg_all`put_call)=`C;
@@ -793,6 +996,7 @@ atm_strategy_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mo
     if[not `put_leg_price in cols px; px:update put_leg_price:(count px)#0n from px];
     if[not `call_leg_qid in cols px; px:update call_leg_qid:(count px)#` from px];
     if[not `put_leg_qid in cols px; px:update put_leg_qid:(count px)#` from px];
+    if[not `n_model_legs in cols px; px:update n_model_legs:(count px)#0 from px];
     if[not `straddle_leg_sum in cols px; px:update straddle_leg_sum:(count px)#0n from px];
     px: px @ iasc px`date;
     scaffold:([] date:seg_dates);
@@ -828,7 +1032,8 @@ atm_strategy_returns_wing:{[t; rebalance_days; target_dte; min_dte; max_dte; pri
   c:$[99h=type cfg; cfg; ()!()];
   s:$[`side in key c; c`side; 1f];
   w:$[`wing_steps in key c; c`wing_steps; 1];
-  .oca.atm_strategy_returns[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; strategy; (`side`wing_steps)!(s; w)]
+  m:$[`wing_mode in key c; c`wing_mode; `rank];
+  .oca.atm_strategy_returns[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; strategy; (`side`wing_steps`wing_mode)!(s; w; m)]
  }
 
 atm_strategy_suite_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; side; strategies]
@@ -836,12 +1041,13 @@ atm_strategy_suite_returns:{[t; rebalance_days; target_dte; min_dte; max_dte; pr
   swcfg:.oca.side_wing_cfg side;
   s:swcfg`side;
   ws:swcfg`wing_steps;
+  wm:swcfg`wing_mode;
   if[0=count strats; '"strategy list is empty"];
   outs:();
   i:0;
   while[i<count strats;
     st:(strats i);
-    out1:.[.oca.atm_strategy_returns; (t; rebalance_days; target_dte; min_dte; max_dte; price_mode; st; (`side`wing_steps)!(s; ws)); {::}];
+    out1:.[.oca.atm_strategy_returns; (t; rebalance_days; target_dte; min_dte; max_dte; price_mode; st; (`side`wing_steps`wing_mode)!(s; ws; wm)); {::}];
     if[98h=type out1; outs,: enlist out1];
     i+:1;
   ];
@@ -853,7 +1059,8 @@ atm_strategy_suite_returns_wing:{[t; rebalance_days; target_dte; min_dte; max_dt
   c:$[99h=type cfg; cfg; ()!()];
   s:$[`side in key c; c`side; 1f];
   w:$[`wing_steps in key c; c`wing_steps; 1];
-  .oca.atm_strategy_suite_returns[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; (`side`wing_steps)!(s; w); strategies]
+  m:$[`wing_mode in key c; c`wing_mode; `rank];
+  .oca.atm_strategy_suite_returns[t; rebalance_days; target_dte; min_dte; max_dte; price_mode; (`side`wing_steps`wing_mode)!(s; w; m); strategies]
  }
 
 atm_strategy_pnl_diagnostics:{[rets; top_n]
