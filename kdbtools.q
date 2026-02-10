@@ -4293,6 +4293,22 @@ gbrBT:{[tbl;bycol;xc;yc;n;cfg]
     c:$[99h=type cfg; defaults,cfg; defaults];
     rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbrB[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride]}[n;c]]}
 
+// Rolling Histogram-based GB Regression on table (XGBoost-style)
+// cfg keys: `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1) `nBins(64) `lambda(0.1)
+gbHistrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr`nBins`lambda!(50;3;5;0.1;64;0.1);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y]
+        len:count y;
+        preds:len#0n;
+        i:n;
+        while[i < len;
+            idx:(i-n) + til n;
+            model:gbHistFit[X idx;y idx;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`nBins;c`lambda];
+            preds[i]:first gbPredict[model;enlist X i];
+            i+:1];
+        preds}[n;c]]}
+
 // =============================================================================
 // HISTOGRAM-BASED GRADIENT BOOSTING (XGBoost-style, QML optimized)
 // =============================================================================
@@ -4420,6 +4436,93 @@ dtBuildHist:{[Xbins;y;idx;maxDepth;minLeaf;lambda;nBins;edges]
     left:dtBuildHist[Xbins;y;idxL;maxDepth-1;minLeaf;lambda;nBins;edges];
     right:dtBuildHist[Xbins;y;idxR;maxDepth-1;minLeaf;lambda;nBins;edges];
     `leaf`feat`thresh`left`right!(0b;bestFeat;thresh;left;right)}
+
+// =============================================================================
+// DEFLATED SHARPE RATIO (Bailey & Lopez de Prado, 2014)
+// =============================================================================
+// Corrects observed Sharpe for multiple testing, non-normality, and sample length.
+// DSR is the probability that the observed Sharpe exceeds the expected best
+// of N random (zero-alpha) strategies.
+
+// Standard normal CDF (Abramowitz-Stegun 26.2.17, max error ~7.5e-8)
+// Vectorized: works on scalars and lists
+normCDF:{[x]
+    p0:0.2316419;
+    b1:0.319381530; b2:neg 0.356563782; b3:1.781477937;
+    b4:neg 1.821255978; b5:1.330274429;
+    ax:abs x;
+    t:1 % 1 + p0 * ax;
+    // Horner form: t*(b1 + t*(b2 + t*(b3 + t*(b4 + t*b5))))
+    h:((b5 * t) + b4);
+    h:((h * t) + b3);
+    h:((h * t) + b2);
+    h:((h * t) + b1);
+    poly:h * t;
+    phi:(exp neg 0.5 * ax * ax) % sqrt 2 * acos neg 1f;
+    cdf:1 - phi * poly;
+    ?[x < 0; 1 - cdf; cdf]}
+
+// Standard normal inverse CDF (Beasley-Springer-Moro, max error ~4.5e-4)
+// Vectorized: works on scalars and lists
+normCDFInv:{[p]
+    isLow:p < 0.5;
+    pp:?[isLow; p; 1 - p];
+    t:sqrt neg 2 * log pp;
+    c0:2.515517; c1:0.802853; c2:0.010328;
+    d1:1.432788; d2:0.189269; d3:0.001308;
+    num:(c0 + (t * (c1 + (c2 * t))));
+    den:(1 + (t * (d1 + (t * (d2 + (d3 * t))))));
+    x:t - num % den;
+    ?[isLow; neg x; x]}
+
+// Expected max Sharpe from N independent trials under null (SR=0)
+expectedMaxSR_:{[nTrials;nObs]
+    if[nTrials <= 1; :0f];
+    gamma:0.5772156649;  // Euler-Mascheroni
+    z1:normCDFInv[1 - 1 % `float$nTrials];
+    z2:normCDFInv[1 - 1 % (`float$nTrials) * exp 1f];
+    eMax:((1 - gamma) * z1) + gamma * z2;
+    eMax % sqrt (`float$nObs) - 1}
+
+// Deflated Sharpe Ratio
+// @param rets - return series (e.g., signal-weighted daily PnL)
+// @param nTrials - number of strategies/signals tested
+// @return dict: sharpe, annSharpe, dsr (probability 0-1), skew, kurt, nObs, nTrials, sr0, minSharpe
+deflatedSharpe:{[rets;nTrials]
+    rets:rets where not null rets;
+    n:count rets;
+    nullResult:`sharpe`annSharpe`dsr`skew`kurt`nObs`nTrials`sr0`minSharpe!(0n;0n;0n;0n;0n;n;nTrials;0n;0n);
+    if[n < 5; :nullResult];
+    mu:avg rets;
+    sd:dev rets;
+    if[sd < 1e-15; :nullResult];
+    sr:mu % sd;
+    annSr:sr * sqrt 252f;
+    z:(rets - mu) % sd;
+    skew:avg z * z * z;
+    kurt:avg z * z * z * z;  // regular kurtosis (3 for normal)
+    // Variance of SR estimator under non-normality (Lo 2002, Mertens 2002)
+    srVar:((1 - (skew * sr)) + (((kurt - 1) % 4) * sr * sr)) % `float$n;
+    // Expected max SR under null
+    sr0:expectedMaxSR_[nTrials;n];
+    // Minimum annualized Sharpe for 5% significance
+    minSr:$[srVar > 0; (sr0 + (1.645 * sqrt srVar)) * sqrt 252f; 0n];
+    // DSR: probability observed Sharpe is significant after multiple testing
+    dsr:$[srVar > 0; normCDF[(sr - sr0) % sqrt srVar]; 0n];
+    `sharpe`annSharpe`dsr`skew`kurt`nObs`nTrials`sr0`minSharpe!(sr;annSr;dsr;skew;kurt;n;nTrials;sr0 * sqrt 252f;minSr)}
+
+// Deflated Sharpe for multiple signal PnL columns
+// @param t - table containing PnL columns
+// @param pnlCols - symbol list of column names with signal PnLs
+// @param nTrials - number of strategies tested (null = use count pnlCols)
+// @return table: signal, sharpe, annSharpe, dsr, skew, kurt, nObs, nTrials, sr0, minSharpe
+deflatedSharpeTable:{[t;pnlCols;nTrials]
+    nT:$[null nTrials; count pnlCols; nTrials];
+    results:{[t;nT;col]
+        r:deflatedSharpe[t col;nT];
+        (enlist[`signal]!enlist col),r
+    }[t;nT] each pnlCols;
+    flip results}
 
 \d .
 
