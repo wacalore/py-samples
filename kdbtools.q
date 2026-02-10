@@ -4524,6 +4524,122 @@ deflatedSharpeTable:{[t;pnlCols;nTrials]
     }[t;nT] each pnlCols;
     flip results}
 
+// =============================================================================
+// PROBABILITY OF BACKTEST OVERFITTING (PBO)
+// Bailey, Borwein, Lopez de Prado, Zhu (2014)
+// Uses Combinatorially Symmetric Cross-Validation (CSCV)
+// =============================================================================
+
+// Internal: generate all k-element combinations of 0..n-1
+// Returns list of k-length integer lists
+comb_:{[n;k]
+    if[(k < 1) | k > n; :()];
+    if[k = n; :enlist til n];
+    if[k = 1; :enlist each til n];
+    // Recursive: include n-1 in combo + don't include n-1
+    with:comb_[n-1;k-1];
+    with:{x,y}[;n-1] each with;
+    without:comb_[n-1;k];
+    with,without}
+
+// Probability of Backtest Overfitting
+// @param retMatrix - matrix of returns: each column is a strategy, each row is a time period
+//                    OR table with strategy PnL columns
+// @param nPart - number of partitions (must be even, typically 10 or 16)
+// @return dict: pbo, probLoss, nCombs, nStrategies, nPartitions, nObs,
+//               avgOosRank, medOosRank, oosRanks, logitScores
+pbo:{[retMatrix;nPart]
+    // Handle table input: extract numeric columns as matrix
+    M:$[98h = type retMatrix;
+        flip value flip retMatrix;
+        retMatrix];
+    nObs:count M;
+    nStrats:count first M;
+    nullResult:`pbo`probLoss`nCombs`nStrategies`nPartitions`nObs`avgOosRank`medOosRank`oosRanks`logitScores!(0n;0n;0;nStrats;nPart;nObs;0n;0n;();());
+    if[nStrats < 2; :nullResult];
+    if[nPart < 2; :nullResult];
+    if[nPart mod 2; :nullResult];  // must be even
+    halfPart:nPart div 2;
+    // Partition data into nPart equal-sized blocks
+    blockSize:nObs div nPart;
+    if[blockSize < 2; :nullResult];  // need at least 2 obs per block
+    // Precompute per-block sums and sum-of-squares for each strategy
+    blockSums:{[M;blockSize;b]
+        startIdx:b * blockSize;
+        endIdx:$[b = (count[M] div blockSize) - 1; count M; startIdx + blockSize];
+        idx:startIdx + til endIdx - startIdx;
+        sum each flip M idx
+    }[M;blockSize] each til nPart;
+    blockSumSqs:{[M;blockSize;b]
+        startIdx:b * blockSize;
+        endIdx:$[b = (count[M] div blockSize) - 1; count M; startIdx + blockSize];
+        idx:startIdx + til endIdx - startIdx;
+        {sum x * x} each flip M idx
+    }[M;blockSize] each til nPart;
+    blockCounts:{[M;blockSize;nPart;b]
+        startIdx:b * blockSize;
+        endIdx:$[b = nPart - 1; count M; startIdx + blockSize];
+        endIdx - startIdx
+    }[M;blockSize;nPart] each til nPart;
+    // Enumerate all C(nPart, halfPart) IS/OOS combinations
+    combos:comb_[nPart;halfPart];
+    nCombs:count combos;
+    allBlocks:til nPart;
+    // For each combination, compute IS Sharpe for all strategies,
+    // find IS-best, check OOS performance
+    evalCombo:{[blockSums;blockSumSqs;blockCounts;nStrats;allBlocks;halfPart;isBlocks]
+        oosBlocks:allBlocks except isBlocks;
+        // IS Sharpe per strategy
+        isSums:sum blockSums isBlocks;
+        isSumSqs:sum blockSumSqs isBlocks;
+        isN:sum blockCounts isBlocks;
+        isMu:isSums % `float$isN;
+        isVar:((isSumSqs % `float$isN) - isMu * isMu);
+        isSd:sqrt 0f | isVar;
+        isSr:?[isSd > 1e-15; isMu % isSd; nStrats#0f];
+        // OOS Sharpe per strategy
+        oosSums:sum blockSums oosBlocks;
+        oosSumSqs:sum blockSumSqs oosBlocks;
+        oosN:sum blockCounts oosBlocks;
+        oosMu:oosSums % `float$oosN;
+        oosVar:((oosSumSqs % `float$oosN) - oosMu * oosMu);
+        oosSd:sqrt 0f | oosVar;
+        oosSr:?[oosSd > 1e-15; oosMu % oosSd; nStrats#0f];
+        // Find IS-best strategy
+        isBest:isSr ? max isSr;
+        // OOS rank of IS-best (0 = best, nStrats-1 = worst)
+        oosRank:sum oosSr > oosSr isBest;
+        // Logit of relative OOS rank
+        relRank:(`float$oosRank) % `float$nStrats;
+        // Clamp away from 0 and 1 for logit
+        relRank:0.01 | relRank & 0.99;
+        logit:log relRank % 1 - relRank;
+        (oosRank; logit; oosSr isBest)
+    }[blockSums;blockSumSqs;blockCounts;nStrats;allBlocks;halfPart] each combos;
+    oosRanks:evalCombo[;0];
+    logitScores:evalCombo[;1];
+    oosSharpes:evalCombo[;2];
+    // PBO = fraction of combos where IS-best underperforms OOS median
+    // (i.e., OOS rank >= nStrats/2)
+    pboVal:avg oosRanks >= nStrats div 2;
+    // Probability of loss: fraction where OOS Sharpe of IS-best < 0
+    probLoss:avg oosSharpes < 0;
+    avgRank:avg `float$oosRanks;
+    medRank:med `float$oosRanks;
+    `pbo`probLoss`nCombs`nStrategies`nPartitions`nObs`avgOosRank`medOosRank`oosRanks`logitScores!(pboVal;probLoss;nCombs;nStrats;nPart;nObs;avgRank;medRank;oosRanks;logitScores)}
+
+// PBO for a table of strategy PnL columns
+// @param t - table containing PnL columns
+// @param pnlCols - symbol list of column names with strategy PnLs
+// @param nPart - number of partitions (even, typically 10 or 16)
+// @return dict: pbo, probLoss, nCombs, nStrategies, nPartitions, nObs, avgOosRank, medOosRank
+pboTable:{[t;pnlCols;nPart]
+    // Extract columns as matrix (list of row vectors)
+    M:flip t pnlCols;
+    // Remove rows with any nulls
+    M:M where not any each null M;
+    pbo[M;nPart]}
+
 \d .
 
 // =============================================================================
