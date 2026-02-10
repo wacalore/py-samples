@@ -4210,74 +4210,88 @@ gbHistr:{[n;X;y;nTrees;maxDepth;minLeaf;lr]
 // =============================================================================
 // TABLE-FRIENDLY ROLLING ENSEMBLE FUNCTIONS
 // =============================================================================
-// These functions work directly with tables and column names
-// Usage: .kdbtools.gbcrT[t;`rsi`macd`sma20;`target;60;20;3;5;0.1]
+// All functions: f[tbl; bycol; xc; yc; n; cfg]
+//   tbl   - table with features and target
+//   bycol - column to group by (e.g. `sym), use (::) for no grouping
+//   xc    - feature column names (symbol list)
+//   yc    - target column name (symbol)
+//   n     - window size
+//   cfg   - dict of hyperparams (merged with defaults), or (::) for all defaults
+//
+// Usage:
+//   .kdbtools.gbrT[t; `sym; `f1`f2; `ret; 60; `nTrees`maxDepth!(20;3)]
+//   .kdbtools.gbrT[t; (::); `f1`f2; `ret; 60; (::)]  // no grouping, all defaults
+
+// Internal: run rolling function by group with scatter-back
+rollingByGroup_:{[tbl;bycol;xc;yc;fn]
+    nObs:count tbl;
+    grpIdxs:$[(::)~bycol; enlist til nObs; value group tbl bycol];
+    proc:{[tbl;xc;yc;fn;idxs]
+        sub:tbl idxs;
+        fn[flip sub xc; `float$sub yc]
+    }[tbl;xc;yc;fn];
+    results:proc each grpIdxs;
+    allIdx:raze grpIdxs;
+    allPreds:raze results;
+    allPreds iasc allIdx}
 
 // Rolling GB Classification on table
-// @param tbl - table with features and target
-// @param xc - feature column names (symbol list)
-// @param yc - target column name (symbol)
-// @param n - window size
-// @param nTrees - number of trees
-// @param maxDepth - max tree depth
-// @param minLeaf - min samples per leaf
-// @param lr - learning rate
-// @return column of probabilities (same length as table)
-gbcrT:{[tbl;xc;yc;n;nTrees;maxDepth;minLeaf;lr]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbcr[n;X;y;nTrees;maxDepth;minLeaf;lr]}
+// cfg keys: `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1)
+gbcrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr!(50;3;5;0.1);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbcr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]}[n;c]]}
 
 // Rolling GB Classification Newton on table
-gbcnrT:{[tbl;xc;yc;n;nTrees;maxDepth;minLeaf;lr]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbcnr[n;X;y;nTrees;maxDepth;minLeaf;lr]}
+gbcnrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr!(50;3;5;0.1);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbcnr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]}[n;c]]}
 
 // Rolling GB Regression on table
-gbrT:{[tbl;xc;yc;n;nTrees;maxDepth;minLeaf;lr]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbr[n;X;y;nTrees;maxDepth;minLeaf;lr]}
+// cfg keys: `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1)
+gbrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr!(50;3;5;0.1);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]}[n;c]]}
 
 // Rolling Random Forest Classification on table
-rfcrT:{[tbl;xc;yc;n;nTrees;maxDepth;minLeaf]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    rfcr[n;X;y;nTrees;maxDepth;minLeaf]}
+// cfg keys: `nTrees(100) `maxDepth(5) `minLeaf(10)
+rfcrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf!(100;5;10);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] rfcr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf]}[n;c]]}
 
 // Rolling Random Forest Regression on table
-rfrT:{[tbl;xc;yc;n;nTrees;maxDepth;minLeaf]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    rfr[n;X;y;nTrees;maxDepth;minLeaf]}
+rfrT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf!(100;5;10);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] rfr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf]}[n;c]]}
 
-// Fast Rolling GB Classification on table (stride)
-// Uses stride=5 by default for 5x speedup
-// @param n - window size
-// @param nTrees - trees (default minLeaf=5, lr=0.1)
-gbcrFT:{[tbl;xc;yc;n;nTrees;maxDepth]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbcrF[n;X;y;nTrees;maxDepth;5;0.1;5]}
+// Fast Rolling GB Classification (stride) on table
+// cfg keys: `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1) `stride(5)
+gbcrFT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr`stride!(50;3;5;0.1;5);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbcrF[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride]}[n;c]]}
 
-// Fast Rolling GB Regression on table (stride)
-gbrFT:{[tbl;xc;yc;n;nTrees;maxDepth]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbrF[n;X;y;nTrees;maxDepth;5;0.1;5]}
+// Fast Rolling GB Regression (stride) on table
+gbrFT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr`stride!(50;3;5;0.1;5);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbrF[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride]}[n;c]]}
 
-// Batch Rolling GB Classification on table
-gbcrBT:{[tbl;xc;yc;n;nTrees;maxDepth]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbcrB[n;X;y;nTrees;maxDepth;5;0.1;5]}
+// Batch Rolling GB Classification (stride) on table
+gbcrBT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr`stride!(50;3;5;0.1;5);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbcrB[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride]}[n;c]]}
 
-// Batch Rolling GB Regression on table
-gbrBT:{[tbl;xc;yc;n;nTrees;maxDepth]
-    X:flip tbl xc;
-    y:`float$tbl yc;
-    gbrB[n;X;y;nTrees;maxDepth;5;0.1;5]}
+// Batch Rolling GB Regression (stride) on table
+gbrBT:{[tbl;bycol;xc;yc;n;cfg]
+    defaults:`nTrees`maxDepth`minLeaf`lr`stride!(50;3;5;0.1;5);
+    c:$[99h=type cfg; defaults,cfg; defaults];
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbrB[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride]}[n;c]]}
 
 // =============================================================================
 // HISTOGRAM-BASED GRADIENT BOOSTING (XGBoost-style, QML optimized)
