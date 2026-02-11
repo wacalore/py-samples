@@ -464,8 +464,8 @@ hedgeRatioBatch:{[curve;deliveryDate;futuresPrices;ctdBonds;swapNotional;freq]
 //   2. Timing option: When to deliver during the month (first vs last)
 //   3. Wild card option: Delivery after futures stop trading
 //
-// OAS = Invoice Spread - (Delivery Option Value / DV01)
-// A higher option value means the standard spread OVERSTATES the true spread
+// OAS (short-futures invoice spread convention) = Invoice Spread + (Delivery Option Value / DV01)
+// A higher option value makes the received spread MORE positive (or less negative)
 //
 // Key methodology:
 //   - CTD is determined by HIGHEST IMPLIED REPO (not lowest net basis)
@@ -653,69 +653,57 @@ switchPoints:{[curve;settleDate;deliveryDate;futuresPrice;bonds;repoRate]
 // Returns dict with qualityOption, timingOption, and total
 deliveryOptionValueMarket:{[settleDate;firstDelivery;lastDelivery;futuresPrice;bonds;repoRate;vol]
     if[1 >= count bonds; :`qualityOption`timingOption`total!(0f;0f;0f)];
-    // Use last delivery for quality option calculation
     deliveryDate:lastDelivery;
-    // Time to delivery
     horizon:(deliveryDate - settleDate) % 365f;
     if[horizon <= 0; :`qualityOption`timingOption`total!(0f;0f;0f)];
-    // Volatility over horizon
     sigmaT:vol * sqrt horizon;
-    // Get switch points using market prices
-    switches:switchPointsMarket[settleDate;deliveryDate;futuresPrice;bonds;repoRate];
-    // Current ranking by implied repo
+    // Rank once — reused for CTD identification and switch points
     ranked:rankByImpliedRepo[settleDate;deliveryDate;futuresPrice;bonds];
     ctdBond:(first ranked)`bond;
     ctdIR:(first ranked)`impliedRepo;
-    // QUALITY OPTION VALUE (CTD may switch as rates move)
-    // Only consider switches within a reasonable rate range (e.g., +/- 300bp)
-    // Switches requiring larger moves have negligible probability
-    // NOTE: Take MAX contribution, not SUM - you can only deliver ONE bond
-    maxSwitchBps:300f;  // Maximum reasonable switch in bp
+    // CTD net basis (computed once, reused in quality option loop)
+    ctdNB:netBasisMarket[settleDate;deliveryDate;futuresPrice;ctdBond;repoRate];
+    ctdCF:ctdBond`cf;
+    // CTD DV01 (computed once, reused in switch point estimation)
+    ctdYtm:.ctd.yieldToMaturity[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdBond`cleanPrice];
+    ctdPUp:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdYtm+0.0001];
+    ctdPDn:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdYtm-0.0001];
+    ctdDV01:(ctdPDn - ctdPUp) % 2;
+    // Compute switch points + net basis for all non-CTD bonds in one pass
+    others:1 _ ranked;
+    sigmaTbps:sigmaT * 10000;
+    maxSwitchBps:300f;
     qualityOpt:0f;
-    if[0 < count switches;
+    if[0 < count others;
+        // Compute YTM, DV01, net basis for all non-CTD bonds in one pass
+        otherBonds:others@\:`bond;
+        ytmFn:{[s;b] .ctd.yieldToMaturity[s;b`maturity;b`coupon;`SA;100f;b`cleanPrice]}[settleDate;];
+        otherYtms:ytmFn each otherBonds;
+        pFn:{[s;b;y] .ctd.priceBondFromYield[s;b`maturity;b`coupon;`SA;100f;y]}[settleDate;];
+        otherPUp:pFn'[otherBonds;otherYtms+0.0001];
+        otherPDn:pFn'[otherBonds;otherYtms-0.0001];
+        otherDV01s:(otherPDn - otherPUp) % 2;
+        otherNBs:netBasisMarket[settleDate;deliveryDate;futuresPrice;;repoRate] each otherBonds;
+        // Switch points: Δrate = -nbGap / nbSensDiff
+        nbGaps:otherNBs - ctdNB;
+        nbSensDiffs:((otherBonds@\:`cf) * ctdDV01 % ctdCF) - otherDV01s;
+        switchBpsList:?[abs[nbSensDiffs] > 1e-6; neg nbGaps % nbSensDiffs; count[otherBonds]#0n];
+        // Quality option: max over probability-weighted net basis gaps
         i:0;
-        do[count switches;
-            sw:switches i;
-            switchBps:sw`switchBps;
-            bond:sw`bond;
-            // Skip null or unreasonable switch points
+        do[count otherBonds;
+            switchBps:switchBpsList i;
             if[not[null switchBps] and (abs switchBps) < maxSwitchBps;
-                // Net basis gap (value of switching)
-                bondNB:netBasisMarket[settleDate;deliveryDate;futuresPrice;bond;repoRate];
-                ctdNB:netBasisMarket[settleDate;deliveryDate;futuresPrice;ctdBond;repoRate];
-                nbGap:bondNB - ctdNB;
-                // Probability of switch (rate moves enough)
-                // sigmaT is in decimal (e.g., 0.003 = 30bp), convert to bp for z-score
-                sigmaTbps:sigmaT * 10000;  // Convert to bp
                 zScore:$[sigmaTbps > 1e-6; switchBps % sigmaTbps; 0n];
-                // Cap z-score at +/- 4 to avoid numerical issues
                 zScore:$[null zScore; 0n; -4f | 4f & zScore];
-                // If switch requires rates to rise (positive switchBps), use right tail
-                // If switch requires rates to fall (negative switchBps), use left tail
-                // Both cases: P(|move| >= |switchBps|) = tail probability beyond switch point
                 pSwitch:$[null zScore; 0f; 1 - normCDF abs zScore];
-                // Option value = probability-weighted expected gain from switching
-                // Take MAX across all potential switches (can only deliver one bond)
-                contribution:pSwitch * abs nbGap;
-                qualityOpt:qualityOpt | contribution];
+                qualityOpt:qualityOpt | pSwitch * abs nbGaps i];
             i+:1]];
-    // TIMING OPTION VALUE (first vs last delivery)
-    // Short can choose first OR last delivery - this is an option
-    // - Positive carry (implied repo > financing): short earns by delaying to last
-    // - Negative carry (implied repo < financing): short saves by delivering first
-    // The option value is the ABSOLUTE benefit of being able to choose optimally
+    // TIMING OPTION
     daysDiff:lastDelivery - firstDelivery;
-    // Carry spread: implied repo vs financing
     carrySpread:ctdIR - repoRate;
-    // CTD dirty price for carry calculation
     aiSettle:.ctd.accruedInterest[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f];
     dirtyPrice:ctdBond[`cleanPrice] + aiSettle;
-    // Absolute daily carry value
     dailyCarryAbs:abs (dirtyPrice * carrySpread) % 360;
-    // Timing option value = absolute carry benefit over the delivery window
-    // The short will ALWAYS choose the better date, so the option value is the absolute benefit
-    // We use 50% factor because there's uncertainty about which direction is optimal ex-ante
-    // (In practice, carry is usually predictable, but rates can move)
     timingOpt:0.5 * dailyCarryAbs * daysDiff;
     `qualityOption`timingOption`total`carrySpread!(qualityOpt;timingOpt;qualityOpt + timingOpt;carrySpread)}
 
@@ -892,16 +880,15 @@ oasInvoiceSpreadMarketFull:{[curve;delivery;futuresPrice;ctdBond;basket;repoRate
     wc:wildcardOption[settleDate;firstDelivery;lastDelivery;ctdBond;intradayVol];
     // Total option value
     totalOptVal:(optResult`total) + wc`total;
-    // Convert option value to yield terms using market-based DV01
-    // DV01 from yield bump
-    ytm:.ctd.yieldToMaturity[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdBond`cleanPrice];
-    pUp:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ytm+0.0001];
-    pDn:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ytm-0.0001];
-    ctdDV01:(pDn - pUp) % 2;
-    // Option adjustment in yield terms (per 1bp)
+    // CTD DV01 for yield conversion — reuse from deliveryOptionValue if available
+    // (it already computed CTD YTM + price bumps internally)
+    ctdYtm:.ctd.yieldToMaturity[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdBond`cleanPrice];
+    ctdPUp:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdYtm+0.0001];
+    ctdPDn:.ctd.priceBondFromYield[settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f;ctdYtm-0.0001];
+    ctdDV01:(ctdPDn - ctdPUp) % 2;
     optYieldAdj:$[ctdDV01 > 1e-6; totalOptVal % ctdDV01; 0f];
-    // OAS = standard spread - option adjustment
-    oas:spread - (optYieldAdj * 0.0001);
+    // OAS (short-futures convention) = standard spread + option adjustment
+    oas:spread + (optYieldAdj * 0.0001);
     oasBps:oas * 10000;
     // Net basis for CTD (using market prices)
     ctdNetBasis:netBasisMarket[settleDate;lastDelivery;futuresPrice;ctdBond;repoRate];
@@ -968,9 +955,9 @@ oasInvoiceSpread:{[curve;deliveryDate;futuresPrice;ctdBond;basket;repoRate;vol;f
              .ctd.priceBond[curveUp;settleDate;ctdBond`maturity;ctdBond`coupon;`SA;100f]) % 2;
     // Option adjustment in yield terms (per 1bp)
     optYieldAdj:$[ctdDV01 > 1e-6; optVal % ctdDV01; 0f];
-    // OAS = standard spread - option adjustment
-    // The option makes futures cheaper for the short, so standard spread overstates
-    oas:std[`invoiceSpread] - (optYieldAdj * 0.0001);
+    // OAS (short-futures convention) = standard spread + option adjustment
+    // The option benefits the short futures leg, so add to swap-minus-CTD spread
+    oas:std[`invoiceSpread] + (optYieldAdj * 0.0001);
     oasBps:oas * 10000;
     `invoiceYield`swapRate`invoiceSpread`spreadBps`optionValue`optionAdjBps`oas`oasBps!(
         std`invoiceYield;
@@ -1734,6 +1721,29 @@ rowToBondWithFlag:{[hasCP;row]
         $[hasCP; row`cleanPrice; 100f];
         row`cf)}
 
+// Internal: get basket from cache, apply daily prices if needed
+basketFromCache_:{[ctx;dc;dt]
+    cachedBasket:ctx[`basketCache] dc;
+    if[0 = count ctx`pricesByDateSym; :cachedBasket];
+    {[px;dt;b]
+        p:px (dt;b`sym);
+        $[null p; b; @[b;`cleanPrice;:;p]]
+    }[ctx`pricesByDateSym;dt] each cachedBasket}
+
+// Internal: get basket from table (no cache), build bond dicts
+basketFromTable_:{[ctx;dc;dt]
+    basketRows:$[ctx`hasBasketDateCol;
+        select from ctx[`basketTable] where date=dt, deliveryCode=dc;
+        select from ctx[`basketTable] where deliveryCode=dc];
+    if[(0 < count basketRows) and (0 < count ctx`pricesByDateSym);
+        pxBySym:{[px;d;s] px (d;s)}[ctx`pricesByDateSym;dt;] each basketRows`sym;
+        basketRows:$[`cleanPrice in cols basketRows;
+            update cleanPrice:{$[null x; y; x]}'[pxBySym;cleanPrice] from basketRows;
+            update cleanPrice:pxBySym from basketRows]];
+    if[0 = count basketRows; :()];
+    hasCleanPrice:`cleanPrice in cols basketRows;
+    rowToBondWithFlag[hasCleanPrice;] each basketRows}
+
 // Helper: process one CTD row for OAS
 // Supports both OIS curves (from buildOISCurves) and swap curves (from .swaps.buildCurve)
 dailyOASFromCTDRow:{[ctx;row]
@@ -1772,34 +1782,24 @@ dailyOASFromCTDRow:{[ctx;row]
     lastDelivery:$[`lastDelivery in key row; row`lastDelivery; deliveryDate];
     delivery:`first`last!(firstDelivery;lastDelivery);
 
-    // Get basket for this deliveryCode
-    // basketTable may or may not have date column
-    basketRows:$[ctx`hasBasketDateCol;
-        select from ctx[`basketTable] where date=dt, deliveryCode=dc;
-        select from ctx[`basketTable] where deliveryCode=dc];
+    // Get basket bond dicts - use cache when available
+    useCache:(0 < count ctx`basketCache) and dc in key ctx`basketCache;
+    basket:$[useCache;
+        basketFromCache_[ctx;dc;dt];
+        basketFromTable_[ctx;dc;dt]];
 
-    // Add prices from bondPx lookup if available
-    if[(0 < count basketRows) and (0 < count ctx`pricesByDateSym);
-        basketRows:update cleanPrice:{[px;d;s] px (d;s)}[ctx`pricesByDateSym;dt;] each sym from basketRows];
-
-    if[0=count basketRows;
+    if[0=count basket;
         // No basket - return invoice spread only, no option value
         spread:$[isOIS;
             invoiceSpreadWithOIS[curve;dt;deliveryDate;row`futuresPrice;ctdBond];
             invoiceSpread[curve;deliveryDate;row`futuresPrice;ctdBond;freq]];
         hr:$[isOIS;
-            // Simplified DV01 for OIS - use bond duration approximation
             `swapDV01`futuresDV01!(0f;0f);
             hedgeRatio[curve;deliveryDate;row`futuresPrice;ctdBond;1000000f;freq]];
         :`invoiceYield`swapRate`invoiceSpread`spreadBps`qualityOption`timingOption`wildcardOption`optionValue`optionAdjBps`oas`oasBps`swapDV01`futuresDV01`basketSize!(
             spread`invoiceYield; spread`swapRate; spread`invoiceSpread; spread`spreadBps;
             0f; 0f; 0f; 0f; 0f; spread`invoiceSpread; spread`spreadBps;
             hr`swapDV01; hr`futuresDV01; 0)];
-
-    // Convert basket rows to bond dicts
-    // Check if basketRows has cleanPrice (either from original table or from bondPx lookup)
-    hasCleanPrice:`cleanPrice in cols basketRows;
-    basket:rowToBondWithFlag[hasCleanPrice;] each basketRows;
 
     // Calculate OAS - use market-based function for OIS curves
     oasResult:$[isOIS;
@@ -1931,13 +1931,25 @@ dailyOASFromCTD:{[ctdTable;basketTable;bondPx;curves;repoRate;vol;freq]
     hasCtdCleanPrice:`cleanPrice in cols ctdTable;
     hasBasketCleanPrice:`cleanPrice in cols basketTable;
 
+    // Pre-build basket cache by deliveryCode (avoids repeated select+dict construction)
+    hasBondPxPrices:0 < count pricesByDateSym;
+    basketCache:$[hasBasketDateCol;
+        ()!();  // can't cache when basket varies by date
+        [dcs:distinct basketTable`deliveryCode;
+         hasCP:`cleanPrice in cols basketTable;
+         dcs!{[bt;hasCP;dc]
+             rows:select from bt where deliveryCode=dc;
+             rowToBondWithFlag[hasCP;] each rows
+         }[basketTable;hasCP] each dcs]];
+
     // Pack context
-    ctx:`curvesByDate`basketTable`pricesByDateSym`freq`hasCtdCleanPrice`hasBasketCleanPrice`hasBasketDateCol`isOIS!(
-        curvesByDate;basketTable;pricesByDateSym;frq;hasCtdCleanPrice;hasBasketCleanPrice;hasBasketDateCol;isOIS);
+    ctx:`curvesByDate`basketTable`pricesByDateSym`freq`hasCtdCleanPrice`hasBasketCleanPrice`hasBasketDateCol`isOIS`basketCache!(
+        curvesByDate;basketTable;pricesByDateSym;frq;hasCtdCleanPrice;hasBasketCleanPrice;hasBasketDateCol;isOIS;basketCache);
     ctx:ctx,repoCtx,volCtx;
 
     // Process each CTD row
-    results:dailyOASFromCTDRow[ctx;] each ctdTable;
+    fn:dailyOASFromCTDRow[ctx;];
+    results:$[useParallel and 10 < count ctdTable; fn peach ctdTable; fn each ctdTable];
 
     // Combine with original table
     resultTable:$[98h=type results; results; flip results];
@@ -2749,7 +2761,10 @@ addDeliveryDates:{[ctdTable]
         update contract:.tsy.contractFromCode each deliveryCode from ctdTable;
         ctdTable];
     t:$[hasDC and not hasMonth;
-        update deliveryMonth:.tsy.monthFromCode each deliveryCode from t;
+        $[`deliveryDate in cols t;
+            / Prefer deliveryDate-derived month when available; this is robust to short codes like TYH6.
+            update deliveryMonth:`month$deliveryDate from t;
+            update deliveryMonth:.tsy.monthFromCode each deliveryCode from t];
         t];
 
     // Now add delivery dates based on contract and delivery month
