@@ -372,6 +372,16 @@ bbpos:{[n;k;x] m:sma[n;x]; s:mdev[n;x]; (x - m) % k * s}
 // Donchian breakout signal (1 upper, -1 lower, 0 none)
 donchian:{[n;x] hh:mmax[n;x]; ll:mmin[n;x]; (x = hh) - x = ll}
 
+// Donchian channel bands
+// Returns dict: upper, lower, mid, width, pctB (position within channel 0-1)
+donchianCh:{[n;x]
+    hi:mmax[n;x];
+    lo:mmin[n;x];
+    m:(hi + lo) % 2;
+    w:hi - lo;
+    pb:(x - lo) % w | 1e-15;
+    `upper`lower`mid`width`pctB!(hi;lo;m;w;pb)}
+
 // Linear regression slope - vectorized using cumsum formulas
 // slope = (n*Σiy - Σi*Σy) / (n*Σi² - (Σi)²) where i=0..n-1
 // Returns null for first n-1 positions (partial windows)
