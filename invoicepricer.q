@@ -1796,10 +1796,10 @@ dailyOASFromCTDRow:{[ctx;row]
         hr:$[isOIS;
             `swapDV01`futuresDV01!(0f;0f);
             hedgeRatio[curve;deliveryDate;row`futuresPrice;ctdBond;1000000f;freq]];
-        :`invoiceYield`swapRate`invoiceSpread`spreadBps`qualityOption`timingOption`wildcardOption`optionValue`optionAdjBps`oas`oasBps`swapDV01`futuresDV01`basketSize!(
+        :`invoiceYield`swapRate`invoiceSpread`spreadBps`qualityOption`timingOption`wildcardOption`optionValue`optionAdjBps`oas`oasBps`swapDV01`futuresDV01`netBasis`basketSize!(
             spread`invoiceYield; spread`swapRate; spread`invoiceSpread; spread`spreadBps;
             0f; 0f; 0f; 0f; 0f; spread`invoiceSpread; spread`spreadBps;
-            hr`swapDV01; hr`futuresDV01; 0)];
+            hr`swapDV01; hr`futuresDV01; 0n; 0)];
 
     // Calculate OAS - use market-based function for OIS curves
     oasResult:$[isOIS;
@@ -1819,11 +1819,15 @@ dailyOASFromCTDRow:{[ctx;row]
     timingOpt:$[isOIS; oasResult`timingOption; 0f];
     wildcardOpt:$[isOIS; oasResult`wildcardOption; 0f];
 
-    `invoiceYield`swapRate`invoiceSpread`spreadBps`qualityOption`timingOption`wildcardOption`optionValue`optionAdjBps`oas`oasBps`swapDV01`futuresDV01`basketSize!(
+    // Net basis: available from OIS path, compute for non-OIS
+    nb:$[isOIS; oasResult`netBasis;
+        netBasisMarket[curve[`config]`asOfDate;deliveryDate;row`futuresPrice;ctdBond;repoRate]];
+
+    `invoiceYield`swapRate`invoiceSpread`spreadBps`qualityOption`timingOption`wildcardOption`optionValue`optionAdjBps`oas`oasBps`swapDV01`futuresDV01`netBasis`basketSize!(
         oasResult`invoiceYield; oasResult`swapRate; oasResult`invoiceSpread; oasResult`spreadBps;
         qualityOpt; timingOpt; wildcardOpt;
         optVal; optAdj; oasResult`oas; oasResult`oasBps;
-        hr`swapDV01; hr`futuresDV01; count basket)}
+        hr`swapDV01; hr`futuresDV01; nb; count basket)}
 
 // Daily OAS from pre-computed CTD table and basket
 // Supports both OIS curves (from buildOISCurves) and swap curves (from .swaps.buildCurve)
