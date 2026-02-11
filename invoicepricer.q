@@ -2292,8 +2292,14 @@ oisCurveToSwapCurve:{[oisCurve]
         tenors;yfs;dfs;zeros;(count yfs)#0n;()!();()!();cfg)}
 
 // Repo lookup helper for scalar/dict/table repo inputs.
+// Supported tabular columns:
+//   ([] date; repo)
+//   ([] date; rate)
+//   ([] date; repoRate)
+//   ([] date; value)
 repoForDate:{[repoInput;dt]
     if[repoInput~(::); :0n];
+    dt0:$[(abs type dt) in 12 15h; date dt; dt];
     tr:type repoInput;
     atr:abs tr;
     if[(tr<0h) and (atr in 1 4 5 6 7 8 9h); :1f*repoInput];
@@ -2301,26 +2307,40 @@ repoForDate:{[repoInput;dt]
         if[0=count repoInput; :0n];
         :1f*first repoInput];
     if[tr=99h;
+        / keyed table -> plain table path
+        if[98h=type key repoInput;
+            repoInput:0!repoInput;
+            tr:98h;
+        ];
+    ];
+    if[tr=99h;
         ks:key repoInput;
-        if[dt in ks; :1f*repoInput dt];
+        if[(abs type ks) in 12 15h; ks:date each ks];
+        m:ks=dt0;
+        if[any m; :1f*first (value repoInput) where m];
         :0n];
     if[tr=98h;
         cols_:cols repoInput;
-        if[all (`date`repo in cols_);
-            rr:repoInput where (repoInput`date)=dt;
-            if[0<count rr; :1f*first rr`repo];
-            :0n];
-        if[all (`date`value in cols_);
-            rr:repoInput where (repoInput`date)=dt;
-            if[0<count rr; :1f*first rr`value];
-            :0n];
+        if[not `date in cols_; :0n];
+        rt:repoInput;
+        if[(abs type rt`date) in 12 15h; rt:update date:date date from rt];
+        valCol:$[`repo in cols_; `repo;
+            $[`rate in cols_; `rate;
+                $[`repoRate in cols_; `repoRate;
+                    $[`value in cols_; `value; `]]]];
+        if[valCol~`; :0n];
+        rr:rt where (rt`date)=dt0;
+        if[0<count rr; :1f*first rr valCol];
+        :0n;
     ];
     0n}
 
 // Daily invoice spread with OIS conventions + realized day-over-day PnL and carry.
 // Uses existing createPosition/pnlDecomposition/spreadCarry logic via OIS->swaps curve adapter.
 // cfg options:
-//   `swapNotional (default 1000000f)
+//   `swapNotional (default 1000000f; carry/roll notional, and used when notionalMode=`fixed)
+//   `notionalMode (`perBpDV01 default, or `fixed)
+//   `targetSwapDV01 (default 1f; used when notionalMode is DV01-based)
 //   `direction    (`long default, or `short)
 //   `freq         (default `1Y)
 //   `horizon      (default `1D for carry projection only; does not affect realized 1D pnl)
@@ -2330,7 +2350,13 @@ repoForDate:{[repoInput;dt]
 dailyInvoiceSpreadOISPnL:{[ctdTable;oisCurves;cfg]
     if[0=count ctdTable; :ctdTable];
     c:$[99h=type cfg; cfg; ()!()];
-    swapNotional:$[`swapNotional in key c; 1f*c`swapNotional; 1000000f];
+    baseSwapNotional:$[`swapNotional in key c; 1f*c`swapNotional; 1000000f];
+    notionalMode:`$lower string $[`notionalMode in key c; c`notionalMode; `perBpDV01];
+    dv01Modes:`perbpdv01`dv01`unitdv01;
+    isDv01Mode:notionalMode in dv01Modes;
+    if[not (isDv01Mode or notionalMode~`fixed); '"cfg.notionalMode must be `perBpDV01/`dv01/`unitdv01 or `fixed"];
+    targetSwapDV01:$[`targetSwapDV01 in key c; 1f*c`targetSwapDV01; 1f];
+    if[targetSwapDV01<=0; '"cfg.targetSwapDV01 must be > 0"];
     freq:$[`freq in key c; c`freq; `1Y];
     horizon:$[`horizon in key c; c`horizon; `1D];
     initPnl:$[`initPnl in key c; 1f*c`initPnl; 0f];
@@ -2372,13 +2398,19 @@ dailyInvoiceSpreadOISPnL:{[ctdTable;oisCurves;cfg]
     totalPnL:n#0n;
     spreadChangeBps:n#0n;
     swapCarryV:n#0n;
+    swapRollV:n#0n;
+    swapTotalV:n#0n;
     futuresCarryV:n#0n;
+    futuresRollV:n#0n;
+    futuresTotalV:n#0n;
     netCarryV:n#0n;
     netRollV:n#0n;
     totalExpectedV:n#0n;
     repoRateV:n#0n;
     futuresNotionalV:n#0n;
-    swapNotionalV:n#swapNotional;
+    swapNotionalV:n#0n;
+    carryFuturesNotionalV:n#0n;
+    carrySwapNotionalV:n#baseSwapNotional;
     directionV:n#direction;
     pnlSwapNotionalV:n#0n;
     pnlFuturesNotionalV:n#0n;
@@ -2404,16 +2436,30 @@ dailyInvoiceSpreadOISPnL:{[ctdTable;oisCurves;cfg]
                 curve:convCurves d;
                 cp:$[hasClean; r`cleanPrice; 100f];
                 ctdBond:`sym`coupon`maturity`cleanPrice`cf!(r`sym;r`coupon;r`maturity;cp;r`cf);
-                pos:createPosition[curve;r`deliveryDate;r`futuresPrice;ctdBond;swapNotional;freq;direction];
+                rowSwapNotional:baseSwapNotional;
+                if[isDv01Mode;
+                    / Size to requested swap DV01 units per 1bp (default: 1bp DV01).
+                    dv01PerUnit:swapDV01Dated[curve;1f;r`deliveryDate;ctdBond`maturity;freq];
+                    rowSwapNotional:$[(null dv01PerUnit) or 0f=abs dv01PerUnit; baseSwapNotional; targetSwapDV01 % abs dv01PerUnit];
+                ];
+                pos:createPosition[curve;r`deliveryDate;r`futuresPrice;ctdBond;rowSwapNotional;freq;direction];
+                / Carry/roll is always reported in flat-notional units.
+                carryPos:createPosition[curve;r`deliveryDate;r`futuresPrice;ctdBond;baseSwapNotional;freq;direction];
                 oi:idxs sj;
+                swapNotionalV[oi]:pos`swapNotional;
                 futuresNotionalV[oi]:pos`futuresNotional;
+                carryFuturesNotionalV[oi]:carryPos`futuresNotional;
 
                 rp:.invoicepricer.repoForDate[repoInput;d];
                 repoRateV[oi]:rp;
                 if[not null rp;
-                    cr:spreadCarry[curve;pos;rp;horizon];
+                    cr:spreadCarry[curve;carryPos;rp;horizon];
                     swapCarryV[oi]:cr`swapCarry;
+                    swapRollV[oi]:cr`swapRollDown;
+                    swapTotalV[oi]:(cr`swapCarry) + (cr`swapRollDown);
                     futuresCarryV[oi]:cr`futuresCarry;
+                    futuresRollV[oi]:cr`futuresRollDown;
+                    futuresTotalV[oi]:(cr`futuresCarry) + (cr`futuresRollDown);
                     netCarryV[oi]:cr`netCarry;
                     netRollV[oi]:cr`netRollDown;
                     totalExpectedV[oi]:cr`totalExpected;
@@ -2448,6 +2494,8 @@ dailyInvoiceSpreadOISPnL:{[ctdTable;oisCurves;cfg]
     update
         swapNotional:swapNotionalV,
         futuresNotional:futuresNotionalV,
+        carrySwapNotional:carrySwapNotionalV,
+        carryFuturesNotional:carryFuturesNotionalV,
         direction:directionV,
         repoRate:repoRateV,
         pnlSwapNotional:pnlSwapNotionalV,
@@ -2464,7 +2512,11 @@ dailyInvoiceSpreadOISPnL:{[ctdTable;oisCurves;cfg]
         spreadChangeBpsPrev:spreadChangeBps,
         spreadChangeBps1D:spreadChangeBps,
         swapCarry:swapCarryV,
+        swapRollDown:swapRollV,
+        swapTotalExpected:swapTotalV,
         futuresCarry:futuresCarryV,
+        futuresRollDown:futuresRollV,
+        futuresTotalExpected:futuresTotalV,
         netCarry:netCarryV,
         netRollDown:netRollV,
         totalExpectedCarry:totalExpectedV
