@@ -418,6 +418,28 @@ slope:{[n;x]
     r:((n*siy) - si*sy) % denom;
     @[r;til n-1;:;0n]}               // null for partial windows
 
+// T-statistic of rolling regression slope
+// t = slope / SE(slope), where SE = sqrt(RSS / ((n-2) * Sxx))
+// Vectorized using cumsum formulas (same infrastructure as slope)
+slopeT:{[n;x]
+    si:n*(n-1)%2;
+    si2:n*(n-1)*((2*n)-1)%6;
+    sxx:(n*si2) - si*si;             // n * Σ(i-ī)² = n*Σi²-(Σi)²
+    sy:msum[n;x];
+    sy2:msum[n;x*x];                 // rolling Σy²
+    idx:til count x;
+    offset:(idx-n)+1;
+    siy:(msum[n;idx*x]) - offset*sy;
+    sxy:(n*siy) - si*sy;             // n * Σ(i-ī)(y-ȳ)
+    b:sxy % sxx;                     // slope
+    // RSS = Σ(y-ȳ)² - slope²*Σ(i-ī)² = (Syy - b²*Sxx) / n
+    syy:(n*sy2) - sy*sy;             // n * Σ(y-ȳ)²
+    rss:(syy - (b*b*sxx)) % `float$n; // residual sum of squares
+    // SE(slope) = sqrt(RSS / ((n-2) * Sxx/n))
+    se:sqrt (rss % (`float$n-2)) % sxx % `float$n;
+    r:b % se | 1e-15;
+    @[r;til n-1;:;0n]}
+
 // Trend strength (abs slope of regression)
 trendstr:{[n;x] abs slope[n;x]}
 
