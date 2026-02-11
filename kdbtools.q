@@ -382,6 +382,26 @@ donchianCh:{[n;x]
     pb:(x - lo) % w | 1e-15;
     `upper`lower`mid`width`pctB!(hi;lo;m;w;pb)}
 
+// Donchian channel - table version
+// @param t    - table
+// @param bycol - group column (e.g. `sym) or (::) for none
+// @param col  - price column (e.g. `close)
+// @param n    - window size
+// @return original table + dch_upper, dch_lower, dch_mid, dch_width, dch_pctB, dch_signal
+donchianChT:{[t;bycol;col;n]
+    grpIdxs:$[(::)~bycol; enlist til count t; value group t bycol];
+    proc:{[t;col;n;idxs]
+        x:`float$t[col] idxs;
+        ch:donchianCh[n;x];
+        sig:donchian[n;x];
+        (ch`upper;ch`lower;ch`mid;ch`width;ch`pctB;sig)
+    }[t;col;n];
+    results:proc each grpIdxs;
+    allIdx:raze grpIdxs;
+    cn:`dch_upper`dch_lower`dch_mid`dch_width`dch_pctB`dch_signal;
+    ordered:{(raze x) iasc y}[;allIdx] each flip results;
+    t,'flip cn!ordered}
+
 // Linear regression slope - vectorized using cumsum formulas
 // slope = (n*Σiy - Σi*Σy) / (n*Σi² - (Σi)²) where i=0..n-1
 // Returns null for first n-1 positions (partial windows)
