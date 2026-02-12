@@ -200,14 +200,12 @@ winsorize:clip
 decay:{[f;halflife] smooth[f;halflife]}
 
 // Fast-attack slow-decay filter
-// Responds immediately to impulses, then decays gradually
+// Snaps to input when magnitude is growing, decays gradually when fading
 // @param f - signal vector
-// @param attackHL - halflife for attack (fast, e.g. 1)
-// @param decayHL - halflife for decay (slow, e.g. 5-10)
-attackDecay:{[f;attackHL;decayHL]
-    la:exp neg log[2] % attackHL;
+// @param decayHL - halflife for decay (e.g. 5-10)
+attackDecay:{[f;decayHL]
     ld:exp neg log[2] % decayHL;
-    {[la;ld;y;z] lam:$[(abs z) > abs y; la; ld]; (lam * y) + (1 - lam) * z}[la;ld]\[first f;ffill f]}
+    {[ld;y;z] $[(abs z) >= abs y; z; (ld * y) + (1 - ld) * z]}[ld]\[first f;ffill f]}
 
 // Lag: shift signal by n periods (positive = look back)
 lag:{[f;n] $[n>0; (n#0n),neg[n]_f; (neg[n]_f),abs[n]#0n]}
