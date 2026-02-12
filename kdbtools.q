@@ -3075,8 +3075,8 @@ cusum:{[x;mu;k;h]
         xi:x i;
         $[null xi;
             [sP[i]:0n; sM[i]:0n; st[i]:0n; al[i]:0b];
-            [sp:0f | sp + xi - mu + k;
-             sm:0f | sm + mu - k - xi;
+            [sp:0f | sp + (xi - mu) - k;
+             sm:0f | sm + (mu - xi) - k;
              sP[i]:sp; sM[i]:sm;
              st[i]:sp | sm;
              al[i]:st[i] > h;
@@ -3101,8 +3101,8 @@ cusumr:{[w;x;k;h]
         $[(null xi) or (null mi) or (null si) or si = 0f;
             [sP[i]:0n; sM[i]:0n; st[i]:0n; al[i]:0b];
             [kAbs:k * si; hAbs:h * si;
-             sp:0f | sp + xi - mi + kAbs;
-             sm:0f | sm + mi - kAbs - xi;
+             sp:0f | sp + (xi - mi) - kAbs;
+             sm:0f | sm + (mi - xi) - kAbs;
              sP[i]:sp; sM[i]:sm;
              st[i]:sp | sm;
              al[i]:st[i] > hAbs;
@@ -3282,7 +3282,7 @@ cpTableCusum:{[t;bycol;col;params]
     w:params`window; k:params`k; h:params`h;
     helper:{[col;w;k;h;g]
         r:cusumr[w;g col;k;h];
-        g,'flip `cusumStat`cusumAlarm!(r`stat;r`alarm)
+        g,'flip `cusumSPlus`cusumSMinus`cusumStat`cusumAlarm!(r`sPlus;r`sMinus;r`stat;r`alarm)
     }[col;w;k;h];
     t:update cpIdx__:i from t;
     grp:group t bycol;
