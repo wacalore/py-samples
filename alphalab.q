@@ -761,6 +761,11 @@ help:{[]
     -1 "SIGNAL TURNOVER:";
     -1 "  signalTurnover[sigTable]              - mean |delta sig| / mean |sig|";
     -1 "";
+    -1 "ALPHA EVALUATION SUITE:";
+    -1 "  alphaEval[t;cfg]                      - unified perf report (Sharpe,Sortino,etc)";
+    -1 "  monthlyBreakdown[dts;rets]            - per-month Sharpe, hit rate, return, vol";
+    -1 "  Input: t=([] dt;sym;sig;pnl), cfg=`rf`periods!(0;252)";
+    -1 "";
     -1 "EVALUATION:";
     -1 "  evalAlpha[name;params;data;cfg]       - single evaluation (type-dispatched)";
     -1 "  evalFolds[name;params;data;nFolds;cfg]- K-fold temporal CV";
@@ -816,6 +821,133 @@ exampleData:{[]
         ([] dt:dates; sym:nDays#s; ret:rets; price:100 * prds 1 + rets; volume:1000 + nDays?9000f)
         }[syms;dates;nDays] each til nSym;
     `dt`sym xasc rows}
+
+// -----------------------------------------------------------------------------
+// ALPHA EVALUATION SUITE
+// -----------------------------------------------------------------------------
+
+// Sample skewness
+alphaSkew:{[x]
+    n:count x; mu:avg x; s:dev x;
+    z:(x - mu) % s;
+    ((n % (n - 1)) % (n - 2)) * sum z xexp 3}
+
+// Excess kurtosis
+alphaKurt:{[x]
+    n:count x; mu:avg x; s:dev x;
+    z:(x - mu) % s;
+    s4:sum z xexp 4;
+    adj:((n * (n + 1)) % ((n - 1) * (n - 2) * (n - 3))) * s4;
+    adj - (3f * ((n - 1) * (n - 1)) % ((n - 2) * (n - 3)))}
+
+// Monthly breakdown: Sharpe, hit rate, return, vol, nDays per month
+monthlyBreakdown:{[dts;rets]
+    months:`month$dts;
+    uMonths:asc distinct months;
+    {[dts;rets;months;m]
+        idx:where months = m;
+        r:rets idx;
+        nz:r where r <> 0;
+        nd:count r;
+        nnz:count nz;
+        s:dev nz;
+        sh:$[(nnz > 1) and s > 0; (avg[nz] * sqrt 252) % (s * sqrt 252); 0n];
+        hr:$[nnz > 0; (sum nz > 0) % nnz; 0n];
+        `month`sharpe`hitRate`ret`vol`nDays!(m;sh;hr;sum r;s;nd)
+        }[dts;rets;months] each uMonths}
+
+// Main alpha evaluation function
+// t: table with (dt;sym;sig;pnl) - per-position daily alpha returns
+// cfg: optional dict with `rf (risk-free rate per period) and `periods (annualization)
+alphaEval:{[t;cfg]
+    rf:$[`rf in key cfg; cfg`rf; 0f];
+    periods:$[`periods in key cfg; cfg`periods; 252];
+    wpct:$[`winsorizePct in key cfg; cfg`winsorizePct; 0.01];
+
+    // Aggregate daily portfolio return
+    daily:0!select ret:sum pnl by dt from t;
+    dts:daily`dt;
+    r:daily`ret;
+    n:count r;
+
+    // Non-zero returns for alpha metrics
+    nz:r where r <> 0;
+    nnz:count nz;
+
+    // Annualized return and vol (non-zero days)
+    annRet:periods * avg nz;
+    annVol:(sqrt periods) * dev nz;
+
+    // Sharpe (non-zero days)
+    sharpe:$[annVol > 0; (annRet - (periods * rf)) % annVol; 0n];
+
+    // Winsorized Sharpe: clip at wpct/1-wpct percentiles, then Sharpe
+    lo:(asc nz) @ `long$wpct * nnz;
+    hi:(asc nz) @ `long$(1 - wpct) * nnz;
+    wRets:lo | nz & hi;
+    wAnnRet:periods * avg wRets;
+    wAnnVol:(sqrt periods) * dev wRets;
+    winsorizedSharpe:$[wAnnVol > 0; (wAnnRet - (periods * rf)) % wAnnVol; 0n];
+
+    // Sortino (non-zero days)
+    sortino:.kdbtools.sortino[periods;rf;nz];
+
+    // Max drawdown on cumulative returns (all days, preserves timeline)
+    cumRets:sums r;
+    maxDD:min cumRets - maxs cumRets;
+
+    // Calmar
+    calmar:$[(maxDD < 0) and (not null maxDD); neg annRet % maxDD; 0n];
+
+    // Distribution (non-zero days)
+    skw:alphaSkew nz;
+    krt:alphaKurt nz;
+
+    // Hit/loss (non-zero days)
+    wins:nz where nz > 0;
+    losses:nz where nz < 0;
+    winRate:$[nnz > 0; (count wins) % nnz; 0n];
+    avgWin:$[0 < count wins; avg wins; 0n];
+    avgLoss:$[0 < count losses; avg losses; 0n];
+    profitFactor:$[(0 < count losses) and (0 < count wins); (sum wins) % neg sum losses; 0n];
+    winLossRatio:$[(not null avgWin) and (not null avgLoss) and avgLoss < 0; avgWin % neg avgLoss; 0n];
+
+    // CVaR 95% (non-zero days)
+    cutoff:(asc nz) @ `long$0.05 * nnz;
+    cvar95:neg avg nz where nz <= cutoff;
+
+    // Monthly breakdown
+    mt:monthlyBreakdown[dts;r];
+    medSh:med mt[;`sharpe];
+    medHr:med mt[;`hitRate];
+
+    // Turnover from sig column
+    syms:asc distinct t`sym;
+    tos:{[t;s]
+        sub:`dt xasc select from t where sym=s;
+        sig:sub`sig;
+        dsig:1 _ deltas sig;
+        valid:dsig where not null dsig;
+        lvl:sig where not null sig;
+        $[(0 < count valid) and (0 < avg abs lvl);
+            (avg abs valid) % avg abs lvl;
+            0n]
+        }[t] each syms;
+    turnover:avg tos where not null tos;
+
+    // Build result dict
+    (`sharpe`winsorizedSharpe`sortino`calmar`annReturn`annVol`maxDD,
+     `skew`kurtosis,
+     `winRate`profitFactor`avgWin`avgLoss`winLossRatio,
+     `cvar95,
+     `medianMonthlySharpe`medianMonthlyHitRate`monthlyTable,
+     `turnover`nDays`nNonZeroDays`nPositions)!
+    (sharpe;winsorizedSharpe;sortino;calmar;annRet;annVol;maxDD;
+     skw;krt;
+     winRate;profitFactor;avgWin;avgLoss;winLossRatio;
+     cvar95;
+     medSh;medHr;mt;
+     turnover;n;nnz;count syms)}
 
 example:{[]
     -1 "";
