@@ -416,11 +416,17 @@ slope:{[n;x]
     offset:(t-n)+1;                  // NOTE: parens critical! (t-n)+1 not t-n+1
     siy:(msum[n;t*x]) - offset*sy;   // rolling Σiy
     r:((n*siy) - si*sy) % denom;
-    @[r;til n-1;:;0n]}               // null for partial windows
+    k:(n-1) & count r;               // guard short groups (count x < n)
+    @[r;til k;:;0n]}                 // null for partial windows
 
 // T-statistic of rolling regression slope
 // t = slope / SE(slope), where SE = sqrt(RSS / ((n-2) * Sxx))
 // Vectorized using cumsum formulas (same infrastructure as slope)
+// Table usage:
+//   t:`sym`dt xasc t;
+//   t:update tslope:.kdbtools.slopeT[n;r] by sym from t
+// Do not group by dt,sym when dt is unique per row: those groups are length 1 and
+// will (correctly) return null for rolling windows.
 slopeT:{[n;x]
     si:n*(n-1)%2;
     si2:n*(n-1)*((2*n)-1)%6;
@@ -435,10 +441,11 @@ slopeT:{[n;x]
     // RSS = Σ(y-ȳ)² - slope²*Σ(i-ī)² = (Syy - b²*Sxx) / n
     syy:(n*sy2) - sy*sy;             // n * Σ(y-ȳ)²
     rss:(syy - (b*b*sxx)) % `float$n; // residual sum of squares
-    // SE(slope) = sqrt(RSS / ((n-2) * Sxx/n))
-    se:sqrt (rss % (`float$n-2)) % sxx % `float$n;
+    // SE(slope) = sqrt((RSS/(n-2)) / (Sxx/n))
+    se:sqrt (rss % (`float$n-2) % (sxx % `float$n));
     r:b % se | 1e-15;
-    @[r;til n-1;:;0n]}
+    k:(n-1) & count r;               // guard short groups (count x < n)
+    @[r;til k;:;0n]}
 
 // Trend strength (abs slope of regression)
 trendstr:{[n;x] abs slope[n;x]}
@@ -4716,6 +4723,12 @@ pboTable:{[t;pnlCols;nPart]
     results[`beta]:abs[.kdbtools.beta[x;x]-1]<1e-10;
     results[`ols]:2=count .kdbtools.ols[x;y];
     results[`roc]:100=count .kdbtools.roc[10;x];
+    results[`slope]:100=count .kdbtools.slope[10;x];
+    results[`slopeT]:100=count .kdbtools.slopeT[10;x];
+    linSlope:.kdbtools.slope[20;`float$til 100];
+    results[`slopeLinear]:1e-12 > max abs (1f - (linSlope where not null linSlope));
+    shortSlopeT:.kdbtools.slopeT[10;5?1f];
+    results[`slopeTShort]:(5=count shortSlopeT) and all null shortSlopeT;
     results[`rsi]:100=count .kdbtools.rsi[14;x];
     results[`macd]:3=count .kdbtools.macd[12;26;9;x];
     results[`bband]:5=count .kdbtools.bband[20;2;x];
