@@ -764,7 +764,8 @@ help:{[]
     -1 "ALPHA EVALUATION SUITE:";
     -1 "  alphaEval[t;cfg]                      - unified perf report (Sharpe,Sortino,etc)";
     -1 "  monthlyBreakdown[dts;rets]            - per-month Sharpe, hit rate, return, vol";
-    -1 "  Input: t=([] dt;sym;sig;pnl), cfg=`rf`periods!(0;252)";
+    -1 "  cfg keys: dtCol symCol sigCol pnlCol  - column name overrides";
+    -1 "            rf periods winsorizePct      - (0; 252; 0.01)";
     -1 "";
     -1 "EVALUATION:";
     -1 "  evalAlpha[name;params;data;cfg]       - single evaluation (type-dispatched)";
@@ -850,47 +851,62 @@ monthlyBreakdown:{[dts;rets]
         nz:r where r <> 0;
         nd:count r;
         nnz:count nz;
+        ep:(nnz % nd) * 252;
         s:dev nz;
-        sh:$[(nnz > 1) and s > 0; (avg[nz] * sqrt 252) % (s * sqrt 252); 0n];
+        sh:$[(nnz > 1) and s > 0; (avg[nz] % s) * sqrt ep; 0n];
         hr:$[nnz > 0; (sum nz > 0) % nnz; 0n];
         `month`sharpe`hitRate`ret`vol`nDays!(m;sh;hr;sum r;s;nd)
         }[dts;rets;months] each uMonths}
 
 // Main alpha evaluation function
-// t: table with (dt;sym;sig;pnl) - per-position daily alpha returns
-// cfg: optional dict with `rf (risk-free rate per period) and `periods (annualization)
+// t: table with per-position daily rows
+// cfg: optional dict:
+//   `dtCol   - date column (default `dt)
+//   `symCol  - symbol column (default `sym)
+//   `sigCol  - signal column (default `sig)
+//   `pnlCol  - P&L column (default `pnl)
+//   `rf      - risk-free rate per period (default 0)
+//   `periods - annualization factor (default 252)
+//   `winsorizePct - winsorize percentile (default 0.01)
 alphaEval:{[t;cfg]
     rf:$[`rf in key cfg; cfg`rf; 0f];
     periods:$[`periods in key cfg; cfg`periods; 252];
     wpct:$[`winsorizePct in key cfg; cfg`winsorizePct; 0.01];
+    cDt:$[`dtCol in key cfg; cfg`dtCol; `dt];
+    cSym:$[`symCol in key cfg; cfg`symCol; `sym];
+    cSig:$[`sigCol in key cfg; cfg`sigCol; `sig];
+    cPnl:$[`pnlCol in key cfg; cfg`pnlCol; `pnl];
 
-    // Aggregate daily portfolio return
-    daily:0!select ret:sum pnl by dt from t;
-    dts:daily`dt;
-    r:daily`ret;
+    // Aggregate daily portfolio return, fill nulls with 0
+    daily:0!?[t;();(enlist cDt)!enlist cDt;(enlist`ret)!enlist(sum;cPnl)];
+    dts:daily cDt;
+    r:0f^daily`ret;
     n:count r;
 
-    // Non-zero returns for alpha metrics
+    // Non-zero returns
     nz:r where r <> 0;
     nnz:count nz;
 
-    // Annualized return and vol (non-zero days)
-    annRet:periods * avg nz;
-    annVol:(sqrt periods) * dev nz;
+    // Effective annualization: scale by fraction of active days
+    ep:(nnz % n) * periods;
 
-    // Sharpe (non-zero days)
-    sharpe:$[annVol > 0; (annRet - (periods * rf)) % annVol; 0n];
+    // Annualized return and vol (non-zero days)
+    annRet:ep * avg nz;
+    annVol:(sqrt ep) * dev nz;
+
+    // Sharpe (non-zero days, correctly annualized)
+    sharpe:$[annVol > 0; (annRet - (ep * rf)) % annVol; 0n];
 
     // Winsorized Sharpe: clip at wpct/1-wpct percentiles, then Sharpe
     lo:(asc nz) @ `long$wpct * nnz;
     hi:(asc nz) @ `long$(1 - wpct) * nnz;
     wRets:lo | nz & hi;
-    wAnnRet:periods * avg wRets;
-    wAnnVol:(sqrt periods) * dev wRets;
-    winsorizedSharpe:$[wAnnVol > 0; (wAnnRet - (periods * rf)) % wAnnVol; 0n];
+    wAnnRet:ep * avg wRets;
+    wAnnVol:(sqrt ep) * dev wRets;
+    winsorizedSharpe:$[wAnnVol > 0; (wAnnRet - (ep * rf)) % wAnnVol; 0n];
 
     // Sortino (non-zero days)
-    sortino:.kdbtools.sortino[periods;rf;nz];
+    sortino:.kdbtools.sortino[ep;rf;nz];
 
     // Max drawdown on cumulative returns (all days, preserves timeline)
     cumRets:sums r;
@@ -898,6 +914,10 @@ alphaEval:{[t;cfg]
 
     // Calmar
     calmar:$[(maxDD < 0) and (not null maxDD); neg annRet % maxDD; 0n];
+
+    // CVaR 95% (non-zero days)
+    cutoff:(asc nz) @ `long$0.05 * nnz;
+    cvar95:neg avg nz where nz <= cutoff;
 
     // Distribution (non-zero days)
     skw:alphaSkew nz;
@@ -912,27 +932,27 @@ alphaEval:{[t;cfg]
     profitFactor:$[(0 < count losses) and (0 < count wins); (sum wins) % neg sum losses; 0n];
     winLossRatio:$[(not null avgWin) and (not null avgLoss) and avgLoss < 0; avgWin % neg avgLoss; 0n];
 
-    // CVaR 95% (non-zero days)
-    cutoff:(asc nz) @ `long$0.05 * nnz;
-    cvar95:neg avg nz where nz <= cutoff;
-
     // Monthly breakdown
     mt:monthlyBreakdown[dts;r];
-    medSh:med mt[;`sharpe];
-    medHr:med mt[;`hitRate];
+    mSh:mt[;`sharpe]; mHr:mt[;`hitRate]; mRet:mt[;`ret];
+    // Filter to months with non-zero total return, drop nulls
+    shValid:mSh where (mRet <> 0) and not null mSh;
+    hrValid:mHr where (mRet <> 0) and not null mHr;
+    medSh:$[0 < count shValid; med shValid; 0n];
+    medHr:$[0 < count hrValid; med hrValid; 0n];
 
     // Turnover from sig column
-    syms:asc distinct t`sym;
-    tos:{[t;s]
-        sub:`dt xasc select from t where sym=s;
-        sig:sub`sig;
+    syms:asc distinct t cSym;
+    tos:{[t;cDt;cSym;cSig;s]
+        sub:cDt xasc ?[t;enlist(=;cSym;enlist s);0b;(cDt,cSig)!(cDt,cSig)];
+        sig:sub cSig;
         dsig:1 _ deltas sig;
         valid:dsig where not null dsig;
         lvl:sig where not null sig;
         $[(0 < count valid) and (0 < avg abs lvl);
             (avg abs valid) % avg abs lvl;
             0n]
-        }[t] each syms;
+        }[t;cDt;cSym;cSig] each syms;
     turnover:avg tos where not null tos;
 
     // Build result dict
