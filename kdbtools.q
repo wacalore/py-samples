@@ -442,7 +442,7 @@ slopeT:{[n;x]
     syy:(n*sy2) - sy*sy;             // n * Σ(y-ȳ)²
     rss:(syy - (b*b*sxx)) % `float$n; // residual sum of squares
     // SE(slope) = sqrt((RSS/(n-2)) / (Sxx/n))
-    se:sqrt (rss % (`float$n-2) % (sxx % `float$n));
+    se:sqrt (rss % `float$n-2) % (sxx % `float$n);
     r:b % se | 1e-15;
     k:(n-1) & count r;               // guard short groups (count x < n)
     @[r;til k;:;0n]}
