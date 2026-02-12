@@ -1744,6 +1744,44 @@ basketFromTable_:{[ctx;dc;dt]
     hasCleanPrice:`cleanPrice in cols basketRows;
     rowToBondWithFlag[hasCleanPrice;] each basketRows}
 
+// Internal: prebuild basket lookup keyed by (date,deliveryCode)
+// Applies daily bond prices once during cache build (instead of per-row).
+buildBasketsByDateDelivery_:{[ctdTable;basketTable;hasBasketDateCol;pricesByDateSym]
+    if[0=count ctdTable; :()!()];
+    keysTbl:distinct select date,deliveryCode from ctdTable;
+    if[0=count keysTbl; :()!()];
+
+    hasPrices:0 < count pricesByDateSym;
+
+    // Static base basket cache by deliveryCode (reused across dates when basket has no date col)
+    staticByDc:$[hasBasketDateCol;
+        ()!();
+        [dcs:distinct basketTable`deliveryCode;
+         hasCP:`cleanPrice in cols basketTable;
+         dcs!{[bt;hasCP;dc]
+            rows:select from bt where deliveryCode=dc;
+            rowToBondWithFlag[hasCP;] each rows
+         }[basketTable;hasCP] each dcs]];
+
+    // Build final basket list for each (date,deliveryCode) key
+    vals:{[ctx;dt;dc]
+        base:$[ctx`hasBasketDateCol;
+            [rows:select from ctx`basketTable where date=dt, deliveryCode=dc;
+             if[0=count rows; :()];
+             hasCP:`cleanPrice in cols rows;
+             rowToBondWithFlag[hasCP;] each rows];
+            $[dc in key ctx`staticByDc; ctx[`staticByDc] dc; ()]];
+        if[(0=count base) or not ctx`hasPrices; :base];
+        {[px;d;b]
+            p:px (d;b`sym);
+            $[null p; b; @[b;`cleanPrice;:;p]]
+        }[ctx`pricesByDateSym;dt] each base
+    }[`basketTable`hasBasketDateCol`staticByDc`hasPrices`pricesByDateSym!(
+        basketTable;hasBasketDateCol;staticByDc;hasPrices;pricesByDateSym);;]'[keysTbl`date;keysTbl`deliveryCode];
+
+    // Build dict with composite key shape matching lookups: dict (date;deliveryCode)
+    exec (date,'deliveryCode)!basket from ([] date:keysTbl`date; deliveryCode:keysTbl`deliveryCode; basket:vals)}
+
 // Helper: process one CTD row for OAS
 // Supports both OIS curves (from buildOISCurves) and swap curves (from .swaps.buildCurve)
 dailyOASFromCTDRow:{[ctx;row]
@@ -1782,11 +1820,13 @@ dailyOASFromCTDRow:{[ctx;row]
     lastDelivery:$[`lastDelivery in key row; row`lastDelivery; deliveryDate];
     delivery:`first`last!(firstDelivery;lastDelivery);
 
-    // Get basket bond dicts - use cache when available
-    useCache:(0 < count ctx`basketCache) and dc in key ctx`basketCache;
-    basket:$[useCache;
-        basketFromCache_[ctx;dc;dt];
-        basketFromTable_[ctx;dc;dt]];
+    // Get basket bond dicts - prefer prebuilt (date,deliveryCode) cache
+    basketKey:(dt;dc);
+    hasPrebuilt:(`basketByDateDelivery in key ctx) and (0 < count ctx`basketByDateDelivery);
+    basket:$[hasPrebuilt;
+        $[basketKey in key ctx`basketByDateDelivery; ctx[`basketByDateDelivery] basketKey; ()];
+        [useCache:(0 < count ctx`basketCache) and dc in key ctx`basketCache;
+         $[useCache; basketFromCache_[ctx;dc;dt]; basketFromTable_[ctx;dc;dt]]]];
 
     if[0=count basket;
         // No basket - return invoice spread only, no option value
@@ -1946,9 +1986,18 @@ dailyOASFromCTD:{[ctdTable;basketTable;bondPx;curves;repoRate;vol;freq]
              rowToBondWithFlag[hasCP;] each rows
          }[basketTable;hasCP] each dcs]];
 
+    // Pre-build final basket lookup by (date,deliveryCode) only when beneficial:
+    // - basket varies by date (avoids repeated per-row table scans), or
+    // - ctdTable has duplicate (date,deliveryCode) rows (avoids repeated basket rebuilds).
+    nBasketKeys:count distinct exec (date,'deliveryCode) from ctdTable;
+    usePrebuiltBasket:hasBasketDateCol or (count ctdTable) > nBasketKeys;
+    basketByDateDelivery:$[usePrebuiltBasket;
+        buildBasketsByDateDelivery_[ctdTable;basketTable;hasBasketDateCol;pricesByDateSym];
+        ()!()];
+
     // Pack context
-    ctx:`curvesByDate`basketTable`pricesByDateSym`freq`hasCtdCleanPrice`hasBasketCleanPrice`hasBasketDateCol`isOIS`basketCache!(
-        curvesByDate;basketTable;pricesByDateSym;frq;hasCtdCleanPrice;hasBasketCleanPrice;hasBasketDateCol;isOIS;basketCache);
+    ctx:`curvesByDate`basketTable`pricesByDateSym`freq`hasCtdCleanPrice`hasBasketCleanPrice`hasBasketDateCol`isOIS`basketCache`basketByDateDelivery!(
+        curvesByDate;basketTable;pricesByDateSym;frq;hasCtdCleanPrice;hasBasketCleanPrice;hasBasketDateCol;isOIS;basketCache;basketByDateDelivery);
     ctx:ctx,repoCtx,volCtx;
 
     // Process each CTD row
@@ -1958,6 +2007,103 @@ dailyOASFromCTD:{[ctdTable;basketTable;bondPx;curves;repoRate;vol;freq]
     // Combine with original table
     resultTable:$[98h=type results; results; flip results];
     ctdTable,'resultTable}
+
+// =============================================================================
+// FEATURE ENGINEERING FROM DAILY OAS TABLE
+// =============================================================================
+
+// Stable vectorized divide: returns 0n where denominator is null/near-zero
+safeDivVec_:{[num;den;eps]
+    {[n;d;e] $[(null d) or (abs d)<=e; 0n; n%d]}'[num;den;count[num]#eps]}
+
+// Rolling z-score (trailing window, by-series helper)
+rollZ_:{[x;w;eps]
+    mu:w mavg x;
+    sd:w mdev x;
+    {[v;m;s;e] $[(null s) or (s<=e); 0n; (v-m)%s]}'[x;mu;sd;count[x]#eps]}
+
+// Run length since last CTD symbol change (0 on first row and on change day)
+runLenSinceChange_:{[chg]
+    n:count chg;
+    if[0=n; :()];
+    out:n#0i;
+    i:1;
+    while[i<n;
+        out[i]:$[chg i; 0i; 1+out i-1];
+        i+:1];
+    out}
+
+// Cross-sectional z-score helper
+crossZ_:{[x;eps]
+    m:avg x;
+    s:dev x;
+    $[(null s) or (s<=eps); count[x]#0n; (x-m)%s]}
+
+// Build engineered features from dailyOASFromCTD output.
+// cfg keys (all optional):
+//   momShort (5), momMed (20), momLong (60), zWin (60), churnWin (20), eps (1e-9)
+featureTableFromDailyOAS:{[dailyOAS;cfg]
+    if[0=count dailyOAS; :dailyOAS];
+    if[not all `date`deliveryCode in cols dailyOAS;
+        '"featureTableFromDailyOAS requires `date and `deliveryCode columns"];
+
+    cfgDef:`momShort`momMed`momLong`zWin`churnWin`eps!(5;20;60;60;20;1e-9);
+    optCfg:$[cfg~(::); cfgDef; cfgDef,cfg];
+    momShort:optCfg`momShort;
+    momMed:optCfg`momMed;
+    momLong:optCfg`momLong;
+    zWin:optCfg`zWin;
+    churnWin:optCfg`churnWin;
+    eps:optCfg`eps;
+
+    t:`deliveryCode`date xasc dailyOAS;
+
+    if[`spreadBps in cols t;
+        t:update spreadChg1d:spreadBps-prev spreadBps by deliveryCode from t;
+        t:update spreadMomShort:spreadBps-(momShort xprev spreadBps) by deliveryCode from t;
+        t:update spreadMomMed:spreadBps-(momMed xprev spreadBps) by deliveryCode from t;
+        t:update spreadMomLong:spreadBps-(momLong xprev spreadBps) by deliveryCode from t;
+        t:update spreadZ:.invoicepricer.rollZ_[spreadBps;zWin;eps] by deliveryCode from t];
+
+    if[`oasBps in cols t;
+        t:update oasChg1d:oasBps-prev oasBps by deliveryCode from t;
+        t:update oasMomShort:oasBps-(momShort xprev oasBps) by deliveryCode from t;
+        t:update oasMomMed:oasBps-(momMed xprev oasBps) by deliveryCode from t;
+        t:update oasMomLong:oasBps-(momLong xprev oasBps) by deliveryCode from t;
+        t:update oasZ:.invoicepricer.rollZ_[oasBps;zWin;eps] by deliveryCode from t;
+        t:update oasCrossZ:.invoicepricer.crossZ_[oasBps;eps] by date from t];
+
+    if[`optionAdjBps in cols t;
+        t:update optionAdjChg1d:optionAdjBps-prev optionAdjBps by deliveryCode from t;
+        t:update optionAdjZ:.invoicepricer.rollZ_[optionAdjBps;zWin;eps] by deliveryCode from t;
+        if[`spreadBps in cols t;
+            t:update optionShare:.invoicepricer.safeDivVec_[optionAdjBps;spreadBps;eps] from t;
+            t:update optionShareAbs:.invoicepricer.safeDivVec_[abs optionAdjBps;abs spreadBps;eps] from t]];
+
+    if[all `qualityOption`timingOption`wildcardOption`optionValue in cols t;
+        t:update qualityShare:.invoicepricer.safeDivVec_[qualityOption;optionValue;eps] from t;
+        t:update timingShare:.invoicepricer.safeDivVec_[timingOption;optionValue;eps] from t;
+        t:update wildcardShare:.invoicepricer.safeDivVec_[wildcardOption;optionValue;eps] from t];
+
+    if[all `swapDV01`futuresDV01 in cols t;
+        t:update hedgeErrDV01:swapDV01-futuresDV01 from t;
+        t:update hedgeErrRatio:.invoicepricer.safeDivVec_[swapDV01-futuresDV01;abs swapDV01;eps] from t];
+
+    if[`basketSize in cols t;
+        t:update expBasketSize:max basketSize by deliveryCode from t;
+        t:update basketCoverage:.invoicepricer.safeDivVec_[basketSize;expBasketSize;eps] from t];
+
+    if[`sym in cols t;
+        t:update prevCtdSym:prev sym by deliveryCode from t;
+        t:update ctdChanged:{[s;ps] $[null ps;0b;s<>ps]}'[sym;prevCtdSym] from t;
+        t:update ctdStabilityDays:.invoicepricer.runLenSinceChange_ ctdChanged by deliveryCode from t;
+        t:update ctdChurn:churnWin msum ctdChanged by deliveryCode from t;
+        t:delete prevCtdSym from t];
+
+    if[all `spreadBps`oasBps in cols t;
+        t:update carryVsOas:.invoicepricer.safeDivVec_[spreadBps;oasBps;eps] from t];
+
+    t}
 
 // =============================================================================
 // DAILY INVOICE SPREAD FROM BASKETS (full CTD recomputation)
@@ -3152,6 +3298,9 @@ usage:{[]
     -1 "    // ctdTable: date, deliveryCode, deliveryDate, futuresPrice, sym, coupon, maturity, cf";
     -1 "    // basketTable: date, deliveryCode, sym, coupon, maturity, cf, cleanPrice (all bonds)";
     -1 "    // Returns: ctdTable + spreadBps, optionValue, oasBps, swapDV01, futuresDV01, basketSize";
+    -1 ".invoicepricer.featureTableFromDailyOAS[dailyOASTable;cfg]";
+    -1 "    // Feature engineering from daily OAS output";
+    -1 "    // cfg keys: momShort,momMed,momLong,zWin,churnWin,eps";
     -1 "";
     -1 "// From baskets (recomputes CTD internally - slower)";
     -1 ".invoicepricer.dailyInvoiceSpread[baskets;prices;futures;curves;repoRate;freq;useLastDelivery]";
