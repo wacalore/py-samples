@@ -762,7 +762,12 @@ help:{[]
     -1 "  signalTurnover[sigTable]              - mean |delta sig| / mean |sig|";
     -1 "";
     -1 "ALPHA EVALUATION SUITE:";
-    -1 "  alphaEval[t;cfg]                      - unified perf report (Sharpe,Sortino,etc)";
+    -1 "  alphaEval[t;cfg]                      - unified perf report";
+    -1 "    Returns: sharpe, winsorizedSharpe, sortino, calmar, annReturn, annVol,";
+    -1 "      maxDD, skew, kurtosis, winRate, profitFactor, avgWin, avgLoss,";
+    -1 "      winLossRatio, cvar95, medianMonthlySharpe, medianMonthlyHitRate,";
+    -1 "      monthlyTable, turnover, ic, icIR, icHitRate, retTstat, retPval,";
+    -1 "      icTstat, icPval, minTRL, retAutoCorr, icDecay";
     -1 "  monthlyBreakdown[dts;rets]            - per-month Sharpe, hit rate, return, vol";
     -1 "  cfg keys: dtCol symCol sigCol pnlCol  - column name overrides";
     -1 "            rf periods winsorizePct      - (0; 252; 0.01)";
@@ -840,6 +845,56 @@ alphaKurt:{[x]
     s4:sum z xexp 4;
     adj:((n * (n + 1)) % ((n - 1) * (n - 2) * (n - 3))) * s4;
     adj - (3f * ((n - 1) * (n - 1)) % ((n - 2) * (n - 3)))}
+
+// Cross-sectional IC from position-level table: rank-correlate sig vs pnl per day
+// Returns ([] dt; ic) — one IC per day with >= 2 non-null positions
+alphaIC:{[t;cDt;cSym;cSig;cPnl]
+    dates:asc distinct t cDt;
+    {[t;cDt;cSig;cPnl;d]
+        sub:?[t;enlist(=;cDt;d);0b;(cSig,cPnl)!(cSig,cPnl)];
+        s:0f^sub cSig; p:0f^sub cPnl;
+        valid:where (not null s) & not null p;
+        $[2 > count valid; 0n; cor[iasc iasc s valid; iasc iasc p valid]]
+        }[t;cDt;cSig;cPnl] each dates}
+
+// IC at lagged horizons: correlate sig at t with pnl at t+lag, per sym, cross-sectionally
+alphaICDecay:{[t;cDt;cSym;cSig;cPnl;lags]
+    syms:asc distinct t cSym;
+    // Build lagged pnl per sym
+    lagged:raze {[t;cDt;cSym;cPnl;lag;s]
+        sub:cDt xasc ?[t;enlist(=;cSym;enlist s);0b;(cDt,cPnl)!(cDt,cPnl)];
+        p:sub cPnl;
+        fp:$[lag > 0; (lag _ p),(lag#0n); p];
+        (enlist(enlist cDt)!enlist sub cDt),(enlist(enlist cSym)!enlist(count sub cDt)#s),(enlist(enlist`fwdPnl)!enlist fp)
+        }[t;cDt;cSym;cPnl] each/: lags cross syms;
+    // Actually, simpler approach: for each lag, shift pnl forward by lag within each sym, then compute daily IC
+    {[t;cDt;cSym;cSig;cPnl;lag]
+        syms:asc distinct t cSym;
+        shifted:raze {[t;cDt;cSym;cSig;cPnl;lag;s]
+            sub:cDt xasc ?[t;enlist(=;cSym;enlist s);0b;(cDt,cSig,cPnl)!(cDt,cSig,cPnl)];
+            p:sub cPnl;
+            fp:((lag # 0n), neg[lag] _ p);
+            df:(enlist cDt)!enlist sub cDt;
+            df[cSym]:(count sub cDt)#s;
+            df[cSig]:sub cSig;
+            df[`fwdPnl]:fp;
+            flip df
+            }[t;cDt;cSym;cSig;cPnl;lag] each syms;
+        dates:asc distinct shifted cDt;
+        ics:{[shifted;cDt;cSig;d]
+            sub:?[shifted;enlist(=;cDt;d);0b;(cSig,`fwdPnl)!(cSig,`fwdPnl)];
+            s:0f^sub cSig; p:0f^sub`fwdPnl;
+            valid:where (not null s) & not null p;
+            $[2 > count valid; 0n; cor[iasc iasc s valid; iasc iasc p valid]]
+            }[shifted;cDt;cSig] each dates;
+        v:ics where not null ics;
+        mic:$[0 < count v; avg v; 0n];
+        ir:$[1 < count v; (avg v) % dev v; 0n];
+        `lag`meanIC`icIR!(lag;mic;ir)
+        }[t;cDt;cSym;cSig;cPnl] each lags}
+
+// Lag-1 autocorrelation
+autoCorr1:{[x] v:x where not null x; $[2 > count v; 0n; cor[neg[1] _ v; 1 _ v]]}
 
 // Monthly breakdown: Sharpe, hit rate, return, vol, nDays per month
 monthlyBreakdown:{[dts;rets]
@@ -951,19 +1006,59 @@ alphaEval:{[t;cfg]
         }[t;cDt;cSym;cSig] each syms;
     turnover:avg tos where not null tos;
 
+    // IC metrics (cross-sectional: rank-correlate sig vs pnl per day)
+    nSym:count syms;
+    dailyICs:$[nSym >= 2; alphaIC[t;cDt;cSym;cSig;cPnl]; n # 0n];
+    icValid:dailyICs where not null dailyICs;
+    nICDays:count icValid;
+    icMean:$[nICDays > 0; avg icValid; 0n];
+    icStd:$[nICDays > 1; dev icValid; 0n];
+    icIR:$[(nICDays > 1) and icStd > 0; icMean % icStd; 0n];
+    icHitRate:$[nICDays > 0; (sum icValid > 0) % nICDays; 0n];
+
+    // Signal vs noise: t-stats and p-values
+    // t-stat on returns
+    retTstat:$[nnz > 1; (avg nz) % (dev nz) % sqrt nnz; 0n];
+    // t-stat on IC
+    icTstat:$[(nICDays > 1) and icStd > 0; icMean % icStd % sqrt nICDays; 0n];
+    // p-values (two-sided, normal approx for large n)
+    retPval:$[not null retTstat; 2 * 1 - .kdbtools.normCDF abs retTstat; 0n];
+    icPval:$[not null icTstat; 2 * 1 - .kdbtools.normCDF abs icTstat; 0n];
+
+    // Minimum Track Record Length (MinTRL)
+    // Days needed for observed Sharpe to be significant at 95% (z=1.96)
+    sr:$[annVol > 0; (avg[nz] % dev nz); 0n];
+    minTRL:$[(not null sr) and sr <> 0;
+        `long$(1 + ((krt % 4) * sr * sr) - ((skw % 2) * sr)) * (1.96 * 1.96) % (sr * sr);
+        0N];
+
+    // Return autocorrelation (lag-1)
+    retAutoCorr:autoCorr1 nz;
+
+    // IC decay profile
+    icDecay:$[nSym >= 2; alphaICDecay[t;cDt;cSym;cSig;cPnl;1 2 3 5 10]; ()];
+
     // Build result dict
     (`sharpe`winsorizedSharpe`sortino`calmar`annReturn`annVol`maxDD,
      `skew`kurtosis,
      `winRate`profitFactor`avgWin`avgLoss`winLossRatio,
      `cvar95,
      `medianMonthlySharpe`medianMonthlyHitRate`monthlyTable,
-     `turnover`nDays`nNonZeroDays`nPositions)!
+     `turnover,
+     `ic`icIR`icHitRate,
+     `retTstat`retPval`icTstat`icPval`minTRL`retAutoCorr,
+     `icDecay,
+     `nDays`nNonZeroDays`nPositions)!
     (sharpe;winsorizedSharpe;sortino;calmar;annRet;annVol;maxDD;
      skw;krt;
      winRate;profitFactor;avgWin;avgLoss;winLossRatio;
      cvar95;
      medSh;medHr;mt;
-     turnover;n;nnz;count syms)}
+     turnover;
+     icMean;icIR;icHitRate;
+     retTstat;retPval;icTstat;icPval;minTRL;retAutoCorr;
+     icDecay;
+     n;nnz;count syms)}
 
 example:{[]
     -1 "";
