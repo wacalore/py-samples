@@ -851,9 +851,8 @@ monthlyBreakdown:{[dts;rets]
         nz:r where r <> 0;
         nd:count r;
         nnz:count nz;
-        ep:(nnz % nd) * 252;
         s:dev nz;
-        sh:$[(nnz > 1) and s > 0; (avg[nz] % s) * sqrt ep; 0n];
+        sh:$[(nnz > 1) and s > 0; (avg[nz] % s) * sqrt 252; 0n];
         hr:$[nnz > 0; (sum nz > 0) % nnz; 0n];
         `month`sharpe`hitRate`ret`vol`nDays!(m;sh;hr;sum r;s;nd)
         }[dts;rets;months] each uMonths}
@@ -883,30 +882,27 @@ alphaEval:{[t;cfg]
     r:0f^daily`ret;
     n:count r;
 
-    // Non-zero returns
+    // Non-zero returns — zero days are excluded entirely
     nz:r where r <> 0;
     nnz:count nz;
 
-    // Effective annualization: scale by fraction of active days
-    ep:(nnz % n) * periods;
+    // Annualized return and vol (non-zero days only)
+    annRet:periods * avg nz;
+    annVol:(sqrt periods) * dev nz;
 
-    // Annualized return and vol (non-zero days)
-    annRet:ep * avg nz;
-    annVol:(sqrt ep) * dev nz;
-
-    // Sharpe (non-zero days, correctly annualized)
-    sharpe:$[annVol > 0; (annRet - (ep * rf)) % annVol; 0n];
+    // Sharpe
+    sharpe:$[annVol > 0; (annRet - (periods * rf)) % annVol; 0n];
 
     // Winsorized Sharpe: clip at wpct/1-wpct percentiles, then Sharpe
     lo:(asc nz) @ `long$wpct * nnz;
     hi:(asc nz) @ `long$(1 - wpct) * nnz;
     wRets:lo | nz & hi;
-    wAnnRet:ep * avg wRets;
-    wAnnVol:(sqrt ep) * dev wRets;
-    winsorizedSharpe:$[wAnnVol > 0; (wAnnRet - (ep * rf)) % wAnnVol; 0n];
+    wAnnRet:periods * avg wRets;
+    wAnnVol:(sqrt periods) * dev wRets;
+    winsorizedSharpe:$[wAnnVol > 0; (wAnnRet - (periods * rf)) % wAnnVol; 0n];
 
     // Sortino (non-zero days)
-    sortino:.kdbtools.sortino[ep;rf;nz];
+    sortino:.kdbtools.sortino[periods;rf;nz];
 
     // Max drawdown on cumulative returns (all days, preserves timeline)
     cumRets:sums r;
