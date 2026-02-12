@@ -447,6 +447,14 @@ slopeT:{[n;x]
     k:(n-1) & count r;               // guard short groups (count x < n)
     @[r;til k;:;0n]}
 
+// One-shot slope t-stat over the full vector (non-rolling)
+// Useful for grouped table analytics where you want one value per group:
+//   select tstat:.kdbtools.slopeT1[r] by d,sym from t
+// Returns 0n for groups with fewer than 3 observations.
+slopeT1:{[x]
+    n:count x;
+    $[n<3;0n;last slopeT[n;`float$x]]}
+
 // Trend strength (abs slope of regression)
 trendstr:{[n;x] abs slope[n;x]}
 
@@ -4725,6 +4733,8 @@ pboTable:{[t;pnlCols;nPart]
     results[`roc]:100=count .kdbtools.roc[10;x];
     results[`slope]:100=count .kdbtools.slope[10;x];
     results[`slopeT]:100=count .kdbtools.slopeT[10;x];
+    results[`slopeT1]:(type .kdbtools.slopeT1 x) in -9 -8h;
+    results[`slopeT1Short]:null .kdbtools.slopeT1 2?1f;
     linSlope:.kdbtools.slope[20;`float$til 100];
     results[`slopeLinear]:1e-12 > max abs (1f - (linSlope where not null linSlope));
     shortSlopeT:.kdbtools.slopeT[10;5?1f];
