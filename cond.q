@@ -372,7 +372,12 @@ varianceRatio:{[x;q;w]
 // @param q - multi-period horizon
 // @param w - lookback window
 varianceRatioTable:{[t;bycol;col;q;w]
-    ![t;();(enlist bycol)!enlist bycol;`vr`vrTrending!((`.cond.varianceRatio;col;q;w);(>;(`.cond.varianceRatio;col;q;w);1f))]}
+    f:{[c;q;w;g] vr:varianceRatio[g c;q;w]; g,'flip `vr`vrTrending!(vr;vr > 1f)}[col;q;w];
+    t:update vrIdx__:i from t;
+    grp:group t bycol;
+    r:raze f each {[t;idx] t idx}[t] each value grp;
+    r:`vrIdx__ xasc r;
+    ![r;();0b;enlist `vrIdx__]}
 
 // Gated momentum signal: directional signal active only in trending regimes
 // @param x - return series
@@ -395,11 +400,12 @@ gatedMomentum:{[x;momWindow;q;vrWindow;vrThresh]
 // @param vrWindow - variance ratio lookback
 // @param vrThresh - VR threshold
 gatedMomentumTable:{[t;bycol;col;momWindow;q;vrWindow;vrThresh]
-    ![t;();(enlist bycol)!enlist bycol;
-        `vr`direction`gatedSig!(
-            (`.cond.varianceRatio;col;q;vrWindow);
-            (`signum;(`mavg;momWindow;col));
-            (`.cond.gatedMomentum;col;momWindow;q;vrWindow;vrThresh))]}
+    f:{[c;mw;q;vrw;vrt;g] r:gatedMomentum[g c;mw;q;vrw;vrt]; vr:varianceRatio[g c;q;vrw]; dir:signum mavg[mw; g c]; g,'flip `vr`direction`gatedSig!(vr;dir;r)}[col;momWindow;q;vrWindow;vrThresh];
+    t:update gmIdx__:i from t;
+    grp:group t bycol;
+    r:raze f each {[t;idx] t idx}[t] each value grp;
+    r:`gmIdx__ xasc r;
+    ![r;();0b;enlist `gmIdx__]}
 
 // -----------------------------------------------------------------------------
 // CROSS-SECTIONAL (operate across assets at each time point)
