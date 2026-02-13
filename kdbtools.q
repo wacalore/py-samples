@@ -3373,7 +3373,9 @@ cpTable:{[t;bycol;col;method;params]
 // @param pxcol - price column used for return calculation
 // @param params - optional dict:
 //   `volWindow (120), `zThresh (4f), `cooldown (20),
-//   `horizons (5 15 30 60), `useCusumAlarm (1b), `alarmCol (`cusumAlarm)
+//   `horizons (5 15 30 60), `useCusumAlarm (1b), `alarmCol (`cusumAlarm),
+//   `retCol (auto from px if absent), `sigmaFloor (1e-6),
+//   `eventPick (`first|`maxAbsZ), `requireFullHorizon (0b)
 // @return dict `events`summary
 //   events: one row per impulse with resp_h/mfe_h/mae_h columns
 //   summary: per-horizon aggregate response metrics
@@ -3383,13 +3385,17 @@ impulseEventStudy:{[t;bycol;timecol;pxcol;params]
             t;
             ([] horizon:`int$(); nEvents:`int$(); meanResp:`float$(); medianResp:`float$(); winRate:`float$(); meanMFE:`float$(); meanMAE:`float$()))];
 
-    cfgDef:`volWindow`zThresh`cooldown`horizons`useCusumAlarm`alarmCol!(
+    cfgDef:`volWindow`zThresh`cooldown`horizons`useCusumAlarm`alarmCol`retCol`sigmaFloor`eventPick`requireFullHorizon!(
         120;
         4f;
         20;
         5 15 30 60;
         1b;
-        `cusumAlarm);
+        `cusumAlarm;
+        `;
+        1e-6f;
+        `first;
+        0b);
     cfg:$[params~(::); cfgDef; cfgDef,params];
 
     hz:`int$cfg`horizons;
@@ -3413,9 +3419,12 @@ impulseEventStudy:{[t;bycol;timecol;pxcol;params]
         px:`float$g pxcol;
         tm:g timecol;
 
-        r:0f^log px % prev px;
+        rcol:cfg`retCol;
+        hasRcol:(-11h=type rcol) and (rcol in cols g);
+        r:$[hasRcol; `float$g rcol; 0f^log px % prev px];
         sig:prev mdev[cfg`volWindow;r];
-        z:{[ri;si] $[(null ri) or (null si) or (si<=1e-12); 0n; ri%si]}'[r;sig];
+        sf:`float$cfg`sigmaFloor;
+        z:{[ri;si;sfv] $[(null ri) or (null si) or (si<=sfv); 0n; ri%si]}'[r;sig;count[r]#sf];
 
         raw:(abs z) >= cfg`zThresh;
         if[cfg`useCusumAlarm;
@@ -3425,14 +3434,24 @@ impulseEventStudy:{[t;bycol;timecol;pxcol;params]
 
         evIdx:where raw;
         keep:`long$();
-        lastKeep:neg 1000000000i;
-        j:0;
-        while[j<count evIdx;
-            k:evIdx j;
-            if[(k-lastKeep)>cfg`cooldown;
-                keep,:k;
-                lastKeep:k];
-            j+:1];
+        pick:cfg`eventPick;
+        $[pick=`maxAbsZ;
+            [st:0;
+             while[st<count evIdx;
+                en:st;
+                while[((en+1)<count evIdx) and (((evIdx[en+1])-(evIdx en))<=cfg`cooldown); en+:1];
+                seg:evIdx[st+til 1+en-st];
+                az:abs z seg;
+                keep,:enlist seg[az?max az];
+                st:en+1]];
+            [lastKeep:neg 1000000000i;
+             j:0;
+             while[j<count evIdx;
+                k:evIdx j;
+                if[(k-lastKeep)>cfg`cooldown;
+                    keep,:k;
+                    lastKeep:k];
+                j+:1]]];
 
         m:count keep;
         base:g keep;
@@ -3464,7 +3483,7 @@ impulseEventStudy:{[t;bycol;timecol;pxcol;params]
                 i:keep k;
                 d:dir k;
                 e:(n-1) & i + h;
-                if[e>i;
+                if[(e>i) and ((not cfg`requireFullHorizon) or ((i+h)<n));
                     path:sums d * r0[(i+1)+til (e-i)];
                     resp[k]:last path;
                     mfe[k]:max path;
