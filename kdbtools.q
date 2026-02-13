@@ -3460,7 +3460,8 @@ impulseEventStudy:{[t;bycol;timecol;pxcol;params]
         impRet:m#0n;
         impZ:m#0n;
         if[m>0;
-            dir:(r keep>0f) - (r keep<0f);
+            rk:r keep;
+            dir:(`float$(rk>0f)) - (`float$(rk<0f));
             impRet:r keep;
             impZ:z keep];
 
@@ -3538,7 +3539,7 @@ condOpt_:{[d;k;def]
 condCol_:{[g;c;def] if[c in cols g; :g c]; (count g)#def}
 
 // Numeric sign helper (no built-in sign primitive in this q setup).
-condSign_:{[x] (x>0f) - (x<0f)}
+condSign_:{[x] (`float$(x>0f)) - (`float$(x<0f))}
 
 // Base alpha module evaluator.
 // baseSpec methods:
