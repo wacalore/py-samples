@@ -3285,7 +3285,7 @@ cpTableCusum:{[t;bycol;col;params]
         g,'flip `cusumSPlus`cusumSMinus`cusumStat`cusumAlarm!(r`sPlus;r`sMinus;r`stat;r`alarm)
     }[col;w;k;h];
     t:update cpIdx__:i from t;
-    grp:group t bycol;
+    grp:$[-11h=type bycol; group t bycol; group flip t bycol];
     result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
@@ -3309,7 +3309,7 @@ cpTablePelt:{[t;bycol;col;params]
         g,'flip `isChangepoint`segMean`segVar!(isCP;segMu;segVar)
     }[col;pen;ms];
     t:update cpIdx__:i from t;
-    grp:group t bycol;
+    grp:$[-11h=type bycol; group t bycol; group flip t bycol];
     result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
@@ -3332,7 +3332,7 @@ cpTableBinseg:{[t;bycol;col;params]
         g,'flip `isChangepoint`segMean`segVar!(isCP;segMu;segVar)
     }[col;pen;ms;mc];
     t:update cpIdx__:i from t;
-    grp:group t bycol;
+    grp:$[-11h=type bycol; group t bycol; group flip t bycol];
     result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
@@ -3344,7 +3344,7 @@ bocpdTable:{[t;bycol;col;hazard]
         g,'flip `cpProb`cpScore`runLength`cpDetect`postMean`postVar!(r`cpProb;r`cpScore;r`runLength;r`cpDetect;r`postMean;r`postVar)
     }[col;hazard];
     t:update cpIdx__:i from t;
-    grp:group t bycol;
+    grp:$[-11h=type bycol; group t bycol; group flip t bycol];
     result:raze helper each {[t;idx] t idx}[t] each value grp;
     result:`cpIdx__ xasc result;
     ![result;();0b;enlist `cpIdx__]}
