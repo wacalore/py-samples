@@ -349,6 +349,59 @@ hitRateGate:{[f;fwdRet;window;minHitRate] hits:rmean[window;(signum ffill f)=sig
 maxLossGate:{[f;fwdRet;window;maxLoss] losses:rmean[window;0f & fwdRet * signum ffill f]; ffill[f] * losses > neg maxLoss}
 
 // -----------------------------------------------------------------------------
+// VARIANCE RATIO & REGIME DETECTION
+// -----------------------------------------------------------------------------
+
+// Variance ratio: detects trending vs mean-reverting regimes
+// Compares variance of q-period returns to q * variance of 1-period returns
+// VR > 1 = trending (positive autocorrelation), VR < 1 = mean-reverting
+// @param x - return series (daily changes)
+// @param q - multi-period horizon (e.g. 5 for weekly)
+// @param w - lookback window for rolling estimates
+varianceRatio:{[x;q;w]
+    x:ffill x;
+    qRet:q msum x;
+    varQ:mdev[w; qRet] xexp 2;
+    var1:mdev[w; x] xexp 2;
+    varQ % 1e-10 | q * var1}
+
+// Variance ratio table interface (grouped by sym)
+// @param t - table sorted by (bycol, time)
+// @param bycol - group column (e.g. `sym)
+// @param col - return column
+// @param q - multi-period horizon
+// @param w - lookback window
+varianceRatioTable:{[t;bycol;col;q;w]
+    ![t;();(enlist bycol)!enlist bycol;`vr`vrTrending!((`.cond.varianceRatio;col;q;w);(>;(`.cond.varianceRatio;col;q;w);1f))]}
+
+// Gated momentum signal: directional signal active only in trending regimes
+// @param x - return series
+// @param momWindow - momentum lookback (e.g. 20)
+// @param q - variance ratio horizon (e.g. 5)
+// @param vrWindow - variance ratio lookback (e.g. 60)
+// @param vrThresh - VR threshold for trending (e.g. 1.0)
+gatedMomentum:{[x;momWindow;q;vrWindow;vrThresh]
+    x:ffill x;
+    direction:signum mavg[momWindow; x];
+    vr:varianceRatio[x;q;vrWindow];
+    direction * vr > vrThresh}
+
+// Gated momentum table interface (grouped by sym)
+// @param t - table sorted by (bycol, time)
+// @param bycol - group column
+// @param col - return column
+// @param momWindow - momentum lookback
+// @param q - variance ratio horizon
+// @param vrWindow - variance ratio lookback
+// @param vrThresh - VR threshold
+gatedMomentumTable:{[t;bycol;col;momWindow;q;vrWindow;vrThresh]
+    ![t;();(enlist bycol)!enlist bycol;
+        `vr`direction`gatedSig!(
+            (`.cond.varianceRatio;col;q;vrWindow);
+            (`signum;(`mavg;momWindow;col));
+            (`.cond.gatedMomentum;col;momWindow;q;vrWindow;vrThresh))]}
+
+// -----------------------------------------------------------------------------
 // CROSS-SECTIONAL (operate across assets at each time point)
 // -----------------------------------------------------------------------------
 
