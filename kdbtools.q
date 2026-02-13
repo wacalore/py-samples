@@ -3363,6 +3363,346 @@ cpTable:{[t;bycol;col;method;params]
       method = `bocpd;  bocpdTable[t;bycol;col;params`hazard];
       '"Unknown changepoint method: ",string method]}
 
+
+
+// Detect impulse events and measure forward response by horizon.
+// Typical use: run cpTable first, then study impulses on the same table.
+// @param t - input table (must contain bycol, timecol, pxcol)
+// @param bycol - grouping column (symbol) or list of grouping columns
+// @param timecol - ordering column within group (e.g., `bar or `time)
+// @param pxcol - price column used for return calculation
+// @param params - optional dict:
+//   `volWindow (120), `zThresh (4f), `cooldown (20),
+//   `horizons (5 15 30 60), `useCusumAlarm (1b), `alarmCol (`cusumAlarm)
+// @return dict `events`summary
+//   events: one row per impulse with resp_h/mfe_h/mae_h columns
+//   summary: per-horizon aggregate response metrics
+impulseEventStudy:{[t;bycol;timecol;pxcol;params]
+    if[0=count t;
+        :`events`summary!(
+            t;
+            ([] horizon:`int$(); nEvents:`int$(); meanResp:`float$(); medianResp:`float$(); winRate:`float$(); meanMFE:`float$(); meanMAE:`float$()))];
+
+    cfgDef:`volWindow`zThresh`cooldown`horizons`useCusumAlarm`alarmCol!(
+        120;
+        4f;
+        20;
+        5 15 30 60;
+        1b;
+        `cusumAlarm);
+    cfg:$[params~(::); cfgDef; cfgDef,params];
+
+    hz:`int$cfg`horizons;
+    if[0h>type hz; hz:enlist hz];
+
+    isByAtom:-11h=type bycol;
+    bcols:$[isByAtom; enlist bycol; bycol];
+    t0:(bcols,enlist timecol) xasc t;
+    t0:update impulseStudyIdx__:i from t0;
+    grp:$[isByAtom; group t0 bycol; group flip t0 bycol];
+
+    ctx:`timecol`pxcol`hz`cfg!(timecol;pxcol;hz;cfg);
+
+    helper:{[ctx;g]
+        n:count g;
+        cfg:ctx`cfg;
+        hz:ctx`hz;
+        pxcol:ctx`pxcol;
+        timecol:ctx`timecol;
+
+        px:`float$g pxcol;
+        tm:g timecol;
+
+        r:0f^log px % prev px;
+        sig:prev mdev[cfg`volWindow;r];
+        z:{[ri;si] $[(null ri) or (null si) or (si<=1e-12); 0n; ri%si]}'[r;sig];
+
+        raw:(abs z) >= cfg`zThresh;
+        if[cfg`useCusumAlarm;
+            alarmVals:.[{[tbl;c] tbl c};(g;cfg`alarmCol);{count[g]#0b}];
+            alarmVals:`boolean$alarmVals;
+            raw:raw & alarmVals];
+
+        evIdx:where raw;
+        keep:`long$();
+        lastKeep:neg 1000000000i;
+        j:0;
+        while[j<count evIdx;
+            k:evIdx j;
+            if[(k-lastKeep)>cfg`cooldown;
+                keep,:k;
+                lastKeep:k];
+            j+:1];
+
+        m:count keep;
+        base:g keep;
+
+        dir:m#0n;
+        impRet:m#0n;
+        impZ:m#0n;
+        if[m>0;
+            dir:(r keep>0f) - (r keep<0f);
+            impRet:r keep;
+            impZ:z keep];
+
+        out:base,'flip `impulseBarIdx`impulseTime`impulseDir`impulseRet`impulseZ!(
+            keep;
+            tm keep;
+            dir;
+            impRet;
+            impZ);
+
+        r0:0f^r;
+        j:0;
+        while[j<count hz;
+            h:`int$hz j;
+            resp:m#0n;
+            mfe:m#0n;
+            mae:m#0n;
+            k:0;
+            while[k<m;
+                i:keep k;
+                d:dir k;
+                e:(n-1) & i + h;
+                if[e>i;
+                    path:sums d * r0[(i+1)+til (e-i)];
+                    resp[k]:last path;
+                    mfe[k]:max path;
+                    mae[k]:min path];
+                k+:1];
+            out:out,'flip (`$"resp_",string h; `$"mfe_",string h; `$"mae_",string h)!(resp;mfe;mae);
+            j+:1];
+        out
+    }[ctx];
+
+    parts:helper each {[tab;idx] tab idx}[t0] each value grp;
+    events:raze parts;
+    events:`impulseStudyIdx__ xasc events;
+    events:![events;();0b;enlist `impulseStudyIdx__];
+
+    respCols:`$"resp_",/:string hz;
+    mfeCols:`$"mfe_",/:string hz;
+    maeCols:`$"mae_",/:string hz;
+
+    nVec:{[ev;c] count (ev c) where not null ev c}[events] each respCols;
+    meanRespVec:{[ev;c] avg (ev c) where not null ev c}[events] each respCols;
+    medRespVec:{[ev;c] med (ev c) where not null ev c}[events] each respCols;
+    winVec:{[ev;c] x:(ev c) where not null ev c; $[0=count x; 0n; avg x>0]}[events] each respCols;
+    meanMfeVec:{[ev;c] avg (ev c) where not null ev c}[events] each mfeCols;
+    meanMaeVec:{[ev;c] avg (ev c) where not null ev c}[events] each maeCols;
+
+    summary:([] horizon:hz;
+        nEvents:`int$nVec;
+        meanResp:`float$meanRespVec;
+        medianResp:`float$medRespVec;
+        winRate:`float$winVec;
+        meanMFE:`float$meanMfeVec;
+        meanMAE:`float$meanMaeVec);
+
+    `events`summary!(events;summary)
+    }
+
+
+
+// =============================================================================
+// CONDITIONAL ALPHA UTILITIES
+// =============================================================================
+
+// Safe dict get with default fallback.
+condOpt_:{[d;k;def]
+    ks:key d;
+    if[-11h=type ks; :$[ks~k; value d; def]];
+    if[k in ks; :(value d) ks?k];
+    def}
+
+// Safe table column get with scalar default replicated to table length.
+condCol_:{[g;c;def] if[c in cols g; :g c]; (count g)#def}
+
+// Numeric sign helper (no built-in sign primitive in this q setup).
+condSign_:{[x] (x>0f) - (x<0f)}
+
+// Base alpha module evaluator.
+// baseSpec methods:
+//   `momentum: log(px / lag px), params `lookback (20)
+//   `trend: sma(fast,log px) - sma(slow,log px), params `fast (20), `slow (60)
+//   `meanrev: -zscore(log px), params `lookback (60)
+//   `return: same as momentum, params `lookback (1)
+//   `column: use existing column, params `col (`alpha)
+condBase_:{[g;pxcol;baseSpec]
+    px:`float$g pxcol;
+    method:condOpt_[baseSpec;`method;`momentum];
+    $[method=`momentum;
+        [lb:`int$condOpt_[baseSpec;`lookback;20];
+         log px % lb xprev px];
+      method=`trend;
+        [fast:`int$condOpt_[baseSpec;`fast;20];
+         slow:`int$condOpt_[baseSpec;`slow;60];
+         sma[fast;log px] - sma[slow;log px]];
+      method=`meanrev;
+        [lb:`int$condOpt_[baseSpec;`lookback;60];
+         neg zscorer[lb;log px]];
+      method=`return;
+        [lb:`int$condOpt_[baseSpec;`lookback;1];
+         log px % lb xprev px];
+      method=`column;
+        [col:condOpt_[baseSpec;`col;`alpha];
+         `float$condCol_[g;col;0n]];
+      '"Unknown conditional base method: ",string method]}
+
+// Single condition rule evaluator. Returns numeric weight vector.
+// rule methods:
+//   `always
+//   `coherence (fast/slow momentum sign agreement)
+//   `volBand (realized vol in [min,max])
+//   `colGT / `colLT / `colBand (thresholding on a column or `base)
+//   `zBand (rolling zscore band on a column or `base)
+//   `sigmoid (smooth weight from column or `base)
+//   `linearClip (0..1 mapped from [lo,hi])
+//   `eventBlock (1 when event column is false, else 0)
+condRuleWeight_:{[g;pxcol;base;rule]
+    n:count g;
+    px:`float$g pxcol;
+    ret:0f^log px % prev px;
+    method:condOpt_[rule;`method;`always];
+
+    $[method=`always;
+        n#1f;
+      method=`coherence;
+        [fast:`int$condOpt_[rule;`fast;20];
+         slow:`int$condOpt_[rule;`slow;60];
+         m1:log px % fast xprev px;
+         m2:log px % slow xprev px;
+         `float$((not null m1) & (not null m2) & (condSign_[m1] = condSign_[m2]))];
+      method=`volBand;
+        [w:`int$condOpt_[rule;`window;60];
+         ann:`float$condOpt_[rule;`annFactor;252f];
+         mn:`float$condOpt_[rule;`min;0f];
+         mx:`float$condOpt_[rule;`max;0w];
+         rv:sqrt ann * mdev[w;ret];
+         `float$((rv>=mn) & (rv<=mx))];
+      method=`colGT;
+        [col:condOpt_[rule;`col;`base];
+         thr:`float$condOpt_[rule;`thresh;0f];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         `float$(x>thr)];
+      method=`colLT;
+        [col:condOpt_[rule;`col;`base];
+         thr:`float$condOpt_[rule;`thresh;0f];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         `float$(x<thr)];
+      method=`colBand;
+        [col:condOpt_[rule;`col;`base];
+         mn:`float$condOpt_[rule;`min;neg 0w];
+         mx:`float$condOpt_[rule;`max;0w];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         `float$((x>=mn) & (x<=mx))];
+      method=`zBand;
+        [col:condOpt_[rule;`col;`base];
+         w:`int$condOpt_[rule;`window;60];
+         mn:`float$condOpt_[rule;`min;neg 1f];
+         mx:`float$condOpt_[rule;`max;1f];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         z:zscorer[w;x];
+         `float$((z>=mn) & (z<=mx))];
+      method=`sigmoid;
+        [col:condOpt_[rule;`col;`base];
+         ctr:`float$condOpt_[rule;`center;0f];
+         scl:`float$condOpt_[rule;`scale;1f];
+         den:$[abs scl < 1e-12; 1e-12; scl];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         u:(x - ctr) % den;
+         1f % (1f + exp neg u)];
+      method=`linearClip;
+        [col:condOpt_[rule;`col;`base];
+         lo:`float$condOpt_[rule;`lo;neg 1f];
+         hi:`float$condOpt_[rule;`hi;1f];
+         den:$[abs hi-lo < 1e-12; 1e-12; hi-lo];
+         x:$[col=`base; base; `float$condCol_[g;col;0n]];
+         0f | ((x-lo)%den) & 1f];
+      method=`eventBlock;
+        [col:condOpt_[rule;`col;`event];
+         ev:`boolean$condCol_[g;col;0b];
+         1f - `float$ev];
+      '"Unknown conditional rule method: ",string method]}
+
+// Aggregate condition rules into a raw weight and final gated weight.
+// condSpec keys:
+//   `rules (enlist rule dict) or single rule dict
+//   `combine (`product|`min|`avg), default `product
+//   `gate (`hard|`soft), default `hard
+//   `hardThresh (0.5)
+condWeights_:{[g;pxcol;base;condSpec]
+    rules:condOpt_[condSpec;`rules;enlist `method`_!(`always;0N)];
+    if[-11h=type rules; rules:enlist rules];
+    if[99h=type rules; rules:enlist rules];
+
+    n:count g;
+    raw:n#1f;
+    combine:condOpt_[condSpec;`combine;`product];
+
+    i:0;
+    while[i<count rules;
+        rw:`float$condRuleWeight_[g;pxcol;base;rules i];
+        $[combine=`min;
+            raw:raw & rw;
+          combine=`avg;
+            raw:0.5 * (raw + rw);
+          raw:raw * rw];
+        i+:1];
+
+    mode:condOpt_[condSpec;`gate;`hard];
+    thresh:`float$condOpt_[condSpec;`hardThresh;0.5f];
+
+    $[mode=`hard;
+        [gate:(not null raw) & raw>=thresh;
+         `weightRaw`weight`gate!(raw;`float$gate;gate)];
+        [w:0f^raw;
+         gate:w>=thresh;
+         `weightRaw`weight`gate!(raw;w;gate)] ]}
+
+// Build conditional alpha table with pluggable base and condition modules.
+// @param t - input table
+// @param bycol - grouping key(s), symbol or symbol list
+// @param timecol - ordering column within group
+// @param pxcol - price column
+// @param baseSpec - dict specifying base alpha module
+// @param condSpec - dict specifying conditioning module(s)
+// @param params - optional dict (currently `lag, default 1)
+// @return original table +
+//   `baseAlpha`condWeightRaw`condWeight`condGate`condAlpha`condPos
+conditionalAlphaTable:{[t;bycol;timecol;pxcol;baseSpec;condSpec;params]
+    if[0=count t; :t];
+
+    cfgDef:`lag!(1);
+    cfg:$[params~(::); cfgDef; cfgDef,params];
+    lagRaw:condOpt_[cfg;`lag;1];
+    lagN:`int$$[0h<type lagRaw; first lagRaw; lagRaw];
+
+    isByAtom:-11h=type bycol;
+    bcols:$[isByAtom; enlist bycol; bycol];
+    t0:(bcols,enlist timecol) xasc t;
+    t0:update condAlphaIdx__:i from t0;
+    grp:$[isByAtom; group t0 bycol; group flip t0 bycol];
+
+    helper:{[pxcol;baseSpec;condSpec;lagN;g]
+        base:condBase_[g;pxcol;baseSpec];
+        cw:condWeights_[g;pxcol;base;condSpec];
+        sig:base * cw`weight;
+        pos:lagN xprev sig;
+        g,'flip `baseAlpha`condWeightRaw`condWeight`condGate`condAlpha`condPos!(
+            base;
+            cw`weightRaw;
+            cw`weight;
+            cw`gate;
+            sig;
+            pos)
+    }[pxcol;baseSpec;condSpec;lagN];
+
+    parts:helper each {[tab;idx] tab idx}[t0] each value grp;
+    out:raze parts;
+    out:`condAlphaIdx__ xasc out;
+    ![out;();0b;enlist `condAlphaIdx__]}
+
 // =============================================================================
 // FACTOR MODEL UTILITIES
 // =============================================================================
