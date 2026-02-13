@@ -184,7 +184,7 @@ tilt:{[f1;f2;window;ntype;weight] f1n:normalize[window;ntype;ffill f1]; f2n:norm
 // -----------------------------------------------------------------------------
 
 // Smooth: exponential moving average (causal - only uses past)
-smooth:{[f;halflife] lambda:exp neg log[2]%halflife; {(x*y)+(1-x)*z}[lambda]\[first f;ffill f]}
+smooth:{[f;halflife] lam:exp neg log[2]%halflife; {(x*y)+(1-x)*z}[lam]\[first f;ffill f]}
 
 // Rolling clip: cap at rolling percentile bounds (no look-ahead)
 clip:{[f;window;loPct;hiPct]
@@ -361,9 +361,9 @@ maxLossGate:{[f;fwdRet;window;maxLoss] losses:rmean[window;0f & fwdRet * signum 
 varianceRatio:{[x;q;w]
     x:ffill x;
     qRet:q msum x;
-    varQ:mdev[w; qRet] xexp 2;
-    var1:mdev[w; x] xexp 2;
-    varQ % 1e-10 | q * var1}
+    vQ:mdev[w; qRet] xexp 2;
+    v1:mdev[w; x] xexp 2;
+    vQ % 1e-10 | q * v1}
 
 // Variance ratio table interface (grouped by sym)
 // @param t - table sorted by (bycol, time)
