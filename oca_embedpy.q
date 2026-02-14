@@ -1227,6 +1227,583 @@ atm_strategy_trade_table:{[rets]
   d`by_trade
  }
 
+is_numeric_col:{[t;c]
+  if[not c in cols t; :0b];
+  (abs type t c) in 1 4 5 6 7 8 9h
+ }
+
+safe_corr:{[x;y]
+  n:count x;
+  if[(n<2) or (count y<2); :0n];
+  dx:dev x;
+  dy:dev y;
+  if[(null dx) or (null dy) or (dx<=1e-12) or (dy<=1e-12); :0n];
+  cor[x;y]
+ }
+
+safe_beta:{[x;y]
+  n:count x;
+  if[(n<2) or (count y<2); :0n];
+  vx:var x;
+  if[(null vx) or (vx<=1e-12); :0n];
+  cov[x;y] % vx
+ }
+
+/ Explain good/bad performance drivers for a returns stream.
+/ Inputs:
+/   rets: table containing at least `date`pnl (optionally `strategy)
+/   cfg keys (all optional):
+/     `top_n (default 10) number of top/worst days used in concentration metrics
+/     `driver_cols (symbol or symbol list) numeric columns to attribute performance to
+/     `drivers_tbl (table keyed by `date with extra daily drivers to join onto `rets)
+/ Returns dict:
+/   `summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative
+atm_strategy_performance_explain:{[rets; cfg]
+  t:rets;
+  if[99h=type t; t:0!t];
+  if[98h<>type t; '"returns input must be a table"];
+  c:$[cfg~(::); ()!(); cfg];
+  req:`date`pnl;
+  if[not all req in cols t; '"returns table missing required columns (`date`pnl)"];
+
+  if[0=count t;
+    e:([]);
+    :(`summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative)!(e;e;e;e;e;e;e;e);
+  ];
+
+  dty:abs type t`date;
+  if[dty in 12 15h; t:update date:date date from t];
+  if[not dty in 14 12 15h; '"date column must be date or timestamp/datetime"];
+  if[not `strategy in cols t; t:update strategy:`all from t];
+
+  if[`drivers_tbl in key c;
+    dtb:c`drivers_tbl;
+    if[99h=type dtb; dtb:0!dtb];
+    if[98h<>type dtb; '"drivers_tbl must be a table"];
+    if[0<count dtb;
+      if[not `date in cols dtb; '"drivers_tbl must include `date"];
+      dty2:abs type dtb`date;
+      if[dty2 in 12 15h; dtb:update date:date date from dtb];
+      if[not dty2 in 14 12 15h; '"drivers_tbl `date must be date or timestamp/datetime"];
+      if[(count distinct dtb`date)<>count dtb; '"drivers_tbl `date must be unique"];
+      t:t lj `date xkey dtb;
+    ];
+  ];
+
+  tn:$[`top_n in key c; c`top_n; 10];
+  tn:max 1, `int$tn;
+
+  drv_raw:$[`driver_cols in key c; c`driver_cols; `symbol$()];
+  dty_drv:type drv_raw;
+  dcols:$[
+    drv_raw~(::); `symbol$();
+    dty_drv=-11h; enlist drv_raw;
+    dty_drv=10h; enlist `$drv_raw;
+    dty_drv=11h; drv_raw;
+    dty_drv=0h; .oca.to_sym each drv_raw;
+    enlist .oca.to_sym drv_raw];
+  dcols:dcols where dcols in cols t;
+
+  if[(0=count dcols) and (`drivers_tbl in key c);
+    cs:cols t;
+    i:0;
+    auto:`symbol$();
+    while[i<count cs;
+      c1:cs i;
+      if[(not c1 in `date`strategy`pnl`price`ret`reb_date) and .oca.is_numeric_col[t;c1];
+        auto,:enlist c1];
+      i+:1;
+    ];
+    dcols:auto;
+  ];
+
+  / Daily aggregated pnl by strategy/date
+  daily:0!select day_pnl:sum pnl by date,strategy from t;
+
+  / Attach daily driver averages if requested
+  i:0;
+  gk:group flip `date`strategy!(t`date; t`strategy);
+  gkTab:key gk;
+  gkIdx:value gk;
+  while[i<count dcols;
+    c1:dcols i;
+    vals:`float$avg each (t c1) gkIdx;
+    dv:flip (`date`strategy,c1)!(gkTab`date; gkTab`strategy; vals);
+    daily:daily lj `date`strategy xkey dv;
+    i+:1;
+  ];
+
+  svals:asc distinct daily`strategy;
+  paths:();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    sub:daily where (daily`strategy)=s1;
+    sub:sub @ iasc sub`date;
+    sub:update cum_pnl:sums day_pnl from sub;
+    sub:update cum_peak:maxs cum_pnl from sub;
+    sub:update drawdown:cum_pnl - cum_peak from sub;
+    paths,:enlist sub;
+    i+:1;
+  ];
+  daily_path:raze paths;
+
+  summary:0!select
+    start_date:min date,
+    end_date:max date,
+    n_days:count i,
+    total_pnl:sum day_pnl,
+    avg_day_pnl:avg day_pnl,
+    pnl_stdev:dev day_pnl,
+    win_rate:avg day_pnl>0f,
+    avg_win:avg day_pnl where day_pnl>0f,
+    avg_loss:avg day_pnl where day_pnl<0f,
+    best_day:max day_pnl,
+    worst_day:min day_pnl
+    by strategy from daily_path;
+  summary:update sharpe:(sqrt 252f) * avg_day_pnl % (pnl_stdev | 1e-12f) from summary;
+
+  dd:0!select max_drawdown:min drawdown, max_dd_date:first date where drawdown=min drawdown by strategy from daily_path;
+  summary:summary lj `strategy xkey dd;
+
+  concRows:();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    sub:daily_path where (daily_path`strategy)=s1;
+    subD:sub @ reverse iasc sub`day_pnl;
+    subW:sub @ iasc sub`day_pnl;
+    tp:sum tn#subD`day_pnl;
+    wl:sum abs tn#subW`day_pnl;
+    totAbs:abs sum sub`day_pnl;
+    cTop:$[totAbs<=1e-12; 0n; tp % totAbs];
+    cW:$[totAbs<=1e-12; 0n; wl % totAbs];
+    concRows,:enlist ([] strategy:enlist s1; topn_pnl_conc:enlist cTop; worstn_abs_pnl_conc:enlist cW);
+    i+:1;
+  ];
+  conc:$[0=count concRows; ([] strategy:`symbol$(); topn_pnl_conc:`float$(); worstn_abs_pnl_conc:`float$()); raze concRows];
+  summary:summary lj `strategy xkey conc;
+
+  dm:update month:`month$date from daily_path;
+  monthly:0!select n_days:count i, month_pnl:sum day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
+  monthly:monthly @ iasc monthly`strategy`month;
+
+  top_days:tn#(daily_path @ reverse iasc daily_path`day_pnl);
+  worst_days:tn#(daily_path @ iasc daily_path`day_pnl);
+
+  drvRows:();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    sub:daily_path where (daily_path`strategy)=s1;
+    j:0;
+    while[j<count dcols;
+      c1:dcols j;
+      x:`float$sub c1;
+      y:`float$sub`day_pnl;
+      ok:(not null x) & not null y;
+      x:x where ok;
+      y:y where ok;
+      n:count x;
+      md:$[n=0; 0n; med x];
+      hi:x>=md;
+      lo:x<md;
+      hm:$[sum hi=0; 0n; avg y where hi];
+      lm:$[sum lo=0; 0n; avg y where lo];
+      hwr:$[sum hi=0; 0n; avg (y where hi)>0f];
+      lwr:$[sum lo=0; 0n; avg (y where lo)>0f];
+      cr:.oca.safe_corr[x;y];
+      bt:.oca.safe_beta[x;y];
+      sp:$[(null hm) or (null lm); 0n; hm-lm];
+      drvRows,:enlist ([] strategy:enlist s1; driver:enlist c1; n_obs:enlist n; corr:enlist cr; beta:enlist bt; median_driver:enlist md; high_mean_pnl:enlist hm; low_mean_pnl:enlist lm; pnl_spread:enlist sp; high_win_rate:enlist hwr; low_win_rate:enlist lwr);
+      j+:1;
+    ];
+    i+:1;
+  ];
+  drv:$[
+    0=count drvRows;
+    ([] strategy:`symbol$(); driver:`symbol$(); n_obs:`int$(); corr:`float$(); beta:`float$(); median_driver:`float$(); high_mean_pnl:`float$(); low_mean_pnl:`float$(); pnl_spread:`float$(); high_win_rate:`float$(); low_win_rate:`float$());
+    raze drvRows
+  ];
+
+  flags:update
+    tail_concentrated:topn_pnl_conc>0.6,
+    right_tail_profile:(win_rate<0.5) & (total_pnl>0f),
+    left_tail_drag:(win_rate>0.5) & (total_pnl<0f),
+    fragile_edge:(abs avg_day_pnl) < 0.25f * pnl_stdev
+    from summary;
+  flags:0!select
+    strategy,total_pnl,win_rate,topn_pnl_conc,
+    tail_concentrated,right_tail_profile,left_tail_drag,fragile_edge
+    from flags;
+
+  diag:`symbol$();
+  i:0;
+  while[i<count flags;
+    tp:(flags`total_pnl) i;
+    wr:(flags`win_rate) i;
+    tc:(flags`tail_concentrated) i;
+    d1:$[(tp>0f) and (wr<0.5); `positive_right_tail;
+        (tp<0f) and (wr>0.5); `negative_left_tail;
+        tc; `event_driven;
+        tp>0f; `broad_positive;
+        tp<0f; `broad_negative;
+        `flat];
+    diag,:enlist d1;
+    i+:1;
+  ];
+  flags:update diagnosis:diag from flags;
+
+  / Per-strategy plain-English explanation from flags + strongest driver splits
+  narrReason:();
+  narrDiag:`symbol$();
+  narrPosDrv:`symbol$();
+  narrPosSp:`float$();
+  narrNegDrv:`symbol$();
+  narrNegSp:`float$();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    f:flags where (flags`strategy)=s1;
+    d1:$[0=count f; `flat; first f`diagnosis];
+    tp:$[0=count f; 0n; first f`total_pnl];
+    wr:$[0=count f; 0n; first f`win_rate];
+    tc:$[0=count f; 0b; first f`tail_concentrated];
+    ct:$[0=count f; 0n; first f`topn_pnl_conc];
+
+    dsub:drv where (drv`strategy)=s1;
+    posDrv:`;
+    negDrv:`;
+    posSp:0n;
+    negSp:0n;
+    if[(count dsub)>0;
+      dpos:dsub @ reverse iasc dsub`pnl_spread;
+      dneg:dsub @ iasc dsub`pnl_spread;
+      posDrv:first dpos`driver;
+      negDrv:first dneg`driver;
+      posSp:first dpos`pnl_spread;
+      negSp:first dneg`pnl_spread;
+    ];
+
+    base:$[
+      d1=`positive_right_tail; "PnL is positive with sub-50% win rate; large right-tail days dominate.";
+      d1=`negative_left_tail; "Win rate is above 50% but total PnL is negative; left-tail losses dominate.";
+      d1=`event_driven; "A large share of total PnL comes from a small number of days.";
+      d1=`broad_positive; "Performance is broadly positive across days.";
+      d1=`broad_negative; "Performance is broadly negative across days.";
+      "Performance is close to flat."
+    ];
+
+    concTxt:$[tc; raze (" Concentration is high (top-",string tn," days / total abs PnL = ",string ct,")."); ""];
+    posTxt:$[posDrv~`; ""; raze (" Positive regime driver: ",string posDrv," (high-low avg day pnl spread ",string posSp,").")];
+    negTxt:$[negDrv~`; ""; raze (" Negative regime driver: ",string negDrv," (high-low avg day pnl spread ",string negSp,").")];
+    lvlTxt:raze (" Total pnl ",string tp,", win rate ",string wr,".");
+    msg:raze (base; lvlTxt; concTxt; posTxt; negTxt);
+
+    narrDiag,:enlist d1;
+    narrReason,:enlist msg;
+    narrPosDrv,:enlist posDrv;
+    narrPosSp,:enlist posSp;
+    narrNegDrv,:enlist negDrv;
+    narrNegSp,:enlist negSp;
+    i+:1;
+  ];
+  narrative:flip `strategy`diagnosis`reason`top_driver_pos`top_driver_pos_spread`top_driver_neg`top_driver_neg_spread!(
+    svals;
+    narrDiag;
+    narrReason;
+    narrPosDrv;
+    narrPosSp;
+    narrNegDrv;
+    narrNegSp
+  );
+
+  (`summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative)!(summary; daily_path; monthly; top_days; worst_days; drv; flags; narrative)
+ }
+
+/ Portfolio-level explanation from:
+/   - alpha_wide: wide table (date + one pnl column per alpha)
+/   - total_tbl: total strategy pnl table (date + pnl-like numeric column)
+/ It auto-detects alpha columns and total pnl column, assigns alpha groups,
+/ and returns attribution + working/not-working summaries.
+/ cfg optional keys:
+/   `date_col (default auto: `date then `dt)
+/   `total_col (default auto: `pnl else first numeric non-date col in total_tbl)
+/   `alpha_cols (default auto: all numeric non-date cols in alpha_wide)
+/   `top_n (default 10)
+/   `group_corr_hi (default 0.2)
+/   `group_conc_hi (default 0.6)
+/   `drivers_tbl, `driver_cols (passed through to atm_strategy_performance_explain)
+alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
+  aw:alpha_wide;
+  tt:total_tbl;
+  if[99h=type aw; aw:0!aw];
+  if[99h=type tt; tt:0!tt];
+  if[98h<>type aw; '"alpha_wide must be a table"];
+  if[98h<>type tt; '"total_tbl must be a table"];
+  c:$[cfg~(::); ()!(); cfg];
+
+  / Resolve date columns
+  dcol_aw:$[
+    `date_col in key c; .oca.to_sym c`date_col;
+    `date in cols aw; `date;
+    `dt in cols aw; `dt;
+    '"alpha_wide must include `date (or `dt) or pass cfg`date_col"
+  ];
+  dcol_tt:$[
+    `total_date_col in key c; .oca.to_sym c`total_date_col;
+    `date in cols tt; `date;
+    `dt in cols tt; `dt;
+    dcol_aw
+  ];
+
+  if[not dcol_aw in cols aw; '"cfg`date_col not found in alpha_wide"];
+  if[not dcol_tt in cols tt; '"total date column not found in total_tbl"];
+
+  if[dcol_aw<>`date; aw:update date:aw dcol_aw from aw];
+  if[dcol_tt<>`date; tt:update date:tt dcol_tt from tt];
+
+  dty1:abs type aw`date;
+  if[dty1 in 12 15h; aw:update date:date date from aw];
+  if[not dty1 in 14 12 15h; '"alpha_wide date column must be date or timestamp/datetime"];
+  dty2:abs type tt`date;
+  if[dty2 in 12 15h; tt:update date:date date from tt];
+  if[not dty2 in 14 12 15h; '"total_tbl date column must be date or timestamp/datetime"];
+
+  / Resolve total pnl column
+  tcol:$[`total_col in key c; .oca.to_sym c`total_col; `pnl];
+  if[not tcol in cols tt;
+    cs:cols tt;
+    num:`symbol$();
+    i:0;
+    while[i<count cs;
+      c1:cs i;
+      if[(c1<>`date) and .oca.is_numeric_col[tt;c1]; num,:enlist c1];
+      i+:1;
+    ];
+    if[0=count num; '"total_tbl has no numeric pnl column"];
+    tcol:first num;
+  ];
+  tcol:.oca.to_sym tcol;
+  if[not .oca.is_numeric_col[tt;tcol]; '"resolved total pnl column is not numeric"];
+
+  / Resolve alpha columns
+  ac_raw:$[`alpha_cols in key c; c`alpha_cols; `symbol$()];
+  ac_t:type ac_raw;
+  acols:$[
+    ac_raw~(::); `symbol$();
+    ac_t=-11h; enlist ac_raw;
+    ac_t=10h; enlist `$ac_raw;
+    ac_t=11h; ac_raw;
+    ac_t=0h; .oca.to_sym each ac_raw;
+    enlist .oca.to_sym ac_raw
+  ];
+  if[0=count acols;
+    cs:cols aw;
+    acols:`symbol$();
+    i:0;
+    while[i<count cs;
+      c1:cs i;
+      if[(c1<>`date) and .oca.is_numeric_col[aw;c1]; acols,:enlist c1];
+      i+:1;
+    ];
+  ];
+  acols:acols where acols in cols aw;
+  if[0=count acols; '"no alpha columns resolved in alpha_wide"];
+
+  / Keep only required columns
+  awVals:enlist aw`date;
+  i:0;
+  while[i<count acols;
+    c1:acols i;
+    cvals:`float$(aw c1);
+    awVals,:enlist cvals;
+    i+:1;
+  ];
+  awk:flip (`date,acols)!awVals;
+  if[not (tcol in cols tt); '"internal error: resolved total pnl column missing in total_tbl"];
+  ttk:([] date:tt`date; portfolio_pnl:`float$(tt tcol));
+
+  / Aggregate duplicates by date (sum)
+  gaw:group awk`date;
+  dta:key gaw;
+  ixa:value gaw;
+  aggVals:enlist dta;
+  i:0;
+  while[i<count acols;
+    c1:acols i;
+    vals:`float$sum each (0f^`float$(awk c1)) ixa;
+    aggVals,:enlist vals;
+    i+:1;
+  ];
+  awAgg:flip (`date,acols)!aggVals;
+  gtt:group ttk`date;
+  dtt:key gtt;
+  ixt:value gtt;
+  totVals:`float$sum each (0f^ttk`portfolio_pnl) ixt;
+  ttAgg:([] date:dtt; portfolio_pnl:totVals);
+
+  / Align on shared dates
+  j:awAgg lj `date xkey ttAgg;
+  j:j where not null j`portfolio_pnl;
+  if[0=count j; '"no overlapping dates between alpha_wide and total_tbl"];
+
+  tn:$[`top_n in key c; c`top_n; 10];
+  tn:max 1, `int$tn;
+
+  / Build long alpha table for reusable explain helper
+  parts:();
+  i:0;
+  while[i<count acols;
+    c1:acols i;
+    p1:([] date:j`date; strategy:(count j)#c1; pnl:`float$(j c1));
+    parts,:enlist p1;
+    i+:1;
+  ];
+  alphaLong:raze parts;
+  alphaLong:alphaLong where not null alphaLong`pnl;
+
+  / Portfolio table
+  portTbl:([] date:j`date; strategy:(count j)#`portfolio; pnl:`float$(j`portfolio_pnl));
+
+  / Pass-through config to underlying explain helper
+  ecfg:c;
+  ecfg[`top_n]:tn;
+
+  alphaExp:.oca.atm_strategy_performance_explain[alphaLong; ecfg];
+  portExp:.oca.atm_strategy_performance_explain[portTbl; ecfg];
+
+  / Attribution of each alpha to total
+  topRows:tn#(j @ reverse iasc j`portfolio_pnl);
+  worstRows:tn#(j @ iasc j`portfolio_pnl);
+  topDates:topRows`date;
+  worstDates:worstRows`date;
+  attrRows:();
+  i:0;
+  while[i<count acols;
+    s1:acols i;
+    x:`float$(j s1);
+    y:`float$(j`portfolio_pnl);
+    ok:(not null x) & not null y;
+    x:x where ok;
+    y:y where ok;
+    n:count x;
+    sx:sum x;
+    sy:sum y;
+    sax:sum abs x;
+    say:sum abs y;
+    contrib:$[abs sy<=1e-12; 0n; sx % sy];
+    absContrib:$[say<=1e-12; 0n; sax % say];
+    cr:.oca.safe_corr[x;y];
+    bt:.oca.safe_beta[x;y];
+    sxsgn:(`float$(x>0f)) - (`float$(x<0f));
+    sysgn:(`float$(y>0f)) - (`float$(y<0f));
+    aMask:(sxsgn<>0f) & (sysgn<>0f);
+    agree:$[sum aMask=0; 0n; avg (sxsgn where aMask) = (sysgn where aMask)];
+    upM:y>0f;
+    dnM:y<0f;
+    upCap:$[sum upM=0; 0n; avg x where upM];
+    dnCap:$[sum dnM=0; 0n; avg x where dnM];
+    jt:j where (j`date) in topDates;
+    jw:j where (j`date) in worstDates;
+    xt:`float$(jt s1);
+    yt:`float$(jt`portfolio_pnl);
+    xw:`float$(jw s1);
+    yw:`float$(jw`portfolio_pnl);
+    tShare:$[abs sum yt<=1e-12; 0n; sum xt % sum yt];
+    wShare:$[abs sum yw<=1e-12; 0n; sum xw % sum yw];
+    attrRows,:enlist ([] strategy:enlist s1; n_obs:enlist n; sum_pnl:enlist sx; contrib_pct:enlist contrib; abs_contrib_pct:enlist absContrib; corr_total:enlist cr; beta_total:enlist bt; sign_agree_rate:enlist agree; up_capture:enlist upCap; down_capture:enlist dnCap; top_days_share:enlist tShare; worst_days_share:enlist wShare);
+    i+:1;
+  ];
+  attrib:$[
+    0=count attrRows;
+    ([] strategy:`symbol$(); n_obs:`int$(); sum_pnl:`float$(); contrib_pct:`float$(); abs_contrib_pct:`float$(); corr_total:`float$(); beta_total:`float$(); sign_agree_rate:`float$(); up_capture:`float$(); down_capture:`float$(); top_days_share:`float$(); worst_days_share:`float$());
+    raze attrRows
+  ];
+
+  as:alphaExp`summary;
+  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc from as;
+  attrib:attrib lj `strategy xkey as;
+
+  / Auto grouping
+  corrHi:$[`group_corr_hi in key c; 1f*c`group_corr_hi; 0.2f];
+  concHi:$[`group_conc_hi in key c; 1f*c`group_conc_hi; 0.6f];
+  grp:`symbol$();
+  status:`symbol$();
+  i:0;
+  while[i<count attrib;
+    p:(attrib`sum_pnl) i;
+    cr:(attrib`corr_total) i;
+    tc:(attrib`topn_pnl_conc) i;
+    crPos:(not null cr) and (cr>=corrHi);
+    crNeg:(not null cr) and (cr<=neg corrHi);
+    tcHi:(not null tc) and (tc>=concHi);
+    g1:$[
+      (p>0f) and crPos and (not tcHi); `core_contributor;
+      (p>0f) and crNeg; `diversifying_contributor;
+      (p>0f) and tcHi; `event_contributor;
+      (p<=0f) and crNeg; `hedge_cost;
+      (p<=0f) and crPos; `drag;
+      `mixed
+    ];
+    st1:$[
+      p>0f; `working;
+      g1=`hedge_cost; `insurance_cost;
+      `not_working
+    ];
+    grp,:enlist g1;
+    status,:enlist st1;
+    i+:1;
+  ];
+  attrib:update alpha_group:grp, status:status from attrib;
+  attrib:attrib @ reverse iasc attrib`sum_pnl;
+
+  groupSummary:0!select
+    n_alpha:count i,
+    group_pnl:sum sum_pnl,
+    group_abs_pnl:sum abs sum_pnl,
+    avg_corr_total:avg corr_total
+    by alpha_group from attrib;
+  groupSummary:groupSummary @ reverse iasc groupSummary`group_pnl;
+
+  work:attrib where (attrib`sum_pnl)>0f;
+  work:tn#work;
+  drag:attrib where (attrib`sum_pnl)<0f;
+  drag:tn#(drag @ iasc drag`sum_pnl);
+
+  / High-level narrative
+  psTbl:portExp`summary;
+  hasPs:(count psTbl)>0;
+  pTot:$[hasPs; first psTbl`total_pnl; 0n];
+  pN:$[hasPs; first psTbl`n_days; 0N];
+  pWr:$[hasPs; first psTbl`win_rate; 0n];
+  posN:sum ((attrib`sum_pnl)>0f);
+  negN:sum ((attrib`sum_pnl)<0f);
+  topA:$[0=count work; `; first work`strategy];
+  topP:$[0=count work; 0n; first work`sum_pnl];
+  badA:$[0=count drag; `; first drag`strategy];
+  badP:$[0=count drag; 0n; first drag`sum_pnl];
+  h1:$[hasPs; raze ("Portfolio pnl ",string pTot," over ",string pN," days (win rate ",string pWr,")."); "No portfolio summary rows."];
+  h2:raze (string posN," alphas are working (positive pnl) and ",string negN," are not.");
+  h3:raze ("Top contributor: ",string topA," (",string topP,"). Largest drag: ",string badA," (",string badP,").");
+  narrative:([] section:`headline`breadth`leaders; text:(h1;h2;h3));
+
+  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`working`not_working`narrative)!(
+    portExp`summary;
+    portExp`flags;
+    portExp`narrative;
+    alphaExp`summary;
+    alphaExp`driver_effects;
+    alphaExp`flags;
+    alphaExp`narrative;
+    attrib;
+    groupSummary;
+    work;
+    drag;
+    narrative
+  )
+ }
+
 min_abs_diff:{[vals; p]
   if[p~(::); :0w];
   if[null p; :0w];
