@@ -57,9 +57,14 @@ sharpeMom:{[x;w]
     mu:.cond.smooth[x; hl];
     // EWMA variance: E[x^2] - (E[x])^2
     ewmaX2:.cond.smooth[x * x; hl];
-    // Floor at 1% of long-run variance to avoid division by noise
-    lrVar:(var x) | 1e-10;
-    floorVar:0.01 * lrVar;
+    // Floor at 25% of rolling long-run variance (no lookahead).
+    // Uses 5x signal halflife — adapts to vol regime, prevents
+    // mu/vol from exploding during persistent low-vol trending.
+    lrHL:5f * hl;
+    lrMu:.cond.smooth[x; lrHL];
+    lrX2:.cond.smooth[x * x; lrHL];
+    lrVar:1e-10 | (lrX2 - (lrMu * lrMu));
+    floorVar:0.25 * lrVar;
     localVar:floorVar | (ewmaX2 - (mu * mu));
     vol:sqrt localVar;
     prev mu % vol}
