@@ -1259,8 +1259,7 @@ safe_beta:{[x;y]
 / Returns dict:
 /   `summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative
 atm_strategy_performance_explain:{[rets; cfg]
-  t:rets;
-  if[99h=type t; t:0!t];
+  t:.oca.to_table rets;
   if[98h<>type t; '"returns input must be a table"];
   c:$[cfg~(::); ()!(); cfg];
   req:`date`pnl;
@@ -1277,8 +1276,7 @@ atm_strategy_performance_explain:{[rets; cfg]
   if[not `strategy in cols t; t:update strategy:`all from t];
 
   if[`drivers_tbl in key c;
-    dtb:c`drivers_tbl;
-    if[99h=type dtb; dtb:0!dtb];
+    dtb:.oca.to_table c`drivers_tbl;
     if[98h<>type dtb; '"drivers_tbl must be a table"];
     if[0<count dtb;
       if[not `date in cols dtb; '"drivers_tbl must include `date"];
@@ -1535,10 +1533,8 @@ atm_strategy_performance_explain:{[rets; cfg]
 /   `group_conc_hi (default 0.6)
 /   `drivers_tbl, `driver_cols (passed through to atm_strategy_performance_explain)
 alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
-  aw:alpha_wide;
-  tt:total_tbl;
-  if[99h=type aw; aw:0!aw];
-  if[99h=type tt; tt:0!tt];
+  aw:.oca.to_table alpha_wide;
+  tt:.oca.to_table total_tbl;
   if[98h<>type aw; '"alpha_wide must be a table"];
   if[98h<>type tt; '"total_tbl must be a table"];
   c:$[cfg~(::); ()!(); cfg];
@@ -1666,12 +1662,9 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   / Portfolio table
   portTbl:([] date:j`date; strategy:(count j)#`portfolio; pnl:`float$(j`portfolio_pnl));
 
-  / Pass-through config to underlying explain helper
-  ecfg:c;
-  ecfg[`top_n]:tn;
-
-  alphaExp:.oca.atm_strategy_performance_explain[alphaLong; ecfg];
-  portExp:.oca.atm_strategy_performance_explain[portTbl; ecfg];
+  / Pass-through config (atm_strategy_performance_explain handles defaults itself)
+  alphaExp:.oca.atm_strategy_performance_explain[alphaLong; c];
+  portExp:.oca.atm_strategy_performance_explain[portTbl; c];
 
   / Attribution of each alpha to total
   topRows:tn#(j @ reverse iasc j`portfolio_pnl);
