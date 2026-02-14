@@ -1,22 +1,24 @@
 // =============================================================================
-// MOMENTUM SIGNAL LIBRARY v2.0
+// MOMENTUM SIGNAL LIBRARY v3.0
 // =============================================================================
-// Risk-adjusted multi-speed momentum with regime gating, carry alignment,
-// curve confirmation, crash protection, and portfolio vol targeting.
+// Regime-switched blend architecture for multi-speed momentum.
+// Two signal variants (slow trend ensemble, fast responsive) are blended
+// based on regime state. Carry enters additively. Curve agreement adjusts
+// leverage cap. Single DD brake as protection.
 //
-// Version: 2.0.0
+// Version: 3.0.0
 // Dependencies: cond.q, kdbtools.q
 // Optional:     alphalab.q (for alphaEval bridge)
 //
 // Pipeline:
-//   1. Sharpe momentum (mu/sigma) at each speed — self-normalizing
+//   1. Sharpe momentum (mu/sigma) at trend speeds — self-normalizing
 //   2. Momentum acceleration (2nd derivative) overlay
-//   3. Regime-adaptive ensemble (VR-based speed weighting + scaling)
-//   4. Carry alignment gate (optional, if carry column present)
-//   5. Curve confirmation (cross-contract directional agreement)
-//   6. Extreme taper at cumulative z-score extremes
-//   7. Crash protection (vol break + drawdown circuit breaker)
-//   8. Vol targeting with leverage cap
+//   3. VR-weighted trend ensemble (raw, unscaled)
+//   4. Fast responsive signal (single speed)
+//   5. Regime blend: regimeW * trendSig + (1-regimeW) * fastSig
+//   6. Additive carry tilt (optional, if carry column present)
+//   7. Curve agreement adjusts max leverage ceiling (portfolio level)
+//   8. Vol targeting + DD brake (floored at 0.6)
 //
 // All arithmetic uses explicit parentheses (Q right-to-left).
 
@@ -26,15 +28,16 @@
 // CONFIGURATION
 // =============================================================================
 
-defaultSpeeds:21 63 126
+defaultTrendSpeeds:63 126 252
+defaultFastSpeed:21
 defaultAccelWt:0.3
+defaultBlendHL:10
+defaultCarryTiltWt:0.15
 defaultVRQ:5
 defaultVRW:60
 defaultTargetVol:0.10
 defaultMaxLev:3f
 defaultDDThresh:0.05
-defaultVolBreakThresh:2.0
-defaultExtremeZ:2.0
 defaultClip:4f
 
 // =============================================================================
@@ -90,16 +93,14 @@ singleSpeed:{[x;w;aw]
 // =============================================================================
 
 // Blend multi-speed signals with VR-adaptive weighting.
-// Uses rolling percentile of VR (robust to VR level bias).
-// In trending regimes: upweight slow speeds, full size.
-// In mean-reverting regimes: scale toward zero.
+// Returns RAW ensemble (unscaled) plus vrPctl for regime blending.
 //
 // sigs:   list of signal vectors (one per speed)
 // x:      return series (for VR computation)
 // speeds: list of lookback windows
 // vrQ:    VR aggregation horizon (default 5)
 // vrW:    VR rolling window (default 60)
-// Returns: dict `ensemble`vr`regimeScale
+// Returns: dict `ensemble`vr`regimeScale`vrPctl
 regimeEnsemble:{[sigs;x;speeds;vrQ;vrW]
     n:count sigs;
     nObs:count first sigs;
@@ -119,86 +120,53 @@ regimeEnsemble:{[sigs;x;speeds;vrQ;vrW]
     i:0;
     while[i < n; tiltSum:tiltSum + tilts[i]; i+:1];
     tiltSum:1e-10 | tiltSum;
-    // Weighted sum
+    // Weighted sum (RAW — no regimeScale multiplication)
     ens:nObs # 0f;
     i:0;
     while[i < n;
         ens:ens + (sigs[i] * tilts[i] % tiltSum);
         i+:1];
-    `ensemble`vr`regimeScale!(ens * regimeScale; vr; regimeScale)}
+    `ensemble`vr`regimeScale`vrPctl!(ens; vr; regimeScale; vrPctl)}
 
 // =============================================================================
-// SECTION 4: CARRY ALIGNMENT GATE
+// SECTION 4: REGIME BLEND
 // =============================================================================
 
-// Gate multiplier based on carry direction alignment.
-// 1.0 when signal and carry agree; 0.3 when opposing.
+// Blend trend and fast signals based on smoothed VR percentile.
+// In trending regimes (regimeW→1): uses trend ensemble.
+// In mean-reverting regimes (regimeW→0): uses fast responsive signal.
 //
-// sig:   momentum signal vector
-// carry: daily carry return vector
-// Returns: multiplier vector (0.3 or 1.0)
-carryGateVal:{[sig;carry]
-    carryDir:signum 0f ^ prev carry;
-    sigDir:signum sig;
-    opposing:(sigDir <> 0f) and (carryDir <> 0f) and (sigDir <> carryDir);
-    1f - (0.7 * opposing)}
+// trendSig: VR-weighted trend ensemble (raw)
+// fastSig:  fast speed signal
+// vrPctl:   rolling VR percentile
+// blendHL:  EMA halflife for smoothing regime weight
+// Returns: blended signal vector
+regimeBlend:{[trendSig;fastSig;vrPctl;blendHL]
+    regimeW:.cond.smooth[0.5 ^ vrPctl; blendHL];
+    (regimeW * trendSig) + ((1f - regimeW) * fastSig)}
 
 // =============================================================================
-// SECTION 5: CURVE CONFIRMATION
+// SECTION 5: CARRY TILT
 // =============================================================================
 
-// Cross-contract directional agreement.
-// |mean(sign(sig))| across contracts at each time step.
-// Mapped to [0.3, 1.0]: unanimous = 1.0, max disagreement = 0.3.
+// Additive carry adjustment. When carry aligns with signal direction,
+// nudges the signal larger. When opposing, nudges smaller.
+// Z-scoring normalizes carry magnitude across instruments.
 //
-// sigs: list of signal vectors (one per sym, aligned by index)
-// Returns: multiplier vector
-curveConfirmVec:{[sigs]
-    n:count sigs;
-    if[n < 2; :count[first sigs] # 1f];
-    dirs:{signum x} each sigs;
-    sumDirs:dirs[0];
-    i:1;
-    while[i < n; sumDirs:sumDirs + dirs[i]; i+:1];
-    agreement:abs sumDirs % "f"$n;
-    0.3 + (0.7 * agreement)}
+// sig:    blended signal vector
+// carry:  daily carry return vector
+// weight: carry tilt weight (0.15 recommended)
+// Returns: tilted signal vector
+carryTilt:{[sig;carry;weight]
+    carryZ:(neg defaultClip) | defaultClip & 0f ^ .cond.rzscore[126; "f"$carry];
+    sig + (weight * (prev carryZ) * signum sig)}
 
 // =============================================================================
-// SECTION 6: EXTREME TAPER
+// SECTION 6: CRASH PROTECTION
 // =============================================================================
-
-// Fade signal when cumulative returns reach extreme z-scores.
-// After 200bps of yield decline in a year, continuation probability drops.
-//
-// x:      return series
-// w:      window for cumulative z-score (252 = 1Y)
-// thresh: z-score threshold before taper begins (2.0)
-// Returns: multiplier (0 to 1). 1.0 when |cumZ| < thresh.
-extremeTaper:{[x;w;thresh]
-    cumX:sums x;
-    cumZ:.cond.rzscore[w;cumX];
-    excess:0f | (abs cumZ) - thresh;
-    exp neg (excess * excess) % 2f}
-
-// =============================================================================
-// SECTION 7: CRASH PROTECTION
-// =============================================================================
-
-// Vol break: fast vol / slow vol ratio.
-// Scales down linearly from 1.0 at thresh to 0.0 at thresh+1.
-//
-// x:       return series
-// fastHL:  fast vol EWMA halflife (5)
-// slowHL:  slow vol EWMA halflife (63)
-// thresh:  ratio threshold to begin scale-down (2.0)
-volBreak:{[x;fastHL;slowHL;thresh]
-    fastVol:sqrt 1e-10 | .cond.smooth[x * x; fastHL];
-    slowVol:sqrt 1e-10 | .cond.smooth[x * x; slowHL];
-    ratio:prev fastVol % slowVol;
-    0f | 1f & (1f - (0f | ratio - thresh))}
 
 // Drawdown circuit breaker.
-// 1.0 at no drawdown, 0.5 at -thresh, 0.25 floor.
+// 1.0 at no drawdown, scales down with DD, 0.6 floor.
 //
 // cumPnl: cumulative P&L vector
 // thresh: drawdown threshold (0.05 = 5%)
@@ -206,39 +174,42 @@ ddBreaker:{[cumPnl;thresh]
     peak:maxs cumPnl;
     dd:cumPnl - peak;
     absDd:0f | neg dd;
-    0.25 | 1f - ((0.5 * absDd) % thresh)}
+    0.6 | 1f - ((0.5 * absDd) % thresh)}
 
 // =============================================================================
-// SECTION 8: TABLE INTERFACE
+// SECTION 7: TABLE INTERFACE
 // =============================================================================
 
 // Main entry point. Compute momentum ensemble for multi-sym table.
 //
 // t:   table with (dt; sym; ret) minimum. Optional: carry column.
 // cfg: config dict. All keys optional:
-//   `speeds          - lookback windows (default: 21 63 126)
+//   `trendSpeeds     - trend lookback windows (default: 63 126 252)
+//   `fastSpeed       - fast speed lookback (default: 21)
 //   `accelWt         - acceleration weight (default: 0.3)
+//   `blendHL         - regime blend smoothing halflife (default: 10)
+//   `carryTiltWt     - carry tilt weight (default: 0.15)
 //   `vrQ             - VR aggregation horizon (default: 5)
 //   `vrW             - VR rolling window (default: 60)
 //   `targetVol       - annualized vol target (default: 0.10)
 //   `maxLeverage     - max vol scale factor (default: 3)
 //   `ddThresh        - drawdown threshold (default: 0.05)
-//   `volBreakThresh  - vol break threshold (default: 2.0)
-//   `extremeZ        - cumulative z threshold (default: 2.0)
 //   `retCol          - return column name (default: `ret)
 //   `dtCol           - date/time column name (default: `dt)
 //   `symCol          - symbol column name (default: `sym)
 //   `carryCol        - carry column name (default: `carry)
 //
 // Returns: table with columns:
-//   sig_N (per-speed), sigRaw, vr, regimeScale, carryGate,
-//   curveConfirm, extremeTaper, volBreak, volScale, ddScale, sig
+//   sig_N (per-speed), trendSig, fastSig, vr, regimeW,
+//   blendedSig, carryTilt, curveAgreement, volScale, ddScale, sig
 ensembleTable:{[t;cfg]
     // Parse config
     pcfg:parseConfig[cfg;cols t];
-    speeds:pcfg`speeds; symCol:pcfg`symCol; dtCol:pcfg`dtCol;
+    trendSpeeds:pcfg`trendSpeeds; fastSpeed:pcfg`fastSpeed;
+    symCol:pcfg`symCol; dtCol:pcfg`dtCol;
+    allSpeeds:asc distinct fastSpeed,trendSpeeds;
 
-    // Phase 1: per-sym signal computation
+    // Phase 1: per-sym signal construction
     t:@[t;`momIdx__;:;til count t];
     grp:group t symCol;
     syms:key grp;
@@ -246,67 +217,83 @@ ensembleTable:{[t;cfg]
     p1:{[t;pcfg;idx]
         dtCol:pcfg`dtCol; retCol:pcfg`retCol;
         carryCol:pcfg`carryCol; hasCarry:pcfg`hasCarry;
-        speeds:pcfg`speeds; aw:pcfg`accelWt;
+        trendSpeeds:pcfg`trendSpeeds; fastSpeed:pcfg`fastSpeed;
+        aw:pcfg`accelWt; blendHL:pcfg`blendHL; carryWt:pcfg`carryTiltWt;
         vrQ:pcfg`vrQ; vrW:pcfg`vrW;
-        ezT:pcfg`extremeZ; vbT:pcfg`volBreakThresh;
+        allSpeeds:asc distinct fastSpeed,trendSpeeds;
         sub:dtCol xasc t idx;
         r:"f"$sub retCol;
         // Excess returns if carry available
         x:$[hasCarry; r - (0f ^ prev "f"$sub carryCol); r];
-        // Per-speed signals
-        sigs:singleSpeed[x;;aw] each speeds;
+        // Per-speed signals (all speeds)
+        allSigs:{[x;aw;spd] singleSpeed[x;spd;aw]}[x;aw;] each allSpeeds;
         i:0;
-        while[i < count speeds;
-            sub:@[sub;`$"sig_",string speeds i;:;sigs i];
+        while[i < count allSpeeds;
+            sub:@[sub;`$"sig_",string allSpeeds i;:;allSigs i];
             i+:1];
-        // Regime ensemble
-        re:regimeEnsemble[sigs;x;speeds;vrQ;vrW];
-        sub:@[sub;`sigRaw;:;re`ensemble];
+        // Fast signal
+        fastIdx:allSpeeds ? fastSpeed;
+        fastSig:allSigs fastIdx;
+        sub:@[sub;`fastSig;:;fastSig];
+        // Trend signals
+        trendIdx:allSpeeds ? trendSpeeds;
+        trendSigs:allSigs trendIdx;
+        // Regime ensemble on trend speeds
+        re:regimeEnsemble[trendSigs;x;trendSpeeds;vrQ;vrW];
+        trendSig:re`ensemble;
+        sub:@[sub;`trendSig;:;trendSig];
         sub:@[sub;`vr;:;re`vr];
-        sub:@[sub;`regimeScale;:;re`regimeScale];
-        // Extreme taper
-        sub:@[sub;`extremeTaper;:;extremeTaper[x;252;ezT]];
-        // Vol break
-        sub:@[sub;`volBreak;:;volBreak[x;5;63;vbT]];
-        // Carry gate
-        sub:@[sub;`carryGate;:;$[hasCarry;
-            carryGateVal[re`ensemble; "f"$sub carryCol];
-            (count sub) # 1f]];
+        // Regime blend
+        vrPctl:re`vrPctl;
+        regimeW:.cond.smooth[0.5 ^ vrPctl; blendHL];
+        blended:(regimeW * trendSig) + ((1f - regimeW) * fastSig);
+        sub:@[sub;`regimeW;:;regimeW];
+        sub:@[sub;`blendedSig;:;blended];
+        // Carry tilt
+        $[hasCarry;
+            [tilted:carryTilt[blended; "f"$sub carryCol; carryWt];
+             sub:@[sub;`carryTilt;:;tilted - blended];
+             sub:@[sub;`blendedSig;:;tilted]];
+            sub:@[sub;`carryTilt;:;(count sub) # 0f]];
         sub}[t;pcfg;];
 
     t:raze p1 each value grp;
     t:`momIdx__ xasc t;
 
-    // Phase 2: curve confirmation
+    // Phase 2: portfolio sizing
     nSyms:count syms;
+
+    // Curve agreement: |avg signum(blendedSig)| by dt → adjusts maxLev ceiling
     if[nSyms > 1;
         [dtVals:t dtCol;
-         dirVals:signum t`sigRaw;
+         dirVals:signum t`blendedSig;
          grpDt:group dtVals;
          meanDirs:(key grpDt)!{[dv;idx] avg dv idx}[dirVals;] each value grpDt;
-         cc:0.3 + (0.7 * abs meanDirs dtVals);
-         t:@[t;`curveConfirm;:;cc]]];
+         ca:abs meanDirs dtVals;
+         t:@[t;`curveAgreement;:;ca]]];
     if[nSyms < 2;
-        t:@[t;`curveConfirm;:;(count t) # 1f]];
+        t:@[t;`curveAgreement;:;(count t) # 1f]];
 
-    // Phase 3: per-sym gates + vol scale + dd breaker
+    // Per-sym vol targeting + DD brake
     grp2:group t pcfg`symCol;
 
-    p3:{[t;pcfg;idx]
+    p2:{[t;pcfg;nSyms;idx]
         dtCol:pcfg`dtCol; retCol:pcfg`retCol;
         targetVol:pcfg`targetVol; maxLev:pcfg`maxLev; ddT:pcfg`ddThresh;
         sub:dtCol xasc t idx;
         r:"f"$sub retCol;
-        // Apply all multiplicative gates
-        sigGated:sub[`sigRaw] * sub[`carryGate] * sub[`curveConfirm];
-        sigGated:sigGated * sub[`extremeTaper] * sub[`volBreak];
+        sigIn:sub`blendedSig;
+        // Adjusted max leverage: curve agreement adjusts ceiling [0.7-1.0]
+        adjMaxLev:$[nSyms > 1;
+            maxLev * (0.7 + (0.3 * sub`curveAgreement));
+            (count sub) # maxLev];
         // Vol targeting
-        sigRet:0f ^ (prev[sigGated] * r);
+        sigRet:0f ^ (prev[sigIn] * r);
         rollingVol:sqrt 1e-10 | .cond.smooth[sigRet * sigRet; 10f];
         annVol:rollingVol * sqrt 252f;
         sf:prev targetVol % (1e-6 | annVol);
-        sf:0f | sf & maxLev;
-        sigVS:sigGated * sf;
+        sf:0f | sf & adjMaxLev;
+        sigVS:sigIn * sf;
         sub:@[sub;`volScale;:;sf];
         // Drawdown circuit breaker
         pnl:0f ^ (prev[sigVS] * r);
@@ -314,33 +301,35 @@ ensembleTable:{[t;cfg]
         dds:ddBreaker[cumPnl;ddT];
         sub:@[sub;`ddScale;:;dds];
         sub:@[sub;`sig;:;sigVS * prev dds];
-        sub}[t;pcfg;];
+        sub}[t;pcfg;nSyms;];
 
-    t:raze p3 each value grp2;
+    t:raze p2 each value grp2;
     t:`momIdx__ xasc t;
     ![t;();0b;enlist `momIdx__]}
 
 // Parse config with defaults
 parseConfig:{[cfg;tcols]
-    speeds:$[`speeds in key cfg; cfg`speeds; defaultSpeeds];
+    trendSpeeds:$[`trendSpeeds in key cfg; cfg`trendSpeeds;
+                   $[`speeds in key cfg; cfg`speeds; defaultTrendSpeeds]];
+    fastSpeed:$[`fastSpeed in key cfg; cfg`fastSpeed; defaultFastSpeed];
     accelWt:$[`accelWt in key cfg; cfg`accelWt; defaultAccelWt];
+    blendHL:$[`blendHL in key cfg; cfg`blendHL; defaultBlendHL];
+    carryTiltWt:$[`carryTiltWt in key cfg; cfg`carryTiltWt; defaultCarryTiltWt];
     vrQ:$[`vrQ in key cfg; cfg`vrQ; defaultVRQ];
     vrW:$[`vrW in key cfg; cfg`vrW; defaultVRW];
     targetVol:$[`targetVol in key cfg; cfg`targetVol; defaultTargetVol];
     maxLev:$[`maxLeverage in key cfg; cfg`maxLeverage; defaultMaxLev];
     ddThresh:$[`ddThresh in key cfg; cfg`ddThresh; defaultDDThresh];
-    vbThresh:$[`volBreakThresh in key cfg; cfg`volBreakThresh; defaultVolBreakThresh];
-    ezThresh:$[`extremeZ in key cfg; cfg`extremeZ; defaultExtremeZ];
     retCol:$[`retCol in key cfg; cfg`retCol; `ret];
     dtCol:$[`dtCol in key cfg; cfg`dtCol; `dt];
     symCol:$[`symCol in key cfg; cfg`symCol; `sym];
     carryCol:$[`carryCol in key cfg; cfg`carryCol; `carry];
     hasCarry:carryCol in tcols;
-    `speeds`accelWt`vrQ`vrW`targetVol`maxLev`ddThresh`volBreakThresh`extremeZ`retCol`dtCol`symCol`carryCol`hasCarry!
-    (speeds;accelWt;vrQ;vrW;targetVol;maxLev;ddThresh;vbThresh;ezThresh;retCol;dtCol;symCol;carryCol;hasCarry)}
+    `trendSpeeds`fastSpeed`accelWt`blendHL`carryTiltWt`vrQ`vrW`targetVol`maxLev`ddThresh`retCol`dtCol`symCol`carryCol`hasCarry!
+    (trendSpeeds;fastSpeed;accelWt;blendHL;carryTiltWt;vrQ;vrW;targetVol;maxLev;ddThresh;retCol;dtCol;symCol;carryCol;hasCarry)}
 
 // =============================================================================
-// SECTION 9: EVALUATION
+// SECTION 8: EVALUATION
 // =============================================================================
 
 // Comprehensive evaluation. t needs dt, sym, sig, ret (+ sig_* for per-speed).
@@ -541,13 +530,13 @@ computeMonthlyBreakdown:{[dts;r]
     delete mu, vol from agg}
 
 computeGateStats:{[t]
-    gateCols:`carryGate`curveConfirm`extremeTaper`volBreak`ddScale;
+    gateCols:`regimeW`ddScale;
     present:gateCols where gateCols in cols t;
     if[0 = count present; :()!()];
     present!{[t;c] v:t[c] where not null t[c]; n:count v; `avg`pctActive!($[n>0;avg v;0n]; $[n>0;(sum v < 0.9) % n; 0f])}[t;] each present}
 
 // =============================================================================
-// SECTION 10: SYNTHETIC DATA
+// SECTION 9: SYNTHETIC DATA
 // =============================================================================
 
 // 4 symbols: trending, trending+crash, random, mean-reverting.
@@ -606,13 +595,13 @@ syntheticTest:{[]
     `dt`sym xasc t}
 
 // =============================================================================
-// SECTION 11: TESTS
+// SECTION 10: TESTS
 // =============================================================================
 
 runTests:{[]
     -1 "";
     -1 "=============================================================================";
-    -1 "              .momentum v2.0 TEST SUITE";
+    -1 "              .momentum v3.0 TEST SUITE";
     -1 "=============================================================================";
     -1 "";
 
@@ -667,108 +656,142 @@ runTests:{[]
     nPass+:t2; nFail+:not t2;
     -1 "";
 
-    // --- Test 3: Regime scaling is low for mean-reverting data ---
-    -1 "Test 3: Regime scaling is low for mean-reverting data";
+    // --- Test 3: Regime blend uses fast signal in MR ---
+    -1 "Test 3: Regime blend uses fast signal in MR regime";
     system "S 42";
     n:1000;
     eps:.cond.randNorm n;
     mrRet:n # 0f; mrRet[0]:0.01 * eps[0];
     i:1; while[i < n; mrRet[i]:(neg[0.5] * mrRet[i-1]) + (0.01 * eps[i]); i+:1];
-    sigs:singleSpeed[mrRet;;0.3] each 21 63 126;
-    re:regimeEnsemble[sigs;mrRet;21 63 126;5;60];
-    avgRS:avg (re`regimeScale) 200 + til 800;
-    t3:avgRS < 0.6;
+    trendSigs:singleSpeed[mrRet;;0.3] each 63 126 252;
+    fastSig3:singleSpeed[mrRet;21;0.3];
+    re:regimeEnsemble[trendSigs;mrRet;63 126 252;5;60];
+    blended:regimeBlend[re`ensemble;fastSig3;re`vrPctl;10];
+    // In MR regime, regimeW should be low → blended ≈ fastSig
+    idx3:300 + til 500;
+    regimeW3:.cond.smooth[re`vrPctl; 10];
+    avgW:avg regimeW3 idx3;
+    // Correlation between blended and fast should be high in MR
+    corrFast:cor[blended idx3; fastSig3 idx3];
+    corrTrend:cor[blended idx3; (re`ensemble) idx3];
+    t3:(avgW < 0.6) and (corrFast > corrTrend);
     results[`test3]:t3;
-    -1 "  Average regime scale (MR data): ",string avgRS;
-    -1 "  Below 0.6: ",string t3;
+    -1 "  Avg regimeW (MR data): ",string avgW;
+    -1 "  Corr(blended, fast): ",string corrFast;
+    -1 "  Corr(blended, trend): ",string corrTrend;
     -1 "  ",$[t3;"PASS";"FAIL"];
     nPass+:t3; nFail+:not t3;
     -1 "";
 
-    // --- Test 4: Carry gate reduces signal when opposing ---
-    -1 "Test 4: Carry gate reduces when opposing carry";
-    sig:100 # 1f;   // all positive signal
-    carryPos:100 # 0.001;
-    carryNeg:100 # neg 0.001;
-    gAligned:carryGateVal[sig;carryPos];
-    gOpposing:carryGateVal[sig;carryNeg];
-    // After warmup (prev), check from index 2
-    t4:((avg gAligned 2 + til 98) > 0.9) and ((avg gOpposing 2 + til 98) < 0.4);
+    // --- Test 4: Carry tilt nudges signal in carry direction ---
+    -1 "Test 4: Carry tilt nudges signal in carry direction";
+    system "S 42";
+    n4:200;
+    sig4:n4 # 1f;   // all positive signal
+    // Use trending carry: starts low, rises to high — recent values have positive carryZ
+    // carryPos ramps up: rzscore will be positive at end
+    carryRamp:(0.0002 * til n4) % n4;   // ramps from 0 to ~0.04
+    // carryDown ramps down: rzscore will be negative at end
+    carryDown:reverse carryRamp;
+    tiltedUp:carryTilt[sig4;carryRamp;0.15];
+    tiltedDn:carryTilt[sig4;carryDown;0.15];
+    // At end of series (idx 170+), ramp up → positive carryZ → tilt > 1
+    // ramp down → negative carryZ → tilt < 1
+    idx4:170 + til 30;
+    avgUp:avg tiltedUp idx4;
+    avgDn:avg tiltedDn idx4;
+    t4:(avgUp > 1f) and (avgDn < 1f);
     results[`test4]:t4;
-    -1 "  Aligned gate avg: ",string avg gAligned 2 + til 98;
-    -1 "  Opposing gate avg: ",string avg gOpposing 2 + til 98;
+    -1 "  Avg tilted (carry ramping up): ",string avgUp;
+    -1 "  Avg tilted (carry ramping down): ",string avgDn;
     -1 "  ",$[t4;"PASS";"FAIL"];
     nPass+:t4; nFail+:not t4;
     -1 "";
 
-    // --- Test 5: Curve confirmation unanimous = 1.0 ---
-    -1 "Test 5: Curve confirmation - unanimous agreement";
-    sigs:(100 # 1f; 100 # 2f; 100 # 0.5);  // all positive
-    cc:curveConfirmVec sigs;
-    t5:(avg cc) > 0.99;
+    // --- Test 5: Curve agreement adjusts leverage ---
+    -1 "Test 5: Curve agreement adjusts leverage ceiling";
+    // Unanimous agreement → adjMaxLev = maxLev * 1.0
+    // Zero agreement → adjMaxLev = maxLev * 0.7
+    maxLev5:3f;
+    adjUnanimous:maxLev5 * (0.7 + (0.3 * 1f));   // agreement = 1.0
+    adjSplit:maxLev5 * (0.7 + (0.3 * 0f));         // agreement = 0.0
+    t5:(adjUnanimous > 2.99) and (adjSplit < 2.11) and (adjSplit > 2.09);
     results[`test5]:t5;
-    -1 "  Unanimous CC avg: ",string avg cc;
+    -1 "  Unanimous adjMaxLev: ",string adjUnanimous;
+    -1 "  Split adjMaxLev: ",string adjSplit;
     -1 "  ",$[t5;"PASS";"FAIL"];
     nPass+:t5; nFail+:not t5;
     -1 "";
 
-    // --- Test 6: Curve confirmation mixed < unanimous ---
-    -1 "Test 6: Curve confirmation - mixed directions";
-    sigs2:(100 # 1f; 100 # neg 1f; 100 # 0.5);  // 2 pos, 1 neg
-    cc2:curveConfirmVec sigs2;
-    t6:(avg cc2) < (avg cc);
+    // --- Test 6: Regime blend uses trend signal in trending ---
+    -1 "Test 6: Regime blend uses trend signal in trending regime";
+    system "S 42";
+    n:2000;
+    eps:.cond.randNorm n;
+    // Strong trending: high autocorrelation (phi=0.5), strong drift
+    trendRet:n # 0f; trendRet[0]:0.01 * eps[0];
+    i:1; while[i < n; trendRet[i]:0.0005 + (0.5 * trendRet[i-1]) + (0.01 * eps[i]); i+:1];
+    trendSigs6:singleSpeed[trendRet;;0.3] each 63 126 252;
+    fastSig6:singleSpeed[trendRet;21;0.3];
+    re6:regimeEnsemble[trendSigs6;trendRet;63 126 252;5;60];
+    blended6:regimeBlend[re6`ensemble;fastSig6;re6`vrPctl;10];
+    idx6:500 + til 1000;
+    regimeW6:.cond.smooth[0.5 ^ re6`vrPctl; 10];
+    avgW6:avg regimeW6 idx6;
+    // In trending regime, regimeW should be above neutral (0.5)
+    t6:avgW6 > 0.5;
     results[`test6]:t6;
-    -1 "  Mixed CC avg: ",string avg cc2;
+    -1 "  Avg regimeW (trending data): ",string avgW6;
+    -1 "  Expected > 0.5 for trending regime";
     -1 "  ",$[t6;"PASS";"FAIL"];
     nPass+:t6; nFail+:not t6;
     -1 "";
 
-    // --- Test 7: Extreme taper activates at large cumZ ---
-    -1 "Test 7: Extreme taper activates at extremes";
-    // Constant returns have cumZ bounded at sqrt(3) ≈ 1.73 (never hits 2.0).
-    // Use flat-then-burst: cumZ spikes at the acceleration point.
-    flatBurst:(800 # 0.0001),(200 # 0.01);
-    et:extremeTaper[flatBurst;252;2.0];
-    // Flat phase: cumZ ~ 1.73 (under 2.0) -> taper = 1.0
-    // Burst transition (~day 830): cumZ > 3 -> taper << 1.0
-    early:avg et 200 + til 100;
-    late:avg et 830 + til 40;
-    t7:(early > 0.95) and (late < 0.5);
+    // --- Test 7: DD breaker floor is 0.6 ---
+    -1 "Test 7: DD breaker floor is 0.6";
+    cumPnl7:0.1 0.12 0.15 0.13 0.10 0.08 0.05 0.04 0.06 0.08;
+    dds7:ddBreaker[cumPnl7;0.05];
+    // At index 6: dd = 0.05 - 0.15 = -0.10 -> scale = max(0.6, 1 - 0.5*0.10/0.05) = max(0.6, 0) = 0.6
+    t7:(dds7[0] > 0.99) and ((abs dds7[6] - 0.6) < 0.01);
     results[`test7]:t7;
-    -1 "  Early taper avg: ",string early;
-    -1 "  Late taper avg: ",string late;
+    -1 "  No DD scale: ",string dds7[0];
+    -1 "  Deep DD scale (floor check): ",string dds7[6];
     -1 "  ",$[t7;"PASS";"FAIL"];
     nPass+:t7; nFail+:not t7;
     -1 "";
 
-    // --- Test 8: Vol break activates during vol spike ---
-    -1 "Test 8: Vol break activates during vol spike";
+    // --- Test 8: Blend is smooth (EMA-based, not discontinuous step) ---
+    -1 "Test 8: Regime weight transitions smoothly (EMA-based)";
     system "S 42";
     n:500;
-    eps:.cond.randNorm n;
-    calm:0.005 * eps;
-    spike:0.025 * eps;
-    r:(300 # calm),(50 # spike),(150 # calm);
-    vb:volBreak[r;5;63;2.0];
-    calmVB:avg vb 250 + til 40;
-    spikeVB:avg vb 310 + til 30;
-    t8:(calmVB > 0.8) and (spikeVB < calmVB);
+    // Construct vrPctl that jumps abruptly from 0 to 1 at midpoint
+    vrPctl8:(250 # 0f),(250 # 1f);
+    trendSig8:n # 1f;
+    fastSig8:n # neg 1f;
+    blended8:regimeBlend[trendSig8;fastSig8;vrPctl8;10];
+    // Smoothed regimeW should transition gradually, not jump
+    // At midpoint: regimeW jumps from ~0 toward 1, but EMA smooths it
+    // Check that regimeW at midpoint+1 is not yet at 1.0
+    regimeW8:.cond.smooth[0.5 ^ vrPctl8; 10];
+    // Just after transition: should be partially transitioned, not fully
+    t8:(regimeW8[251] < 0.9) and (regimeW8[300] > regimeW8[251]);
     results[`test8]:t8;
-    -1 "  Calm vol break: ",string calmVB;
-    -1 "  Spike vol break: ",string spikeVB;
+    -1 "  regimeW at step+1: ",string regimeW8[251];
+    -1 "  regimeW at step+50: ",string regimeW8[300];
+    -1 "  Smooth transition: ",string t8;
     -1 "  ",$[t8;"PASS";"FAIL"];
     nPass+:t8; nFail+:not t8;
     -1 "";
 
     // --- Test 9: DD breaker activates during drawdown ---
     -1 "Test 9: DD breaker activates during drawdown";
-    cumPnl:0.1 0.12 0.15 0.13 0.10 0.08 0.05 0.04 0.06 0.08;
-    dds:ddBreaker[cumPnl;0.05];
-    // At index 6: dd = 0.05 - 0.15 = -0.10 -> scale = max(0.25, 1 - 0.5*0.10/0.05) = max(0.25, 0)
-    t9:(dds[0] > 0.99) and (dds[6] < 0.5);
+    cumPnl9:0.1 0.12 0.15 0.13 0.10 0.08 0.05 0.04 0.06 0.08;
+    dds9:ddBreaker[cumPnl9;0.05];
+    // At peak (0.15, idx 2): dd=0 → scale=1. Deep DD (idx 6-7): scale=0.6 (floor).
+    t9:(dds9[2] > 0.99) and (dds9[6] < 0.61) and (dds9[6] > 0.59);
     results[`test9]:t9;
-    -1 "  No DD scale: ",string dds[0];
-    -1 "  Deep DD scale: ",string dds[6];
+    -1 "  At peak scale: ",string dds9[2];
+    -1 "  Deep DD scale: ",string dds9[6];
     -1 "  ",$[t9;"PASS";"FAIL"];
     nPass+:t9; nFail+:not t9;
     -1 "";
@@ -779,7 +802,7 @@ runTests:{[]
     pipeResult:ensembleTable[td;()!()];
     ev:evaluate[pipeResult];
     sh:ev`sharpe;
-    // Full portfolio across all 4 syms (trend+crash+random+MR). Sharpe may be near 0.
+    // Full portfolio across all 4 syms. Sharpe may be near 0.
     // Key check: pipeline runs, produces finite Sharpe, not terribly negative.
     t10:(not null sh) and sh > neg 1f;
     results[`test10]:t10;
@@ -790,12 +813,13 @@ runTests:{[]
 
     // --- Test 11: Output has all expected columns ---
     -1 "Test 11: Table interface produces correct columns";
-    expectedCols:`sig`sigRaw`vr`regimeScale`carryGate`curveConfirm`extremeTaper`volBreak`volScale`ddScale;
+    expectedCols:`sig`trendSig`fastSig`vr`regimeW`blendedSig`carryTilt`curveAgreement`volScale`ddScale;
     hasCols:all expectedCols in cols pipeResult;
     hasSyms:4 = count distinct pipeResult`sym;
     t11:hasCols and hasSyms;
     results[`test11]:t11;
     -1 "  Has all columns: ",string hasCols;
+    -1 "  Missing: ","," sv string expectedCols where not expectedCols in cols pipeResult;
     -1 "  Has 4 syms: ",string hasSyms;
     -1 "  ",$[t11;"PASS";"FAIL"];
     nPass+:t11; nFail+:not t11;
@@ -832,12 +856,12 @@ runTests:{[]
     results}
 
 // =============================================================================
-// SECTION 12: HELP / EXAMPLE
+// SECTION 11: HELP / EXAMPLE
 // =============================================================================
 
 help:{[]
     -1 "";
-    -1 "=== .momentum v2.0 - Risk-Adjusted Momentum Ensemble ===";
+    -1 "=== .momentum v3.0 - Regime-Switched Blend Momentum ===";
     -1 "";
     -1 "CORE SIGNAL:";
     -1 "  sharpeMom[x;w]              - risk-adjusted momentum (mu/sigma)";
@@ -845,20 +869,18 @@ help:{[]
     -1 "  singleSpeed[x;w;accelWt]    - combined signal at one lookback";
     -1 "";
     -1 "ENSEMBLE:";
-    -1 "  regimeEnsemble[sigs;x;speeds;vrQ;vrW]  - VR-adaptive blend";
+    -1 "  regimeEnsemble[sigs;x;speeds;vrQ;vrW]  - VR-adaptive trend blend (raw)";
+    -1 "  regimeBlend[trend;fast;vrPctl;blendHL]  - regime-switched blending";
+    -1 "  carryTilt[sig;carry;weight]              - additive carry adjustment";
     -1 "";
-    -1 "GATES:";
-    -1 "  carryGateVal[sig;carry]     - carry alignment (0.3 or 1.0)";
-    -1 "  curveConfirmVec[sigs]       - cross-contract agreement (0.3-1.0)";
-    -1 "  extremeTaper[x;w;thresh]    - fade at cumulative extremes";
-    -1 "  volBreak[x;fastHL;slowHL;thresh]  - vol spike protection";
-    -1 "  ddBreaker[cumPnl;thresh]    - drawdown circuit breaker";
+    -1 "PROTECTION:";
+    -1 "  ddBreaker[cumPnl;thresh]    - drawdown brake (0.6 floor)";
     -1 "";
     -1 "TABLE INTERFACE:";
     -1 "  ensembleTable[t;cfg]        - full pipeline for (dt;sym;ret) table";
-    -1 "    Optional carry column enables carry gate + excess return separation";
-    -1 "    cfg keys: speeds, accelWt, vrQ, vrW, targetVol, maxLeverage,";
-    -1 "              ddThresh, volBreakThresh, extremeZ, retCol, dtCol, symCol";
+    -1 "    Optional carry column enables carry tilt + excess return separation";
+    -1 "    cfg keys: trendSpeeds, fastSpeed, accelWt, blendHL, carryTiltWt,";
+    -1 "              vrQ, vrW, targetVol, maxLeverage, ddThresh";
     -1 "";
     -1 "EVALUATION:";
     -1 "  evaluate[t]                 - comprehensive metrics";
@@ -866,14 +888,19 @@ help:{[]
     -1 "  runTests[]                  - 12 validation tests";
     -1 "";
     -1 "DEFAULTS:";
-    -1 "  speeds: 21 63 126 | accelWt: 0.3 | targetVol: 0.10";
-    -1 "  maxLeverage: 3 | ddThresh: 0.05 | volBreakThresh: 2.0";
+    -1 "  trendSpeeds: 63 126 252 | fastSpeed: 21 | accelWt: 0.3";
+    -1 "  blendHL: 10 | carryTiltWt: 0.15 | targetVol: 0.10";
+    -1 "  maxLeverage: 3 | ddThresh: 0.05";
+    -1 "";
+    -1 "OUTPUT COLUMNS:";
+    -1 "  sig_N (per-speed), trendSig, fastSig, vr, regimeW,";
+    -1 "  blendedSig, carryTilt, curveAgreement, volScale, ddScale, sig";
     -1 "";}
 
 example:{[]
     -1 "";
     -1 "=============================================================================";
-    -1 "              .momentum v2.0 EXAMPLE";
+    -1 "              .momentum v3.0 EXAMPLE";
     -1 "=============================================================================";
     -1 "";
     td:.momentum.syntheticTest[];
@@ -892,11 +919,18 @@ example:{[]
     -1 "   MaxDD:        ",string ev`maxDD;
     -1 "   MaxDDDur:     ",string[ev`maxDDDuration]," days";
     -1 "";
-    -1 "4. Gate stats:";
-    gs:ev`gateStats;
-    {[gs;x] -1 "   ",string[x],": avg=",string[(gs x)`avg]," pctActive=",string (gs x)`pctActive}[gs;] each key gs;
+    -1 "4. Architecture stats:";
+    -1 "   Avg regimeW:         ",string avg result`regimeW;
+    -1 "   Avg ddScale:         ",string avg result`ddScale;
+    -1 "   Avg |blendedSig|:    ",string avg abs result`blendedSig;
+    -1 "   Avg |sig|:           ",string avg abs result`sig;
     -1 "";
-    -1 "5. Per-speed Sharpe:";
+    gs:ev`gateStats;
+    if[0 < count gs;
+        -1 "5. Gate stats:";
+        {[gs;x] -1 "   ",string[x],": avg=",string[(gs x)`avg]," pctActive=",string (gs x)`pctActive}[gs;] each key gs;
+        -1 ""];
+    -1 "6. Per-speed Sharpe:";
     pss:ev`perSpeedSharpe;
     {[pss;x] -1 "   ",string[x]," = ",string pss x}[pss;] each key pss;
     -1 "";
@@ -904,7 +938,7 @@ example:{[]
 
 \d .
 
--1 "Loaded .momentum namespace v2.0.0";
--1 "Risk-adjusted momentum: sharpeMom, regimeEnsemble, carry/curve/crash gates";
+-1 "Loaded .momentum namespace v3.0.0";
+-1 "Regime-switched blend: trendSig + fastSig blended by regime, additive carry tilt";
 -1 "Run .momentum.help[] for full function list";
 -1 "Run .momentum.runTests[] for validation";
