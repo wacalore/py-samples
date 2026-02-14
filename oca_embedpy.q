@@ -164,6 +164,22 @@ normalize_cfg:{[cfg]
   $[cfg~(::); ()!(); cfg]
  }
 
+cfg_to_dict:{[cfg]
+  c0:$[cfg~(::); ()!(); cfg];
+  t:type c0;
+  if[t=99h;
+    if[98h=type key c0; :()!()];
+    :c0
+  ];
+  if[t=20h;
+    k:.oca.to_sym key c0;
+    v:value c0;
+    vv:$[(type v)>0h and (count v)=1; first v; v];
+    :(enlist k)!enlist vv
+  ];
+  ()!()
+ }
+
 to_sym:{[x]
   t:type x;
   $[t=-11h; x;
@@ -1318,9 +1334,49 @@ alpha_assign_group_subtype:{[attrib; corrHi; concHi; minSubtype]
   out
  }
 
+alpha_ensure_min_subtypes:{[attrib; minDistinct]
+  out:attrib;
+  tgt:max 0, `int$minDistinct;
+  if[tgt<=0; :out];
+  n:count out;
+  if[n<=1; :out];
+  tgt:min tgt,n;
+  dcnt:count distinct out`alpha_subtype;
+  while[dcnt<tgt;
+    g:group out`alpha_subtype;
+    ks:key g;
+    vix:value g;
+    ns:count each vix;
+    spl:where ns>1;
+    if[0=count spl; :out];
+    candN:ns spl;
+    ord:idesc candN;
+    best:spl first ord;
+    base:ks best;
+    idxs:vix best;
+    cs:`float$(out`corr_total) idxs;
+    hasC:sum not null cs;
+    ordLocal:$[hasC>1; idxs @ iasc cs; idxs @ iasc (`float$(out`sum_pnl) idxs)];
+    mcnt:count ordLocal;
+    if[mcnt<2; :out];
+    splitN:mcnt div 2;
+    iA:splitN#ordLocal;
+    iB:(mcnt-splitN)#splitN _ ordLocal;
+    if[(count iA)=0 or (count iB)=0; :out];
+    sA:`$raze (string base;"_a");
+    sB:`$raze (string base;"_b");
+    out:update alpha_subtype:@[alpha_subtype; iA; :; (count iA)#sA] from out;
+    out:update alpha_subtype:@[alpha_subtype; iB; :; (count iB)#sB] from out;
+    dcnt:count distinct out`alpha_subtype;
+  ];
+  out
+ }
+
 alpha_monthly_status:{[alphaLong; attrib]
   am:update month:`month$date from alphaLong;
-  m:0!select n_days:count i, month_pnl:sum pnl, win_rate:avg pnl>0f by strategy,month from am;
+  m:0!select n_days:count i, month_pnl:sum pnl, avg_day_pnl:avg pnl, pnl_stdev:dev pnl, win_rate:avg pnl>0f by strategy,month from am;
+  m:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f) from m;
+  m:update fragile_edge:fragility_ratio<0.25f from m;
   m:m lj `strategy xkey (select strategy,alpha_group,alpha_subtype,status from attrib);
   ms:(count m)#`flat;
   ip:where (m`month_pnl)>0f;
@@ -1336,6 +1392,42 @@ alpha_monthly_status:{[alphaLong; attrib]
   )
  }
 
+subtype_behavior_enrich:{[st]
+  if[0=count st; :st];
+  lbl:`symbol$();
+  txt:`symbol$();
+  i:0;
+  while[i<count st;
+    p:(st`subtype_pnl) i;
+    wr:(st`avg_win_rate) i;
+    tc:(st`avg_topn_conc) i;
+    cr:(st`avg_corr_total) i;
+    fs:(st`fragile_share) i;
+    b:$[
+      (p>=0f) and (tc>=0.6) and (wr<0.55); `event_driven_convex;
+      (p<0f) and (tc>=0.6); `event_driven_drag;
+      (p>0f) and (wr>=0.55) and (tc<0.5) and (fs<0.6); `steady_carry_trend;
+      (p<0f) and (cr<0f); `diversifying_cost;
+      (p<0f) and (cr>=0f); `structural_drag;
+      fs>=0.7; `fragile_mixed;
+      `mixed
+    ];
+    t:$[
+      b=`event_driven_convex; "Event-driven: gains come from a small number of outsized upside days; hit-rate can be low while convexity is positive.";
+      b=`event_driven_drag; "Event-driven drag: losses are concentrated in a small number of outsized downside days.";
+      b=`steady_carry_trend; "Steady edge: more frequent smaller wins, lower tail concentration, and more stable day-to-day drift.";
+      b=`diversifying_cost; "Diversifying cost: standalone pnl is negative but correlation to portfolio is negative, so it can hedge stress.";
+      b=`structural_drag; "Structural drag: negative pnl with positive/neutral correlation, so it tends to lose with the book.";
+      b=`fragile_mixed; "Fragile mixed profile: average edge is small versus realized volatility, so outcomes are noisy and unstable.";
+      "Mixed profile: no single regime dominates behavior."
+    ];
+    lbl,:enlist b;
+    txt,:enlist `$t;
+    i+:1;
+  ];
+  update behavior_label:lbl, behavior_text:txt from st
+ }
+
 / Explain good/bad performance drivers for a returns stream.
 / Inputs:
 /   rets: table containing at least `date`pnl (optionally `strategy)
@@ -1348,12 +1440,7 @@ alpha_monthly_status:{[alphaLong; attrib]
 atm_strategy_performance_explain:{[rets; cfg]
   t:.oca.to_table rets;
   if[98h<>type t; '"returns input must be a table"];
-  c0:$[cfg~(::); ()!(); cfg];
-  c:$[
-    99h=type c0;
-    $[98h=type key c0; ()!(); c0];
-    ()!()
-  ];
+  c:.oca.cfg_to_dict cfg;
   req:`date`pnl;
   if[not all req in cols t; '"returns table missing required columns (`date`pnl)"];
 
@@ -1452,6 +1539,7 @@ atm_strategy_performance_explain:{[rets; cfg]
     worst_day:min day_pnl
     by strategy from daily_path;
   summary:update sharpe:(sqrt 252f) * avg_day_pnl % (pnl_stdev | 1e-12f) from summary;
+  summary:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f), fragile_edge:(abs avg_day_pnl) < 0.25f * (pnl_stdev | 1e-12f) from summary;
 
   dd:0!select max_drawdown:min drawdown, max_dd_date:first date where drawdown=min drawdown by strategy from daily_path;
   summary:summary lj `strategy xkey dd;
@@ -1475,7 +1563,9 @@ atm_strategy_performance_explain:{[rets; cfg]
   summary:summary lj `strategy xkey conc;
 
   dm:update month:`month$date from daily_path;
-  monthly:0!select n_days:count i, month_pnl:sum day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
+  monthly:0!select n_days:count i, month_pnl:sum day_pnl, avg_day_pnl:avg day_pnl, pnl_stdev:dev day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
+  monthly:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f) from monthly;
+  monthly:update fragile_edge:fragility_ratio<0.25f from monthly;
   monthly:monthly @ iasc monthly`strategy`month;
 
   top_days:tn#(daily_path @ reverse iasc daily_path`day_pnl);
@@ -1598,10 +1688,11 @@ atm_strategy_performance_explain:{[rets; cfg]
     narrNegSp,:enlist negSp;
     i+:1;
   ];
+  reasonSym:{[x] `$raze x} each narrReason;
   narrative:flip `strategy`diagnosis`reason`top_driver_pos`top_driver_pos_spread`top_driver_neg`top_driver_neg_spread!(
     svals;
     narrDiag;
-    narrReason;
+    reasonSym;
     narrPosDrv;
     narrPosSp;
     narrNegDrv;
@@ -1623,19 +1714,16 @@ atm_strategy_performance_explain:{[rets; cfg]
 /   `top_n (default 10)
 /   `group_corr_hi (default 0.2)
 /   `group_conc_hi (default 0.6)
-/   `min_subtype_size (default 2; subtype buckets smaller than this fold into `other)
+/   `min_subtype_members (default 2; subtype buckets smaller than this fold into `other)
+/   `min_subtypes (default 0; enforce at least this many distinct subtype buckets when possible)
+/   `min_subtype_size (deprecated alias for `min_subtypes)
 /   `drivers_tbl, `driver_cols (passed through to atm_strategy_performance_explain)
 alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   aw:.oca.to_table alpha_wide;
   tt:.oca.to_table total_tbl;
   if[98h<>type aw; '"alpha_wide must be a table"];
   if[98h<>type tt; '"total_tbl must be a table"];
-  c0:$[cfg~(::); ()!(); cfg];
-  c:$[
-    99h=type c0;
-    $[98h=type key c0; ()!(); c0];
-    ()!()
-  ];
+  c:.oca.cfg_to_dict cfg;
 
   / Resolve date columns
   dcol_aw:$[
@@ -1813,15 +1901,22 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   ];
 
   as:alphaExp`summary;
-  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc from as;
+  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc,avg_day_pnl,pnl_stdev,fragility_ratio,fragile_edge from as;
   attrib:attrib lj `strategy xkey as;
 
   / Auto grouping
   corrHi:$[`group_corr_hi in key c; 1f*c`group_corr_hi; 0.2f];
   concHi:$[`group_conc_hi in key c; 1f*c`group_conc_hi; 0.6f];
-  minSubtype:$[`min_subtype_size in key c; c`min_subtype_size; 2];
-  minSubtype:max 1, `int$minSubtype;
-  attrib:.oca.alpha_assign_group_subtype[attrib; corrHi; concHi; minSubtype];
+  minMembers:$[`min_subtype_members in key c; c`min_subtype_members; 2];
+  minMembers:max 1, `int$minMembers;
+  minDistinct:$[
+    `min_subtypes in key c; c`min_subtypes;
+    `min_subtype_size in key c; c`min_subtype_size;
+    0
+  ];
+  minDistinct:max 0, `int$minDistinct;
+  attrib:.oca.alpha_assign_group_subtype[attrib; corrHi; concHi; minMembers];
+  attrib:.oca.alpha_ensure_min_subtypes[attrib; minDistinct];
   attrib:attrib @ reverse iasc attrib`sum_pnl;
 
   groupSummary:0!select
@@ -1835,15 +1930,22 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     n_alpha:count i,
     subtype_pnl:sum sum_pnl,
     subtype_abs_pnl:sum abs sum_pnl,
-    avg_corr_total:avg corr_total
+    avg_corr_total:avg corr_total,
+    avg_win_rate:avg win_rate,
+    avg_topn_conc:avg topn_pnl_conc,
+    fragile_share:avg fragile_edge,
+    avg_fragility_ratio:avg fragility_ratio
     by alpha_subtype from attrib;
   subtypeSummary:subtypeSummary @ reverse iasc subtypeSummary`subtype_pnl;
+  subtypeSummary:.oca.subtype_behavior_enrich subtypeSummary;
 
   work:attrib where (attrib`sum_pnl)>0f;
   work:tn#work;
   drag:attrib where (attrib`sum_pnl)<0f;
   drag:tn#(drag @ iasc drag`sum_pnl);
   mres:.oca.alpha_monthly_status[alphaLong; attrib];
+  monthlyFrag:0!select n_alpha:count i, month_pnl:sum month_pnl, avg_fragility_ratio:avg fragility_ratio, fragile_share:avg fragile_edge by month from mres`alpha_monthly;
+  monthlyFrag:monthlyFrag @ iasc monthlyFrag`month;
 
   / High-level narrative
   psTbl:portExp`summary;
@@ -1857,12 +1959,17 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   topP:$[0=count work; 0n; first work`sum_pnl];
   badA:$[0=count drag; `; first drag`strategy];
   badP:$[0=count drag; 0n; first drag`sum_pnl];
-  h1:$[hasPs; raze ("Portfolio pnl ",string pTot," over ",string pN," days (win rate ",string pWr,")."); "No portfolio summary rows."];
-  h2:raze (string posN," alphas are working (positive pnl) and ",string negN," are not across ",string count distinct attrib`alpha_subtype," subtypes.");
-  h3:raze ("Top contributor: ",string topA," (",string topP,"). Largest drag: ",string badA," (",string badP,").");
-  narrative:([] section:`headline`breadth`leaders; text:(h1;h2;h3));
+  h1:$[
+    hasPs;
+    raze ("Portfolio pnl "; string pTot; " over "; string pN; " days (win rate "; string pWr; ").");
+    "No portfolio summary rows."
+  ];
+  h2:raze (string posN; " alphas are working (positive pnl) and "; string negN; " are not across "; string count distinct attrib`alpha_subtype; " subtypes.");
+  h3:raze ("Top contributor: "; string topA; " ("; string topP; "). Largest drag: "; string badA; " ("; string badP; ").");
+  ntext:`$ (h1;h2;h3);
+  narrative:([] section:`headline`breadth`leaders; text:ntext);
 
-  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`narrative)!(
+  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`monthly_edge_fragility`narrative)!(
     portExp`summary;
     portExp`flags;
     portExp`narrative;
@@ -1878,6 +1985,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     mres`alpha_monthly;
     mres`working_monthly;
     mres`not_working_monthly;
+    monthlyFrag;
     narrative
   )
  }
