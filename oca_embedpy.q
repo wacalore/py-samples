@@ -1375,8 +1375,11 @@ alpha_ensure_min_subtypes:{[attrib; minDistinct]
 alpha_monthly_status:{[alphaLong; attrib]
   am:update month:`month$date from alphaLong;
   m:0!select n_days:count i, month_pnl:sum pnl, avg_day_pnl:avg pnl, pnl_stdev:dev pnl, win_rate:avg pnl>0f by strategy,month from am;
-  m:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f) from m;
-  m:update fragile_edge:fragility_ratio<0.25f from m;
+  mstats:0!select monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from m;
+  mstats:update monthly_sharpe:(sqrt 12f) * monthly_avg_pnl % (1e-12f + 0f^monthly_pnl_stdev) from mstats;
+  mstats:update fragility_ratio:(abs monthly_avg_pnl) % (1e-12f + 0f^monthly_pnl_stdev) from mstats;
+  mstats:update fragile_edge:fragility_ratio<0.25f from mstats;
+  m:m lj `strategy xkey mstats;
   m:m lj `strategy xkey (select strategy,alpha_group,alpha_subtype,status from attrib);
   ms:(count m)#`flat;
   ip:where (m`month_pnl)>0f;
@@ -1428,15 +1431,53 @@ subtype_behavior_enrich:{[st]
   update behavior_label:lbl, behavior_text:txt from st
  }
 
+edge_tail_recheck:{[daily_path; svals; trimN]
+  rows:();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    sub:daily_path where (daily_path`strategy)=s1;
+    sub:sub @ iasc sub`date;
+    n:count sub;
+    k:min trimN, max 0, (n-1) div 2;
+    idx:til n;
+    ordUp:reverse iasc sub`day_pnl;
+    ordDn:iasc sub`day_pnl;
+    dropIdx:distinct (k#ordUp),(k#ordDn);
+    keepIdx:idx where not idx in dropIdx;
+    kept:sub keepIdx;
+    nk:count kept;
+    ttot:sum kept`day_pnl;
+    tavg:$[nk=0; 0n; avg kept`day_pnl];
+    tstd:$[nk<2; 0n; dev kept`day_pnl];
+    tsh:(sqrt 252f) * tavg % (tstd | 1e-12f);
+    tfrag:(abs tavg) % (tstd | 1e-12f);
+    tfragF:tfrag<0.25f;
+    twr:$[nk=0; 0n; avg (kept`day_pnl)>0f];
+    oavg:$[n=0; 0n; avg sub`day_pnl];
+    ret:$[(null oavg) or ((abs oavg)<=1e-12f); 0n; (abs tavg) % (abs oavg)];
+    dec:$[null ret; 0n; 1f-ret];
+    dec:1f & (0f | dec);
+    rows,:enlist ([] strategy:enlist s1; trim_n:enlist k; n_days:enlist n; trimmed_n_days:enlist nk; dropped_days:enlist n-nk; dropped_frac:enlist $[n=0; 0n; 1f*(n-nk)%n]; trimmed_total_pnl:enlist ttot; trimmed_avg_day_pnl:enlist tavg; trimmed_pnl_stdev:enlist tstd; trimmed_sharpe:enlist tsh; trimmed_fragility_ratio:enlist tfrag; trimmed_fragile_edge:enlist tfragF; trimmed_win_rate:enlist twr; edge_retention:enlist ret; edge_decay_pct:enlist dec);
+    i+:1;
+  ];
+  $[
+    0=count rows;
+    ([] strategy:`symbol$(); trim_n:`int$(); n_days:`int$(); trimmed_n_days:`int$(); dropped_days:`int$(); dropped_frac:`float$(); trimmed_total_pnl:`float$(); trimmed_avg_day_pnl:`float$(); trimmed_pnl_stdev:`float$(); trimmed_sharpe:`float$(); trimmed_fragility_ratio:`float$(); trimmed_fragile_edge:`boolean$(); trimmed_win_rate:`float$(); edge_retention:`float$(); edge_decay_pct:`float$());
+    raze rows
+  ]
+ }
+
 / Explain good/bad performance drivers for a returns stream.
 / Inputs:
 /   rets: table containing at least `date`pnl (optionally `strategy)
 /   cfg keys (all optional):
 /     `top_n (default 10) number of top/worst days used in concentration metrics
+/     `event_trim_n (default top_n) symmetric tail days removed on each side for edge re-check
 /     `driver_cols (symbol or symbol list) numeric columns to attribute performance to
 /     `drivers_tbl (table keyed by `date with extra daily drivers to join onto `rets)
 / Returns dict:
-/   `summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative
+/   `summary`daily`monthly`top_days`worst_days`edge_recheck`driver_effects`flags`narrative
 atm_strategy_performance_explain:{[rets; cfg]
   t:.oca.to_table rets;
   if[98h<>type t; '"returns input must be a table"];
@@ -1446,7 +1487,7 @@ atm_strategy_performance_explain:{[rets; cfg]
 
   if[0=count t;
     e:([]);
-    :(`summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative)!(e;e;e;e;e;e;e;e);
+    :(`summary`daily`monthly`top_days`worst_days`edge_recheck`driver_effects`flags`narrative)!(e;e;e;e;e;e;e;e;e);
   ];
 
   dty:abs type t`date;
@@ -1469,6 +1510,8 @@ atm_strategy_performance_explain:{[rets; cfg]
 
   tn:$[`top_n in key c; c`top_n; 10];
   tn:max 1, `int$tn;
+  trimN:$[`event_trim_n in key c; c`event_trim_n; tn];
+  trimN:max 0, `int$trimN;
 
   drv_raw:$[`driver_cols in key c; c`driver_cols; `symbol$()];
   dty_drv:type drv_raw;
@@ -1538,8 +1581,13 @@ atm_strategy_performance_explain:{[rets; cfg]
     best_day:max day_pnl,
     worst_day:min day_pnl
     by strategy from daily_path;
-  summary:update sharpe:(sqrt 252f) * avg_day_pnl % (pnl_stdev | 1e-12f) from summary;
-  summary:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f), fragile_edge:(abs avg_day_pnl) < 0.25f * (pnl_stdev | 1e-12f) from summary;
+  / Active-day stats: sharpe/fragility should be computed on non-zero pnl days only.
+  ad:daily_path where (abs daily_path`day_pnl)>1e-12f;
+  aStats:0!select active_n_days:count i, active_avg_day_pnl:avg day_pnl, active_pnl_stdev:dev day_pnl by strategy from ad;
+  summary:summary lj `strategy xkey aStats;
+  summary:update sharpe:(sqrt 252f) * active_avg_day_pnl % (1e-12f + 0f^active_pnl_stdev) from summary;
+  summary:update fragility_ratio:(abs active_avg_day_pnl) % (1e-12f + 0f^active_pnl_stdev) from summary;
+  summary:update fragile_edge:fragility_ratio<0.25f from summary;
 
   dd:0!select max_drawdown:min drawdown, max_dd_date:first date where drawdown=min drawdown by strategy from daily_path;
   summary:summary lj `strategy xkey dd;
@@ -1562,10 +1610,26 @@ atm_strategy_performance_explain:{[rets; cfg]
   conc:$[0=count concRows; ([] strategy:`symbol$(); topn_pnl_conc:`float$(); worstn_abs_pnl_conc:`float$()); raze concRows];
   summary:summary lj `strategy xkey conc;
 
+  edgeRe:.oca.edge_tail_recheck[daily_path; svals; trimN];
+  summary:summary lj `strategy xkey edgeRe;
+  concScore:1f & abs 0f^summary`topn_pnl_conc;
+  fragBase:0f^summary`fragility_ratio;
+  fragScore:1f & (0f | (0.25f-fragBase) % 0.25f);
+  trimScore:1f & (0f | 0f^summary`edge_decay_pct);
+  ofr:100f * (0.35f*concScore + 0.30f*fragScore + 0.35f*trimScore);
+  ofb:{[x] $[x>=70f; `high; x>=40f; `medium; `low]} each ofr;
+  summary:update overfit_risk_score:ofr, overfit_risk_bucket:ofb from summary;
+  edgeRe:edgeRe lj `strategy xkey (select strategy,overfit_risk_score,overfit_risk_bucket from summary);
+
   dm:update month:`month$date from daily_path;
   monthly:0!select n_days:count i, month_pnl:sum day_pnl, avg_day_pnl:avg day_pnl, pnl_stdev:dev day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
-  monthly:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f) from monthly;
-  monthly:update fragile_edge:fragility_ratio<0.25f from monthly;
+  / Monthly fragility is computed from the strategy monthly return series (not within-month daily dispersion).
+  mStats:0!select monthly_n_months:count i, monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from monthly;
+  mStats:update monthly_sharpe:(sqrt 12f) * monthly_avg_pnl % (1e-12f + 0f^monthly_pnl_stdev) from mStats;
+  mStats:update monthly_fragility_ratio:(abs monthly_avg_pnl) % (1e-12f + 0f^monthly_pnl_stdev) from mStats;
+  mStats:update monthly_fragile_edge:monthly_fragility_ratio<0.25f from mStats;
+  monthly:monthly lj `strategy xkey mStats;
+  monthly:update fragility_ratio:monthly_fragility_ratio, fragile_edge:monthly_fragile_edge from monthly;
   monthly:(`strategy`month) xasc monthly;
 
   top_days:tn#(daily_path @ reverse iasc daily_path`day_pnl);
@@ -1610,11 +1674,12 @@ atm_strategy_performance_explain:{[rets; cfg]
     tail_concentrated:topn_pnl_conc>0.6,
     right_tail_profile:(win_rate<0.5) & (total_pnl>0f),
     left_tail_drag:(win_rate>0.5) & (total_pnl<0f),
-    fragile_edge:(abs avg_day_pnl) < 0.25f * pnl_stdev
+    fragile_edge:(abs avg_day_pnl) < 0.25f * pnl_stdev,
+    overfit_risk_high:overfit_risk_score>=70f
     from summary;
   flags:0!select
-    strategy,total_pnl,win_rate,topn_pnl_conc,
-    tail_concentrated,right_tail_profile,left_tail_drag,fragile_edge
+    strategy,total_pnl,win_rate,topn_pnl_conc,overfit_risk_score,overfit_risk_bucket,
+    tail_concentrated,right_tail_profile,left_tail_drag,fragile_edge,overfit_risk_high
     from flags;
 
   diag:`symbol$();
@@ -1699,7 +1764,7 @@ atm_strategy_performance_explain:{[rets; cfg]
     narrNegSp
   );
 
-  (`summary`daily`monthly`top_days`worst_days`driver_effects`flags`narrative)!(summary; daily_path; monthly; top_days; worst_days; drv; flags; narrative)
+  (`summary`daily`monthly`top_days`worst_days`edge_recheck`driver_effects`flags`narrative)!(summary; daily_path; monthly; top_days; worst_days; edgeRe; drv; flags; narrative)
  }
 
 / Portfolio-level explanation from:
@@ -1901,7 +1966,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   ];
 
   as:alphaExp`summary;
-  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc,avg_day_pnl,pnl_stdev,fragility_ratio,fragile_edge from as;
+  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc,avg_day_pnl,pnl_stdev,fragility_ratio,fragile_edge,edge_retention,edge_decay_pct,overfit_risk_score,overfit_risk_bucket from as;
   attrib:attrib lj `strategy xkey as;
 
   / Auto grouping
@@ -1934,7 +1999,9 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     avg_win_rate:avg win_rate,
     avg_topn_conc:avg topn_pnl_conc,
     fragile_share:avg fragile_edge,
-    avg_fragility_ratio:avg fragility_ratio
+    avg_fragility_ratio:avg fragility_ratio,
+    avg_edge_decay_pct:avg edge_decay_pct,
+    avg_overfit_risk_score:avg overfit_risk_score
     by alpha_subtype from attrib;
   subtypeSummary:subtypeSummary @ reverse iasc subtypeSummary`subtype_pnl;
   subtypeSummary:.oca.subtype_behavior_enrich subtypeSummary;
@@ -1974,14 +2041,16 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   ntext:`$ (h1;h2;h3);
   narrative:([] section:`headline`breadth`leaders; text:ntext);
 
-  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`monthly_edge_fragility`monthly_edge_fragility_by_subtype`narrative)!(
+  (`portfolio_summary`portfolio_flags`portfolio_narrative`portfolio_edge_recheck`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_edge_recheck`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`monthly_edge_fragility`monthly_edge_fragility_by_subtype`narrative)!(
     portExp`summary;
     portExp`flags;
     portExp`narrative;
+    portExp`edge_recheck;
     alphaExp`summary;
     alphaExp`driver_effects;
     alphaExp`flags;
     alphaExp`narrative;
+    alphaExp`edge_recheck;
     attrib;
     groupSummary;
     subtypeSummary;
