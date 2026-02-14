@@ -155,7 +155,7 @@ to_table:{[v]
 args_dict:{[args]
   $[99h=type args; args;
     a:$[0h=type args; args; enlist args];
-    if[count a<5; a:a,(5-count a)#(::)];
+    if[(count a)<5; a:a,(5-count a)#(::)];
     (`tables`cfg`date_mode`epoch`libpath)!a
    ]
  }
@@ -1234,7 +1234,7 @@ is_numeric_col:{[t;c]
 
 safe_corr:{[x;y]
   n:count x;
-  if[(n<2) or (count y<2); :0n];
+  if[(n<2) or ((count y)<2); :0n];
   dx:dev x;
   dy:dev y;
   if[(null dx) or (null dy) or (dx<=1e-12) or (dy<=1e-12); :0n];
@@ -1243,10 +1243,97 @@ safe_corr:{[x;y]
 
 safe_beta:{[x;y]
   n:count x;
-  if[(n<2) or (count y<2); :0n];
+  if[(n<2) or ((count y)<2); :0n];
   vx:var x;
   if[(null vx) or (vx<=1e-12); :0n];
   cov[x;y] % vx
+ }
+
+alpha_subtype_guess:{[s]
+  nm:lower string s;
+  if[(nm like "*mom*") or (nm like "*trend*") or (nm like "*break*") or (nm like "*donch*") or (nm like "*time*"); :`momentum];
+  if[(nm like "*carry*") or (nm like "*roll*") or (nm like "*basis*") or (nm like "*curve*"); :`carry];
+  if[(nm like "*mean*") or (nm like "*revert*") or (nm like "*mr*") or (nm like "*zscore*"); :`mean_reversion];
+  if[(nm like "*vol*") or (nm like "*skew*") or (nm like "*gamma*") or (nm like "*straddle*") or (nm like "*fly*") or (nm like "*condor*"); :`volatility];
+  if[(nm like "*event*") or (nm like "*news*") or (nm like "*flow*") or (nm like "*impulse*"); :`event];
+  if[(nm like "*macro*") or (nm like "*fund*") or (nm like "*econ*") or (nm like "*cpi*") or (nm like "*nfp*"); :`fundamental];
+  `other
+ }
+
+alpha_assign_group_subtype:{[attrib; corrHi; concHi; minSubtype]
+  out:attrib;
+  grp:`symbol$();
+  stype:`symbol$();
+  stat:`symbol$();
+  i:0;
+  while[i<count out;
+    p:(out`sum_pnl) i;
+    cr:(out`corr_total) i;
+    tc:(out`topn_pnl_conc) i;
+    wr:(out`win_rate) i;
+    crPos:(not null cr) and (cr>=corrHi);
+    crNeg:(not null cr) and (cr<=neg corrHi);
+    tcHi:(not null tc) and (tc>=concHi);
+    g1:$[
+      (p>0f) and crPos and (not tcHi); `core_contributor;
+      (p>0f) and crNeg; `diversifying_contributor;
+      (p>0f) and tcHi; `event_contributor;
+      (p<=0f) and crNeg; `hedge_cost;
+      (p<=0f) and crPos; `drag;
+      `mixed
+    ];
+    s0:.oca.alpha_subtype_guess (out`strategy) i;
+    if[s0=`other;
+      s0:$[
+        tcHi; `event;
+        crPos and (not null wr) and (wr>=0.55); `trend_like;
+        crNeg; `diversifier;
+        (p>0f) and (not null wr) and (wr<0.5); `convex;
+        (p>0f); `carry_like;
+        `other
+      ];
+    ];
+    st1:$[
+      p>0f; `working;
+      g1=`hedge_cost; `insurance_cost;
+      `not_working
+    ];
+    grp,:enlist g1;
+    stype,:enlist s0;
+    stat,:enlist st1;
+    i+:1;
+  ];
+  out:update alpha_group:grp, alpha_subtype:stype, status:stat from out;
+  g:group out`alpha_subtype;
+  ks:key g;
+  ns:count each value g;
+  ms:max 1, `int$minSubtype;
+  small:ks where ns<ms;
+  if[(count small)>0;
+    m:(out`alpha_subtype) in small;
+    if[(sum m)>0;
+      out:update alpha_subtype:@[alpha_subtype; where m; :; (sum m)#`other] from out;
+    ];
+  ];
+  out
+ }
+
+alpha_monthly_status:{[alphaLong; attrib]
+  am:update month:`month$date from alphaLong;
+  m:0!select n_days:count i, month_pnl:sum pnl, win_rate:avg pnl>0f by strategy,month from am;
+  m:m lj `strategy xkey (select strategy,alpha_group,alpha_subtype,status from attrib);
+  ms:(count m)#`flat;
+  ip:where (m`month_pnl)>0f;
+  ineg:where (m`month_pnl)<0f;
+  if[(count ip)>0; ms:@[ms; ip; :; (count ip)#`working]];
+  if[(count ineg)>0; ms:@[ms; ineg; :; (count ineg)#`not_working]];
+  m:update month_status:ms from m;
+  m:m @ iasc m`month`strategy;
+  (`alpha_monthly`working_monthly`not_working_monthly)!(
+    m;
+    m where (m`month_status)=`working;
+    m where (m`month_status)=`not_working
+  )
  }
 
 / Explain good/bad performance drivers for a returns stream.
@@ -1402,7 +1489,7 @@ atm_strategy_performance_explain:{[rets; cfg]
     j:0;
     while[j<count dcols;
       c1:dcols j;
-      x:`float$sub c1;
+      x:`float$(sub c1);
       y:`float$sub`day_pnl;
       ok:(not null x) & not null y;
       x:x where ok;
@@ -1411,10 +1498,10 @@ atm_strategy_performance_explain:{[rets; cfg]
       md:$[n=0; 0n; med x];
       hi:x>=md;
       lo:x<md;
-      hm:$[sum hi=0; 0n; avg y where hi];
-      lm:$[sum lo=0; 0n; avg y where lo];
-      hwr:$[sum hi=0; 0n; avg (y where hi)>0f];
-      lwr:$[sum lo=0; 0n; avg (y where lo)>0f];
+      hm:$[(sum hi)=0; 0n; avg y where hi];
+      lm:$[(sum lo)=0; 0n; avg y where lo];
+      hwr:$[(sum hi)=0; 0n; avg (y where hi)>0f];
+      lwr:$[(sum lo)=0; 0n; avg (y where lo)>0f];
       cr:.oca.safe_corr[x;y];
       bt:.oca.safe_beta[x;y];
       sp:$[(null hm) or (null lm); 0n; hm-lm];
@@ -1536,6 +1623,7 @@ atm_strategy_performance_explain:{[rets; cfg]
 /   `top_n (default 10)
 /   `group_corr_hi (default 0.2)
 /   `group_conc_hi (default 0.6)
+/   `min_subtype_size (default 2; subtype buckets smaller than this fold into `other)
 /   `drivers_tbl, `driver_cols (passed through to atm_strategy_performance_explain)
 alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   aw:.oca.to_table alpha_wide;
@@ -1695,26 +1783,26 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     sy:sum y;
     sax:sum abs x;
     say:sum abs y;
-    contrib:$[abs sy<=1e-12; 0n; sx % sy];
+    contrib:$[(abs sy)<=1e-12; 0n; sx % sy];
     absContrib:$[say<=1e-12; 0n; sax % say];
     cr:.oca.safe_corr[x;y];
     bt:.oca.safe_beta[x;y];
     sxsgn:(`float$(x>0f)) - (`float$(x<0f));
     sysgn:(`float$(y>0f)) - (`float$(y<0f));
     aMask:(sxsgn<>0f) & (sysgn<>0f);
-    agree:$[sum aMask=0; 0n; avg (sxsgn where aMask) = (sysgn where aMask)];
+    agree:$[(sum aMask)=0; 0n; avg (sxsgn where aMask) = (sysgn where aMask)];
     upM:y>0f;
     dnM:y<0f;
-    upCap:$[sum upM=0; 0n; avg x where upM];
-    dnCap:$[sum dnM=0; 0n; avg x where dnM];
+    upCap:$[(sum upM)=0; 0n; avg x where upM];
+    dnCap:$[(sum dnM)=0; 0n; avg x where dnM];
     jt:j where (j`date) in topDates;
     jw:j where (j`date) in worstDates;
     xt:`float$(jt s1);
     yt:`float$(jt`portfolio_pnl);
     xw:`float$(jw s1);
     yw:`float$(jw`portfolio_pnl);
-    tShare:$[abs sum yt<=1e-12; 0n; sum xt % sum yt];
-    wShare:$[abs sum yw<=1e-12; 0n; sum xw % sum yw];
+    tShare:$[(abs sum yt)<=1e-12; 0n; sum xt % sum yt];
+    wShare:$[(abs sum yw)<=1e-12; 0n; sum xw % sum yw];
     attrRows,:enlist ([] strategy:enlist s1; n_obs:enlist n; sum_pnl:enlist sx; contrib_pct:enlist contrib; abs_contrib_pct:enlist absContrib; corr_total:enlist cr; beta_total:enlist bt; sign_agree_rate:enlist agree; up_capture:enlist upCap; down_capture:enlist dnCap; top_days_share:enlist tShare; worst_days_share:enlist wShare);
     i+:1;
   ];
@@ -1731,34 +1819,9 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   / Auto grouping
   corrHi:$[`group_corr_hi in key c; 1f*c`group_corr_hi; 0.2f];
   concHi:$[`group_conc_hi in key c; 1f*c`group_conc_hi; 0.6f];
-  grp:`symbol$();
-  status:`symbol$();
-  i:0;
-  while[i<count attrib;
-    p:(attrib`sum_pnl) i;
-    cr:(attrib`corr_total) i;
-    tc:(attrib`topn_pnl_conc) i;
-    crPos:(not null cr) and (cr>=corrHi);
-    crNeg:(not null cr) and (cr<=neg corrHi);
-    tcHi:(not null tc) and (tc>=concHi);
-    g1:$[
-      (p>0f) and crPos and (not tcHi); `core_contributor;
-      (p>0f) and crNeg; `diversifying_contributor;
-      (p>0f) and tcHi; `event_contributor;
-      (p<=0f) and crNeg; `hedge_cost;
-      (p<=0f) and crPos; `drag;
-      `mixed
-    ];
-    st1:$[
-      p>0f; `working;
-      g1=`hedge_cost; `insurance_cost;
-      `not_working
-    ];
-    grp,:enlist g1;
-    status,:enlist st1;
-    i+:1;
-  ];
-  attrib:update alpha_group:grp, status:status from attrib;
+  minSubtype:$[`min_subtype_size in key c; c`min_subtype_size; 2];
+  minSubtype:max 1, `int$minSubtype;
+  attrib:.oca.alpha_assign_group_subtype[attrib; corrHi; concHi; minSubtype];
   attrib:attrib @ reverse iasc attrib`sum_pnl;
 
   groupSummary:0!select
@@ -1768,11 +1831,19 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     avg_corr_total:avg corr_total
     by alpha_group from attrib;
   groupSummary:groupSummary @ reverse iasc groupSummary`group_pnl;
+  subtypeSummary:0!select
+    n_alpha:count i,
+    subtype_pnl:sum sum_pnl,
+    subtype_abs_pnl:sum abs sum_pnl,
+    avg_corr_total:avg corr_total
+    by alpha_subtype from attrib;
+  subtypeSummary:subtypeSummary @ reverse iasc subtypeSummary`subtype_pnl;
 
   work:attrib where (attrib`sum_pnl)>0f;
   work:tn#work;
   drag:attrib where (attrib`sum_pnl)<0f;
   drag:tn#(drag @ iasc drag`sum_pnl);
+  mres:.oca.alpha_monthly_status[alphaLong; attrib];
 
   / High-level narrative
   psTbl:portExp`summary;
@@ -1787,11 +1858,11 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   badA:$[0=count drag; `; first drag`strategy];
   badP:$[0=count drag; 0n; first drag`sum_pnl];
   h1:$[hasPs; raze ("Portfolio pnl ",string pTot," over ",string pN," days (win rate ",string pWr,")."); "No portfolio summary rows."];
-  h2:raze (string posN," alphas are working (positive pnl) and ",string negN," are not.");
+  h2:raze (string posN," alphas are working (positive pnl) and ",string negN," are not across ",string count distinct attrib`alpha_subtype," subtypes.");
   h3:raze ("Top contributor: ",string topA," (",string topP,"). Largest drag: ",string badA," (",string badP,").");
   narrative:([] section:`headline`breadth`leaders; text:(h1;h2;h3));
 
-  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`working`not_working`narrative)!(
+  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`narrative)!(
     portExp`summary;
     portExp`flags;
     portExp`narrative;
@@ -1801,8 +1872,12 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     alphaExp`narrative;
     attrib;
     groupSummary;
+    subtypeSummary;
     work;
     drag;
+    mres`alpha_monthly;
+    mres`working_monthly;
+    mres`not_working_monthly;
     narrative
   )
  }
