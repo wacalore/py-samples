@@ -130,9 +130,9 @@ invCorrCombine:{[sigs]
     // Compute pairwise rolling correlations (use trailing 63-day window)
     // For efficiency, use full-sample correlation as proxy for weighting
     // (rolling would be more accurate but much more expensive)
-    valid:sigs .\: where not null sigs[0];  // use indices where first sig is valid
+    nValid:count where not null sigs[0];
     // If too few valid obs, fall back to equal weight
-    if[20 > count first valid; :avgSigs[sigs]];
+    if[20 > nValid; :avgSigs[sigs]];
     // Clean each sig of nulls by forward-filling
     cleanSigs:{fills x} each sigs;
     // Use the last 252 obs (or all if shorter) for correlation estimation
@@ -334,9 +334,7 @@ evaluate:{[t]
 
     // --- Regime-conditional Sharpe ---
     // Split by variance ratio > 1 (trending) vs < 1 (mean-reverting)
-    regimeSharpes:$[nSym = 1;
-        computeRegimeSharpes[t;r;dts];
-        `trending`meanReverting!(0n;0n)];
+    regimeSharpes:computeRegimeSharpes[t;r;dts];
 
     // --- Signal autocorrelation (turnover proxy) ---
     sigAutoCorr:computeSigAutoCorr[t;syms];
@@ -395,17 +393,20 @@ computeDailyPnl:{[t;syms]
 computeDDDurations:{[drawdowns]
     inDD:drawdowns < neg 1e-10;
     if[not any inDD; :enlist 0];
-    // Count consecutive drawdown days
-    transitions:differ inDD;
-    starts:where transitions and inDD;
-    ends:where transitions and not inDD;
-    // Handle case where still in DD at end
+    // Find transitions: 0->1 = DD start, 1->0 = DD end
+    // Use deltas on int cast: +1 = entered DD, -1 = exited DD
+    d:deltas "i"$inDD;
+    starts:where d = 1i;
+    ends:where d = -1i;
+    // Handle: starts in DD from beginning (inDD[0] is true)
+    if[inDD[0] and (0 = count starts) or (count starts) > 0 and starts[0] > 0;
+        starts:0,starts];
+    // Handle: still in DD at end of series
     if[(count starts) > count ends; ends:ends,count drawdowns];
     $[0 < count starts; ends - starts; enlist 0]}
 
 // Per-speed Sharpe ratios
 computePerSpeedSharpe:{[t;syms;speedCols]
-    result:()!();
     {[t;syms;result;sc]
         pnls:raze {[t;sc;s]
             sub:`dt xasc select from t where sym=s;
@@ -419,8 +420,7 @@ computePerSpeedSharpe:{[t;syms;speedCols]
             0n];
         result[sc]:sr;
         result
-    }[t;syms]/[result;speedCols];
-    result}
+    }[t;syms]/[()!();speedCols]}
 
 // Rolling Sharpe (annualized)
 computeRollingSharpe:{[r;w]
@@ -428,18 +428,13 @@ computeRollingSharpe:{[r;w]
     vol:mdev[w;r];
     (sqrt[252f] * mu) % 1e-10 | vol}
 
-// Regime-conditional Sharpe (uses variance ratio on first sym's returns)
+// Regime-conditional Sharpe (uses variance ratio on portfolio returns)
 computeRegimeSharpes:{[t;r;dts]
-    // Get returns of first sym for VR computation
-    firstSym:first asc distinct t`sym;
-    sub:`dt xasc select from t where sym=firstSym;
-    vr:.cond.varianceRatio[sub`ret;5;60];
-    // Map VR to daily dates
-    vrByDt:sub[`dt]!vr;
-    vrDaily:vrByDt dts;
-    // Split
-    trendIdx:where (vrDaily > 1f) and not null vrDaily;
-    mrIdx:where (vrDaily <= 1f) and not null vrDaily;
+    // Compute VR on the aggregated portfolio daily returns
+    vr:.cond.varianceRatio[r;5;60];
+    // Split by VR regime
+    trendIdx:where (vr > 1f) and not null vr;
+    mrIdx:where (vr <= 1f) and not null vr;
     trendR:r trendIdx;
     mrR:r mrIdx;
     trendSharpe:$[(count trendR where trendR <> 0f) > 10;
