@@ -1261,7 +1261,12 @@ safe_beta:{[x;y]
 atm_strategy_performance_explain:{[rets; cfg]
   t:.oca.to_table rets;
   if[98h<>type t; '"returns input must be a table"];
-  c:$[cfg~(::); ()!(); cfg];
+  c0:$[cfg~(::); ()!(); cfg];
+  c:$[
+    99h=type c0;
+    $[98h=type key c0; ()!(); c0];
+    ()!()
+  ];
   req:`date`pnl;
   if[not all req in cols t; '"returns table missing required columns (`date`pnl)"];
 
@@ -1537,7 +1542,12 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   tt:.oca.to_table total_tbl;
   if[98h<>type aw; '"alpha_wide must be a table"];
   if[98h<>type tt; '"total_tbl must be a table"];
-  c:$[cfg~(::); ()!(); cfg];
+  c0:$[cfg~(::); ()!(); cfg];
+  c:$[
+    99h=type c0;
+    $[98h=type key c0; ()!(); c0];
+    ()!()
+  ];
 
   / Resolve date columns
   dcol_aw:$[
