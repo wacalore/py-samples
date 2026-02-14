@@ -272,7 +272,7 @@ ensembleTable:{[t;cfg]
 //    Also expects sig_N columns for per-speed analysis
 // Returns: dict with all evaluation metrics
 evaluate:{[t]
-    // --- Basic P&L: signal(t-1) * return(t), aggregated daily ---
+    // --- Basic P&L: signal(t-1) * return(t), aggregated by dt ---
     syms:asc distinct t`sym;
     nSym:count syms;
 
@@ -317,9 +317,10 @@ evaluate:{[t]
     profitFactor:$[(0 < count losses) and 0 < count wins;
         (sum wins) % neg sum losses; 0n];
 
-    // --- Per-speed metrics ---
+    // --- Per-speed metrics (requires `ret` column and `sig_*` columns) ---
+    hasRet:`ret in cols t;
     speedCols:cols[t] where cols[t] like "sig_*";
-    speedSharpes:$[0 < count speedCols;
+    speedSharpes:$[hasRet and 0 < count speedCols;
         computePerSpeedSharpe[t;syms;speedCols];
         ()!()];
 
@@ -339,11 +340,11 @@ evaluate:{[t]
     // --- Signal autocorrelation (turnover proxy) ---
     sigAutoCorr:computeSigAutoCorr[t;syms];
 
-    // --- IC and IC decay ---
-    icMetrics:computeIC[t;syms];
+    // --- IC and IC decay (requires `ret` column for forward returns) ---
+    icMetrics:$[hasRet; computeIC[t;syms]; `ic`icIR`icHitRate`icDecay!(0n;0n;0n;()!())];
 
     // --- Time-series IC per sym ---
-    tsICBySym:computeTSIC[t;syms];
+    tsICBySym:$[hasRet; computeTSIC[t;syms]; syms!count[syms]#0n];
 
     // --- Bootstrap Sharpe CI (1000 resamples) ---
     bootCI:bootstrapSharpeCI[nzr;1000];
@@ -378,13 +379,15 @@ evaluate:{[t]
 // --- Evaluation helpers ---
 
 // Compute daily P&L: sig(t-1) * ret(t), aggregated across syms
+// If table already has `pnl` column, use it directly
 computeDailyPnl:{[t;syms]
-    // For each sym: prev[sig] * ret, then aggregate by date
-    pnls:raze {[t;s]
-        sub:`dt xasc select from t where sym=s;
-        pnl:prev[sub`sig] * sub`ret;
-        ([] dt:sub`dt; pnl:pnl)
-    }[t;] each syms;
+    hasPnl:`pnl in cols t;
+    hasRet:`ret in cols t;
+    pnls:raze $[hasPnl;
+        {[t;s] sub:`dt xasc select from t where sym=s; ([] dt:sub`dt; pnl:sub`pnl)}[t;] each syms;
+        hasRet;
+        {[t;s] sub:`dt xasc select from t where sym=s; pnl:prev[sub`sig] * sub`ret; ([] dt:sub`dt; pnl:pnl)}[t;] each syms;
+        '"evaluate requires `ret or `pnl column"];
     daily:0!select ret:sum pnl by dt from pnls;
     daily:`dt xasc daily;
     daily}
