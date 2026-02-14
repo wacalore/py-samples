@@ -1384,7 +1384,7 @@ alpha_monthly_status:{[alphaLong; attrib]
   if[(count ip)>0; ms:@[ms; ip; :; (count ip)#`working]];
   if[(count ineg)>0; ms:@[ms; ineg; :; (count ineg)#`not_working]];
   m:update month_status:ms from m;
-  m:m @ iasc m`month`strategy;
+  m:(`month`strategy) xasc m;
   (`alpha_monthly`working_monthly`not_working_monthly)!(
     m;
     m where (m`month_status)=`working;
@@ -1566,7 +1566,7 @@ atm_strategy_performance_explain:{[rets; cfg]
   monthly:0!select n_days:count i, month_pnl:sum day_pnl, avg_day_pnl:avg day_pnl, pnl_stdev:dev day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
   monthly:update fragility_ratio:(abs avg_day_pnl) % (pnl_stdev | 1e-12f) from monthly;
   monthly:update fragile_edge:fragility_ratio<0.25f from monthly;
-  monthly:monthly @ iasc monthly`strategy`month;
+  monthly:(`strategy`month) xasc monthly;
 
   top_days:tn#(daily_path @ reverse iasc daily_path`day_pnl);
   worst_days:tn#(daily_path @ iasc daily_path`day_pnl);
@@ -1944,8 +1944,13 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   drag:attrib where (attrib`sum_pnl)<0f;
   drag:tn#(drag @ iasc drag`sum_pnl);
   mres:.oca.alpha_monthly_status[alphaLong; attrib];
-  monthlyFrag:0!select n_alpha:count i, month_pnl:sum month_pnl, avg_fragility_ratio:avg fragility_ratio, fragile_share:avg fragile_edge by month from mres`alpha_monthly;
-  monthlyFrag:monthlyFrag @ iasc monthlyFrag`month;
+  alphaMonthly:mres`alpha_monthly;
+  monthlyFrag:0!select n_alpha:count i, month_pnl:sum month_pnl, avg_fragility_ratio:avg fragility_ratio, fragile_share:avg fragile_edge by month from alphaMonthly;
+  monthlyFrag:(`month) xasc monthlyFrag;
+  monthlyFragSubtype:0!select n_alpha:count i, month_pnl:sum month_pnl, avg_win_rate:avg win_rate, avg_fragility_ratio:avg fragility_ratio, fragile_share:avg fragile_edge by month,alpha_subtype from alphaMonthly;
+  subtypeBeh:0!select alpha_subtype,behavior_label,behavior_text from subtypeSummary;
+  monthlyFragSubtype:monthlyFragSubtype lj `alpha_subtype xkey subtypeBeh;
+  monthlyFragSubtype:(`month`alpha_subtype) xasc monthlyFragSubtype;
 
   / High-level narrative
   psTbl:portExp`summary;
@@ -1969,7 +1974,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   ntext:`$ (h1;h2;h3);
   narrative:([] section:`headline`breadth`leaders; text:ntext);
 
-  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`monthly_edge_fragility`narrative)!(
+  (`portfolio_summary`portfolio_flags`portfolio_narrative`alpha_summary`alpha_driver_effects`alpha_flags`alpha_narrative`alpha_attribution`group_summary`subtype_summary`working`not_working`alpha_monthly`working_monthly`not_working_monthly`monthly_edge_fragility`monthly_edge_fragility_by_subtype`narrative)!(
     portExp`summary;
     portExp`flags;
     portExp`narrative;
@@ -1986,6 +1991,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     mres`working_monthly;
     mres`not_working_monthly;
     monthlyFrag;
+    monthlyFragSubtype;
     narrative
   )
  }
