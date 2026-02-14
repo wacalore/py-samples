@@ -85,8 +85,10 @@ accel:{[mom;w]
 singleSpeed:{[x;w;aw]
     mom:sharpeMom[x;w];
     acc:accel[mom;w];
-    sig:mom + (aw * acc);
-    (neg defaultClip) | sig & defaultClip}
+    raw:mom + (aw * acc);
+    // Clip to [-4,4] but preserve nulls (Q max converts null → -4)
+    clipped:(neg defaultClip) | raw & defaultClip;
+    @[clipped; where null raw; :; 0n]}
 
 // =============================================================================
 // SECTION 3: REGIME-ADAPTIVE ENSEMBLE
