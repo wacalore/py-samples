@@ -1234,6 +1234,11 @@ atm_strategy_pnl_diagnostics:{[rets; top_n]
     best_day:max pnl,
     worst_day:min pnl
     by strategy from t;
+  nz:t where (abs t`pnl)>1e-12f;
+  nzStats:0!select win_rate_nz:avg pnl>0f by strategy from nz;
+  summary:summary lj `strategy xkey nzStats;
+  summary:update win_rate:win_rate_nz from summary;
+  summary:delete win_rate_nz from summary;
 
   (`summary`by_trade`daily`top_days`worst_days`top_trades`worst_trades)!(summary; trade; daily; top_days; worst_days; top_trades; worst_trades)
  }
@@ -1375,7 +1380,12 @@ alpha_ensure_min_subtypes:{[attrib; minDistinct]
 alpha_monthly_status:{[alphaLong; attrib]
   am:update month:`month$date from alphaLong;
   m:0!select n_days:count i, month_pnl:sum pnl, avg_day_pnl:avg pnl, pnl_stdev:dev pnl, win_rate:avg pnl>0f by strategy,month from am;
-  mstats:0!select monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from m;
+  amAct:am where (abs am`pnl)>1e-12f;
+  mAct:0!select active_n_days:count i, active_win_rate:avg pnl>0f by strategy,month from amAct;
+  m:m lj `strategy`month xkey mAct;
+  m:update win_rate:active_win_rate from m;
+  mNZ:m where (abs m`month_pnl)>1e-12f;
+  mstats:0!select monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from mNZ;
   mstats:update monthly_sharpe:(sqrt 12f) * monthly_avg_pnl % (1e-12f + 0f^monthly_pnl_stdev) from mstats;
   mstats:update fragility_ratio:(abs monthly_avg_pnl) % (1e-12f + 0f^monthly_pnl_stdev) from mstats;
   mstats:update fragile_edge:fragility_ratio<0.25f from mstats;
@@ -1450,8 +1460,8 @@ edge_tail_recheck:{[daily_path; svals; trimN]
     ttot:sum kept`day_pnl;
     tavg:$[nk=0; 0n; avg kept`day_pnl];
     tstd:$[nk<2; 0n; dev kept`day_pnl];
-    tsh:(sqrt 252f) * tavg % (tstd | 1e-12f);
-    tfrag:(abs tavg) % (tstd | 1e-12f);
+    tsh:(sqrt 252f) * tavg % (1e-12f + 0f^tstd);
+    tfrag:(abs tavg) % (1e-12f + 0f^tstd);
     tfragF:tfrag<0.25f;
     twr:$[nk=0; 0n; avg (kept`day_pnl)>0f];
     oavg:$[n=0; 0n; avg sub`day_pnl];
@@ -1466,6 +1476,109 @@ edge_tail_recheck:{[daily_path; svals; trimN]
     ([] strategy:`symbol$(); trim_n:`int$(); n_days:`int$(); trimmed_n_days:`int$(); dropped_days:`int$(); dropped_frac:`float$(); trimmed_total_pnl:`float$(); trimmed_avg_day_pnl:`float$(); trimmed_pnl_stdev:`float$(); trimmed_sharpe:`float$(); trimmed_fragility_ratio:`float$(); trimmed_fragile_edge:`boolean$(); trimmed_win_rate:`float$(); edge_retention:`float$(); edge_decay_pct:`float$());
     raze rows
   ]
+ }
+
+strategy_driver_effects:{[daily_path; svals; dcols]
+  drvRows:();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    sub:daily_path where (daily_path`strategy)=s1;
+    j:0;
+    while[j<count dcols;
+      c1:dcols j;
+      x:`float$(sub c1);
+      y:`float$sub`day_pnl;
+      ok:(not null x) & not null y;
+      x:x where ok;
+      y:y where ok;
+      n:count x;
+      md:$[n=0; 0n; med x];
+      hi:x>=md;
+      lo:x<md;
+      hm:$[(sum hi)=0; 0n; avg y where hi];
+      lm:$[(sum lo)=0; 0n; avg y where lo];
+      hwr:$[(sum hi)=0; 0n; avg (y where hi)>0f];
+      lwr:$[(sum lo)=0; 0n; avg (y where lo)>0f];
+      cr:.oca.safe_corr[x;y];
+      bt:.oca.safe_beta[x;y];
+      sp:$[(null hm) or (null lm); 0n; hm-lm];
+      drvRows,:enlist ([] strategy:enlist s1; driver:enlist c1; n_obs:enlist n; corr:enlist cr; beta:enlist bt; median_driver:enlist md; high_mean_pnl:enlist hm; low_mean_pnl:enlist lm; pnl_spread:enlist sp; high_win_rate:enlist hwr; low_win_rate:enlist lwr);
+      j+:1;
+    ];
+    i+:1;
+  ];
+  $[
+    0=count drvRows;
+    ([] strategy:`symbol$(); driver:`symbol$(); n_obs:`int$(); corr:`float$(); beta:`float$(); median_driver:`float$(); high_mean_pnl:`float$(); low_mean_pnl:`float$(); pnl_spread:`float$(); high_win_rate:`float$(); low_win_rate:`float$());
+    raze drvRows
+  ]
+ }
+
+strategy_performance_narrative:{[svals; flags; drv; tn]
+  narrReason:();
+  narrDiag:`symbol$();
+  narrPosDrv:`symbol$();
+  narrPosSp:`float$();
+  narrNegDrv:`symbol$();
+  narrNegSp:`float$();
+  i:0;
+  while[i<count svals;
+    s1:svals i;
+    f:flags where (flags`strategy)=s1;
+    d1:$[0=count f; `flat; first f`diagnosis];
+    tp:$[0=count f; 0n; first f`total_pnl];
+    wr:$[0=count f; 0n; first f`win_rate];
+    tc:$[0=count f; 0b; first f`tail_concentrated];
+    ct:$[0=count f; 0n; first f`topn_pnl_conc];
+
+    dsub:drv where (drv`strategy)=s1;
+    posDrv:`;
+    negDrv:`;
+    posSp:0n;
+    negSp:0n;
+    if[(count dsub)>0;
+      dpos:dsub @ reverse iasc dsub`pnl_spread;
+      dneg:dsub @ iasc dsub`pnl_spread;
+      posDrv:first dpos`driver;
+      negDrv:first dneg`driver;
+      posSp:first dpos`pnl_spread;
+      negSp:first dneg`pnl_spread;
+    ];
+
+    base:$[
+      d1=`positive_right_tail; "PnL is positive with sub-50% win rate; large right-tail days dominate.";
+      d1=`negative_left_tail; "Win rate is above 50% but total PnL is negative; left-tail losses dominate.";
+      d1=`event_driven; "A large share of total PnL comes from a small number of days.";
+      d1=`broad_positive; "Performance is broadly positive across days.";
+      d1=`broad_negative; "Performance is broadly negative across days.";
+      "Performance is close to flat."
+    ];
+
+    concTxt:$[tc; raze (" Concentration is high (top-",string tn," days / total abs PnL = ",string ct,")."); ""];
+    posTxt:$[posDrv~`; ""; raze (" Positive regime driver: ",string posDrv," (high-low avg day pnl spread ",string posSp,").")];
+    negTxt:$[negDrv~`; ""; raze (" Negative regime driver: ",string negDrv," (high-low avg day pnl spread ",string negSp,").")];
+    lvlTxt:raze (" Total pnl ",string tp,", win rate ",string wr,".");
+    msg:raze (base; lvlTxt; concTxt; posTxt; negTxt);
+
+    narrDiag,:enlist d1;
+    narrReason,:enlist msg;
+    narrPosDrv,:enlist posDrv;
+    narrPosSp,:enlist posSp;
+    narrNegDrv,:enlist negDrv;
+    narrNegSp,:enlist negSp;
+    i+:1;
+  ];
+  reasonSym:{[x] `$raze x} each narrReason;
+  flip `strategy`diagnosis`reason`top_driver_pos`top_driver_pos_spread`top_driver_neg`top_driver_neg_spread!(
+    svals;
+    narrDiag;
+    reasonSym;
+    narrPosDrv;
+    narrPosSp;
+    narrNegDrv;
+    narrNegSp
+  )
  }
 
 / Explain good/bad performance drivers for a returns stream.
@@ -1583,11 +1696,9 @@ atm_strategy_performance_explain:{[rets; cfg]
     by strategy from daily_path;
   / Active-day stats: sharpe/fragility should be computed on non-zero pnl days only.
   ad:daily_path where (abs daily_path`day_pnl)>1e-12f;
-  aStats:0!select active_n_days:count i, active_avg_day_pnl:avg day_pnl, active_pnl_stdev:dev day_pnl by strategy from ad;
+  aStats:0!select active_avg_day_pnl:avg day_pnl, active_pnl_stdev:dev day_pnl, active_win_rate:avg day_pnl>0f by strategy from ad;
   summary:summary lj `strategy xkey aStats;
-  summary:update sharpe:(sqrt 252f) * active_avg_day_pnl % (1e-12f + 0f^active_pnl_stdev) from summary;
-  summary:update fragility_ratio:(abs active_avg_day_pnl) % (1e-12f + 0f^active_pnl_stdev) from summary;
-  summary:update fragile_edge:fragility_ratio<0.25f from summary;
+  summary:update win_rate:active_win_rate, sharpe:(sqrt 252f) * active_avg_day_pnl % (1e-12f + 0f^active_pnl_stdev), fragility_ratio:(abs active_avg_day_pnl) % (1e-12f + 0f^active_pnl_stdev), fragile_edge:((abs active_avg_day_pnl) % (1e-12f + 0f^active_pnl_stdev))<0.25f from summary;
 
   dd:0!select max_drawdown:min drawdown, max_dd_date:first date where drawdown=min drawdown by strategy from daily_path;
   summary:summary lj `strategy xkey dd;
@@ -1609,6 +1720,7 @@ atm_strategy_performance_explain:{[rets; cfg]
   ];
   conc:$[0=count concRows; ([] strategy:`symbol$(); topn_pnl_conc:`float$(); worstn_abs_pnl_conc:`float$()); raze concRows];
   summary:summary lj `strategy xkey conc;
+  summary:update tail_balance_score:(0f^topn_pnl_conc) - (0f^worstn_abs_pnl_conc) from summary;
 
   edgeRe:.oca.edge_tail_recheck[daily_path; svals; trimN];
   summary:summary lj `strategy xkey edgeRe;
@@ -1623,8 +1735,13 @@ atm_strategy_performance_explain:{[rets; cfg]
 
   dm:update month:`month$date from daily_path;
   monthly:0!select n_days:count i, month_pnl:sum day_pnl, avg_day_pnl:avg day_pnl, pnl_stdev:dev day_pnl, win_rate:avg day_pnl>0f by strategy,month from dm;
+  dmAct:dm where (abs dm`day_pnl)>1e-12f;
+  mAct:0!select active_win_rate:avg day_pnl>0f by strategy,month from dmAct;
+  monthly:monthly lj `strategy`month xkey mAct;
+  monthly:update win_rate:active_win_rate from monthly;
   / Monthly fragility is computed from the strategy monthly return series (not within-month daily dispersion).
-  mStats:0!select monthly_n_months:count i, monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from monthly;
+  monthlyNZ:monthly where (abs monthly`month_pnl)>1e-12f;
+  mStats:0!select monthly_n_months:count i, monthly_avg_pnl:avg month_pnl, monthly_pnl_stdev:dev month_pnl by strategy from monthlyNZ;
   mStats:update monthly_sharpe:(sqrt 12f) * monthly_avg_pnl % (1e-12f + 0f^monthly_pnl_stdev) from mStats;
   mStats:update monthly_fragility_ratio:(abs monthly_avg_pnl) % (1e-12f + 0f^monthly_pnl_stdev) from mStats;
   mStats:update monthly_fragile_edge:monthly_fragility_ratio<0.25f from mStats;
@@ -1635,50 +1752,17 @@ atm_strategy_performance_explain:{[rets; cfg]
   top_days:tn#(daily_path @ reverse iasc daily_path`day_pnl);
   worst_days:tn#(daily_path @ iasc daily_path`day_pnl);
 
-  drvRows:();
-  i:0;
-  while[i<count svals;
-    s1:svals i;
-    sub:daily_path where (daily_path`strategy)=s1;
-    j:0;
-    while[j<count dcols;
-      c1:dcols j;
-      x:`float$(sub c1);
-      y:`float$sub`day_pnl;
-      ok:(not null x) & not null y;
-      x:x where ok;
-      y:y where ok;
-      n:count x;
-      md:$[n=0; 0n; med x];
-      hi:x>=md;
-      lo:x<md;
-      hm:$[(sum hi)=0; 0n; avg y where hi];
-      lm:$[(sum lo)=0; 0n; avg y where lo];
-      hwr:$[(sum hi)=0; 0n; avg (y where hi)>0f];
-      lwr:$[(sum lo)=0; 0n; avg (y where lo)>0f];
-      cr:.oca.safe_corr[x;y];
-      bt:.oca.safe_beta[x;y];
-      sp:$[(null hm) or (null lm); 0n; hm-lm];
-      drvRows,:enlist ([] strategy:enlist s1; driver:enlist c1; n_obs:enlist n; corr:enlist cr; beta:enlist bt; median_driver:enlist md; high_mean_pnl:enlist hm; low_mean_pnl:enlist lm; pnl_spread:enlist sp; high_win_rate:enlist hwr; low_win_rate:enlist lwr);
-      j+:1;
-    ];
-    i+:1;
-  ];
-  drv:$[
-    0=count drvRows;
-    ([] strategy:`symbol$(); driver:`symbol$(); n_obs:`int$(); corr:`float$(); beta:`float$(); median_driver:`float$(); high_mean_pnl:`float$(); low_mean_pnl:`float$(); pnl_spread:`float$(); high_win_rate:`float$(); low_win_rate:`float$());
-    raze drvRows
-  ];
+  drv:.oca.strategy_driver_effects[daily_path; svals; dcols];
 
   flags:update
     tail_concentrated:topn_pnl_conc>0.6,
     right_tail_profile:(win_rate<0.5) & (total_pnl>0f),
     left_tail_drag:(win_rate>0.5) & (total_pnl<0f),
-    fragile_edge:(abs avg_day_pnl) < 0.25f * pnl_stdev,
+    fragile_edge:fragility_ratio<0.25f,
     overfit_risk_high:overfit_risk_score>=70f
     from summary;
   flags:0!select
-    strategy,total_pnl,win_rate,topn_pnl_conc,overfit_risk_score,overfit_risk_bucket,
+    strategy,total_pnl,win_rate,topn_pnl_conc,worstn_abs_pnl_conc,tail_balance_score,overfit_risk_score,overfit_risk_bucket,
     tail_concentrated,right_tail_profile,left_tail_drag,fragile_edge,overfit_risk_high
     from flags;
 
@@ -1698,71 +1782,7 @@ atm_strategy_performance_explain:{[rets; cfg]
     i+:1;
   ];
   flags:update diagnosis:diag from flags;
-
-  / Per-strategy plain-English explanation from flags + strongest driver splits
-  narrReason:();
-  narrDiag:`symbol$();
-  narrPosDrv:`symbol$();
-  narrPosSp:`float$();
-  narrNegDrv:`symbol$();
-  narrNegSp:`float$();
-  i:0;
-  while[i<count svals;
-    s1:svals i;
-    f:flags where (flags`strategy)=s1;
-    d1:$[0=count f; `flat; first f`diagnosis];
-    tp:$[0=count f; 0n; first f`total_pnl];
-    wr:$[0=count f; 0n; first f`win_rate];
-    tc:$[0=count f; 0b; first f`tail_concentrated];
-    ct:$[0=count f; 0n; first f`topn_pnl_conc];
-
-    dsub:drv where (drv`strategy)=s1;
-    posDrv:`;
-    negDrv:`;
-    posSp:0n;
-    negSp:0n;
-    if[(count dsub)>0;
-      dpos:dsub @ reverse iasc dsub`pnl_spread;
-      dneg:dsub @ iasc dsub`pnl_spread;
-      posDrv:first dpos`driver;
-      negDrv:first dneg`driver;
-      posSp:first dpos`pnl_spread;
-      negSp:first dneg`pnl_spread;
-    ];
-
-    base:$[
-      d1=`positive_right_tail; "PnL is positive with sub-50% win rate; large right-tail days dominate.";
-      d1=`negative_left_tail; "Win rate is above 50% but total PnL is negative; left-tail losses dominate.";
-      d1=`event_driven; "A large share of total PnL comes from a small number of days.";
-      d1=`broad_positive; "Performance is broadly positive across days.";
-      d1=`broad_negative; "Performance is broadly negative across days.";
-      "Performance is close to flat."
-    ];
-
-    concTxt:$[tc; raze (" Concentration is high (top-",string tn," days / total abs PnL = ",string ct,")."); ""];
-    posTxt:$[posDrv~`; ""; raze (" Positive regime driver: ",string posDrv," (high-low avg day pnl spread ",string posSp,").")];
-    negTxt:$[negDrv~`; ""; raze (" Negative regime driver: ",string negDrv," (high-low avg day pnl spread ",string negSp,").")];
-    lvlTxt:raze (" Total pnl ",string tp,", win rate ",string wr,".");
-    msg:raze (base; lvlTxt; concTxt; posTxt; negTxt);
-
-    narrDiag,:enlist d1;
-    narrReason,:enlist msg;
-    narrPosDrv,:enlist posDrv;
-    narrPosSp,:enlist posSp;
-    narrNegDrv,:enlist negDrv;
-    narrNegSp,:enlist negSp;
-    i+:1;
-  ];
-  reasonSym:{[x] `$raze x} each narrReason;
-  narrative:flip `strategy`diagnosis`reason`top_driver_pos`top_driver_pos_spread`top_driver_neg`top_driver_neg_spread!(
-    svals;
-    narrDiag;
-    reasonSym;
-    narrPosDrv;
-    narrPosSp;
-    narrNegDrv;
-    narrNegSp
-  );
+  narrative:.oca.strategy_performance_narrative[svals; flags; drv; tn];
 
   (`summary`daily`monthly`top_days`worst_days`edge_recheck`driver_effects`flags`narrative)!(summary; daily_path; monthly; top_days; worst_days; edgeRe; drv; flags; narrative)
  }
@@ -1966,7 +1986,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
   ];
 
   as:alphaExp`summary;
-  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc,avg_day_pnl,pnl_stdev,fragility_ratio,fragile_edge,edge_retention,edge_decay_pct,overfit_risk_score,overfit_risk_bucket from as;
+  as:0!select strategy,alpha_total_pnl:total_pnl,win_rate,sharpe,max_drawdown,topn_pnl_conc,worstn_abs_pnl_conc,tail_balance_score,avg_day_pnl,pnl_stdev,fragility_ratio,fragile_edge,edge_retention,edge_decay_pct,overfit_risk_score,overfit_risk_bucket from as;
   attrib:attrib lj `strategy xkey as;
 
   / Auto grouping
@@ -1998,6 +2018,7 @@ alpha_portfolio_explain:{[alpha_wide; total_tbl; cfg]
     avg_corr_total:avg corr_total,
     avg_win_rate:avg win_rate,
     avg_topn_conc:avg topn_pnl_conc,
+    avg_tail_balance_score:avg tail_balance_score,
     fragile_share:avg fragile_edge,
     avg_fragility_ratio:avg fragility_ratio,
     avg_edge_decay_pct:avg edge_decay_pct,
