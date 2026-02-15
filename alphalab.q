@@ -1101,16 +1101,23 @@ alphaEval:{[t;cfg]
 // -----------------------------------------------------------------------------
 // ALPHA REPORT — lightweight signal evaluation
 // -----------------------------------------------------------------------------
-// Evaluate a signal against forward returns. PnL = prev[sig] * alpha.
-// All metrics computed on non-zero PnL days.
+// Evaluate a strategy's alpha. Performance metrics based on alpha column
+// (the strategy's daily PnL), summed across symbols by date.
+// All metrics computed on non-zero alpha days.
 //
-// t:   table with (dt; ricRoot; sig; alpha) minimum, optional pxDiff
+// t:   table with columns:
+//   dt       - date/time column
+//   ricRoot  - symbol identifier
+//   sig      - position signal (used for IC and turnover)
+//   alpha    - strategy alpha / daily PnL per symbol
+//   pxDiff   - (optional) raw price difference for cross-sectional IC
+//
 // cfg: optional config dict:
 //   `dtCol         - date column (default: `dt)
 //   `symCol        - symbol column (default: `ricRoot)
-//   `sigCol        - signal column (default: `sig)
-//   `retCol        - return/alpha column for PnL + tsIc (default: `alpha)
-//   `pxDiffCol     - raw price diff column for cross-sectional IC (default: `pxDiff)
+//   `sigCol        - signal column for IC/turnover (default: `sig)
+//   `retCol        - strategy alpha column for performance (default: `alpha)
+//   `pxDiffCol     - raw price diff for cross-sectional IC (default: `pxDiff)
 //   `topN          - top N days for PnL concentration (default: 5 10)
 //   `winsorizePct  - winsorize percentile (default: 0.025)
 //   `icLags        - forward horizons for IC decay (default: 1 2 5 10 20)
@@ -1136,25 +1143,22 @@ alphaReport:{[t;cfg]
     nSyms:count syms;
     grp:group t cSym;
 
-    // --- Per-sym PnL: prev[sig] * alpha ---
+    // --- Per-sym data extraction ---
     symData:{[t;cDt;cSig;cRet;cPx;hasPx;idx]
         sub:cDt xasc t idx;
-        sig:"f"$sub cSig;
-        alpha:"f"$sub cRet;
-        pnl:prev[sig] * alpha;
-        d:`dt`sig`alpha`pnl!(sub cDt;sig;alpha;pnl);
+        d:`dt`sig`alpha!(sub cDt; "f"$sub cSig; "f"$sub cRet);
         if[hasPx; d[`pxDiff]:"f"$sub cPx];
         d
     }[t;cDt;cSig;cRet;cPx;hasPx;] each value grp;
 
-    // Aggregate daily PnL
-    allRows:raze {([] dt:x`dt; pnl:x`pnl)} each symData;
-    daily:0!select pnl:sum pnl by dt from allRows;
+    // --- Aggregate daily alpha (sum across symbols per date) ---
+    allRows:raze {([] dt:x`dt; alpha:x`alpha)} each symData;
+    daily:0!select alpha:sum alpha by dt from allRows;
     daily:`dt xasc daily;
     dts:daily`dt;
-    r:daily`pnl;
+    r:daily`alpha;
 
-    // Non-zero PnL filter
+    // Non-zero alpha filter
     nzr:r where r <> 0f;
     nzDts:dts where r <> 0f;
     n:count nzr;
@@ -1185,7 +1189,7 @@ alphaReport:{[t;cfg]
     losses:nzr where nzr < 0f;
     hitRate:(count wins) % n;
 
-    // Monthly: fraction of months with positive total PnL
+    // Monthly: fraction of months with positive total alpha
     mPnl:0!select mp:sum x by m from ([] m:`month$nzDts; x:nzr);
     monthlyHitRate:avg (mPnl`mp) > 0f;
 
@@ -1247,8 +1251,8 @@ alphaReport:{[t;cfg]
         (avg abs 1 _ deltas vSig) % avgAbs
     } each symData;
 
-    // --- IC: cor(prev_sig, alpha) — predictive signal quality ---
-    // Time-series IC per sym
+    // --- IC ---
+    // Time-series IC per sym: cor(prev sig, alpha)
     tsIcBySym:(key grp)!{[x]
         ps:prev x`sig;
         a:x`alpha;
@@ -1258,7 +1262,7 @@ alphaReport:{[t;cfg]
     tsIcVals:(value tsIcBySym) where not null value tsIcBySym;
     tsIc:$[0 < count tsIcVals; avg tsIcVals; 0n];
 
-    // Cross-sectional IC (if multi-sym): daily rank cor(prev_sig, pxDiff) across syms
+    // Cross-sectional IC (if multi-sym): daily rank cor(prev sig, pxDiff) across syms
     // Uses pxDiff (raw price diff) if available; falls back to alpha
     icDailyVals:$[nSyms >= 2;
         [icTab:raze {[nm;sd;hasPx]
@@ -1274,7 +1278,7 @@ alphaReport:{[t;cfg]
             $[3 > count valid; 0n;
               cor[iasc iasc ps valid; iasc iasc r valid]]
          }[icTab;] each value icGrp];
-        // Single sym: use rolling correlation as daily IC series
+        // Single sym: rolling cor(prev sig, alpha)
         raze {[x]
             ps:prev x`sig; a:x`alpha;
             exy:mavg[60;ps * a]; ex:mavg[60;ps]; ey:mavg[60;a];
@@ -1289,13 +1293,12 @@ alphaReport:{[t;cfg]
     icStd:$[1 < count icValid; dev icValid; 0n];
     icIR:$[icStd > 1e-10; ic % icStd; 0n];
 
-    // IC decay: cor(prev_sig, fwd_h_return) at each horizon
+    // IC decay: cor(prev sig, fwd h-day alpha) at each horizon
     icDecay:{[symData;h]
         ics:{[sd;h]
             ps:prev sd`sig;
             a:sd`alpha;
             nn:count ps;
-            // Forward h-day return
             fwdRet:msum[h; 1 rotate a];
             fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
             valid:where (not null ps) and not null fwdRet;
