@@ -458,6 +458,69 @@ slopeT1:{[x]
 // Trend strength (abs slope of regression)
 trendstr:{[n;x] abs slope[n;x]}
 
+// Rolling angular momentum - angle of OLS trend line, normalized by volatility
+// Measures steepness of trend in vol-adjusted units. Cross-instrument comparable.
+//
+// x: level/price/cumulative series (NOT returns — cumulate first if needed)
+// w: lookback window
+// Returns: dict `angle`slope`r2`nSlope
+//   angle  - atan of vol-normalized slope (radians, range roughly -pi/2 to pi/2)
+//   slope  - raw OLS slope per period
+//   r2     - rolling R-squared (trend fit quality, 0-1)
+//   nSlope - slope normalized by rolling stdev
+angmom:{[x;w]
+    x:"f"$x;
+    // Rolling OLS slope (reuse infrastructure from slope function)
+    b:slope[w;x];
+    // Rolling stdev for normalization
+    sd:mdev[w;x];
+    // Normalized slope (comparable across instruments)
+    nSlope:b % 1e-10 | sd;
+    // Angle = atan(nSlope)
+    angle:atan nSlope;
+    // R-squared = (b^2 * var_t) / var_y
+    // var_t = (w^2 - 1) / 12, var_y = sd^2
+    varT:((w * w) - 1) % 12f;
+    r2:((b * b) * varT) % 1e-10 | sd * sd;
+    r2:0f | 1f & r2;
+    `angle`slope`r2`nSlope!(angle;b;r2;nSlope)}
+
+// Rolling angular momentum - table interface for multi-sym data
+// Groups by sym, cumulates returns to levels, computes angmom at each window.
+//
+// t:       table with date, sym, and return/level column
+// bycol:   group column (e.g., `sym)
+// col:     column to use (e.g., `ret for returns, `price for levels)
+// windows: list of lookback windows (e.g., 21 63 126)
+// cfg:     optional config dict:
+//   `cumulate  - 1b: cumulate col to levels (for returns), 0b: use as-is (default: 1b)
+//   `dtCol     - date column for sorting (default: `dt)
+//
+// Returns: original table + angmom_W, r2_W columns for each window W
+angmomTable:{[t;bycol;col;windows;cfg]
+    dtCol:$[99h = type cfg; $[`dtCol in key cfg; cfg`dtCol; `dt]; `dt];
+    cumulate:$[99h = type cfg; $[`cumulate in key cfg; cfg`cumulate; 1b]; 1b];
+    // Add row index to preserve original order
+    t:@[t;`angmomIdx__;:;til count t];
+    grp:group t bycol;
+    proc:{[t;dtCol;col;cumulate;windows;idx]
+        sub:dtCol xasc t idx;
+        x:"f"$sub col;
+        // Cumulate returns to levels if requested
+        lvl:$[cumulate; sums x; x];
+        // Compute angmom at each window
+        i:0;
+        while[i < count windows;
+            w:windows i;
+            am:angmom[lvl;w];
+            sub:@[sub;`$"angmom_",string w;:;am`angle];
+            sub:@[sub;`$"r2_",string w;:;am`r2];
+            i+:1];
+        sub}[t;dtCol;col;cumulate;windows;];
+    t:raze proc each value grp;
+    t:`angmomIdx__ xasc t;
+    ![t;();0b;enlist `angmomIdx__]}
+
 // =============================================================================
 // MEAN REVERSION SIGNALS
 // =============================================================================
