@@ -1256,26 +1256,22 @@ arIC_:{[symData;grp;nSyms;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
     // IC uses pxDiff (independent return). If absent, all IC metrics null.
-    // Build flat table of (dt, prevSig, pxDiff) with prev computed per sym
-    flat:$[hasPx;
-        raze {[sd]
-            ps:prev sd`sig; r:sd`pxDiff;
-            valid:where (not null ps) and not null r;
-            ([] dt:sd[`dt] valid; ps:ps valid; r:r valid)
-        } each symData;
-        ([] dt:(); ps:(); r:())];
+    // Build table with prev sig computed per sym
+    tab:$[hasPx;
+        raze {[nm;sd]
+            ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:prev sd`sig; r:sd`pxDiff)
+        }.'flip (key grp; symData);
+        ([] dt:(); sym:(); ps:(); r:())];
+    // panelIc: pooled cor(prev sig, pxDiff)
+    validTab:select from tab where not null ps, not null r;
+    panelIc:$[5 < count validTab; cor[validTab`ps; validTab`r]; 0n];
     // ic: average cross-sectional cor(prev sig, pxDiff) grouped by time
-    icByDt:$[0 < count flat;
-        {[flat;idx]
-            ps:flat[`ps] idx; r:flat[`r] idx;
-            $[2 > count ps; 0n; cor[ps; r]]
-        }[flat;] each value group flat`dt;
-        enlist 0n];
-    icByDt:0f ^ icByDt;
-    icNonZero:icByDt where icByDt <> 0f;
-    ic:$[0 < count icNonZero; avg icNonZero; 0n];
-    // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
-    panelIc:$[5 < count flat; cor[flat`ps; flat`r]; 0n];
+    icByDt:$[0 < count validTab;
+        exec cor[ps;r] by dt from validTab;
+        ()!()];
+    icVals:value 0f ^ icByDt;
+    icNonZero:icVals where icVals <> 0f;
+    ic:$[0 < count icNonZero; avg icNonZero; panelIc];
     // Per-sym IC: cor(prev sig, pxDiff) within each sym
     tsIcBySym:$[hasPx;
         (key grp)!{[x]
