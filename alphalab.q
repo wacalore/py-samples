@@ -1268,6 +1268,7 @@ arIC_:{[symData;grp;nSyms;pcfg]
     tsIcVals:(value tsIcBySym) where not null value tsIcBySym;
     tsIc:$[0 < count tsIcVals; avg tsIcVals; 0n];
     // Cross-sectional IC (multi-sym) or rolling cor (single-sym)
+    // IC = rank_cor(prev sig, pxDiff) — yesterday's signal vs today's return
     icDV:$[not hasPx; enlist 0n;
         nSyms >= 2;
         [icTab:raze {[nm;sd]
@@ -1288,7 +1289,12 @@ arIC_:{[symData;grp;nSyms;pcfg]
             num:exy - (ex * ey);
             varX:1e-6 | ex2 - (ex * ex);
             varY:1e-6 | ey2 - (ey * ey);
-            (-1f) | 1f & num % sqrt varX * varY
+            rawCor:num % sqrt varX * varY;
+            // Clip to [-1,1] preserving nulls (| and & convert null to -1f)
+            clipped:rawCor;
+            vIdx:where not null rawCor;
+            if[0 < count vIdx; clipped[vIdx]:(-1f) | 1f & rawCor vIdx];
+            clipped
         } each symData];
     icValid:icDV where not null icDV;
     ic:$[0 < count icValid; avg icValid; 0n];
