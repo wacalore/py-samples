@@ -1528,12 +1528,19 @@ acRowFromReport_:{[nm;d]
     vals:acMetricVal_[d;] each ks;
     flip (`alpha,ks)!((enlist nm),enlist each vals)}
 
-acReportsToTable_:{[x]
+acReportsToTable_:{[x;reportCfg]
     tx:type x;
-    if[98h = tx; :x];
+    if[98h = tx;
+        if[all `alpha`n`sharpe_nw`ic`ic_ir`turnover_efficiency`sortino`calmar`max_dd`edge_fragility`hit_rate`monthly_hit_rate`ic_breadth`ic_stability`top_concentration`tail_balance`regime_balance in cols x;
+            :x];
+        :acRowFromReport_[`alpha0; alphaReport[x;reportCfg]]];
     if[99h = tx;
         ks:key x;
         vals:value x;
+        if[(0 < count vals) & all 98h = type each vals;
+            rows:{[nm;tb;rc] acRowFromReport_[nm;alphaReport[tb;rc]]}[;;reportCfg]'[ks;vals];
+            out:raze rows;
+            :out];
         if[(0 < count vals) & all 99h = type each vals;
             rows:acRowFromReport_'[ks;vals];
             out:raze rows;
@@ -1541,12 +1548,17 @@ acReportsToTable_:{[x]
         :acRowFromReport_[`alpha0;x]];
     if[0h = tx;
         if[0 = count x; :([])];
+        if[all 98h = type each x;
+            nms:`$"alpha_",/:string til count x;
+            rows:{[nm;tb;rc] acRowFromReport_[nm;alphaReport[tb;rc]]}[;;reportCfg]'[nms;x];
+            out:raze rows;
+            :out];
         if[all 99h = type each x;
             nms:`$"alpha_",/:string til count x;
             rows:acRowFromReport_'[nms;x];
             out:raze rows;
             :out]];
-    '"alphaCompositeScore expects table, report dict, dict-of-reports, or list of report dicts"}
+    '"alphaCompositeScore expects a report table, raw alpha table, report dict, dict-of-reports, dict-of-alpha-tables, or list of report/alpha tables"}
 
 // Composite alpha score from alphaReport outputs.
 // reports: table, single report dict, dict alphaName->reportDict, or list of report dicts.
@@ -1556,7 +1568,15 @@ acReportsToTable_:{[x]
 //   top_concentration_thresh (0.60), tail_balance_lo/hi (0.60/1.70), regime_balance_floor (0)
 alphaCompositeScore:{[reports;cfg]
     c:acCfg_ cfg;
-    t:acReportsToTable_ reports;
+    scoreKeys:`w_edge`w_robust`w_consistency`w_diversification`min_n_days`penalty_n`penalty_top_conc`penalty_tail_balance`penalty_regime`top_concentration_thresh`tail_balance_lo`tail_balance_hi`regime_balance_floor`single_alpha_mode`report_cfg;
+    reportCfg:$[99h = type cfg;
+        $[`report_cfg in key cfg;
+            $[99h = type cfg`report_cfg; cfg`report_cfg; ()!()];
+            [kAll:key cfg;
+             kKeep:kAll except scoreKeys;
+             kKeep!cfg kKeep]];
+        ()!()];
+    t:acReportsToTable_[reports;reportCfg];
     if[0 = count t; :([])];
     if[not `alpha in cols t;
         nms:`$"alpha_",/:string til count t;
