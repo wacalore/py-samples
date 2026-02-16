@@ -446,8 +446,9 @@ csSmooth:{[t;halflife;cfg]
     rawStd:(dev; raw) fby t tc;
     smoMu:(avg; smo) fby t tc;
     smoSd:(dev; smo) fby t tc;
-    adj:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
-    t[`smoothSig]:$[doInv; neg adj; adj];
+    rawMu:(avg; raw) fby t tc;
+    csdev:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
+    t[`smoothSig]:$[doInv; rawMu - csdev; csdev];
     t}
 
 // -----------------------------------------------------------------------------
