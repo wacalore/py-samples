@@ -434,19 +434,20 @@ csResidNeutralize:{[M;window] means:avg each M; {[w;m;col] rresid[w;m;col]}[wind
 // Prevents mean drift and dispersion distortion from independent per-asset smoothing
 // t: table with time, sym, and signal columns
 // halflife: EMA halflife
-// cfg: dict with optional keys `time`sym`sig (defaults: `time`ricRoot`rawSig)
+// cfg: dict with optional keys `time`sym`sig`invert (defaults: `time`ricRoot`rawSig, invert=0b)
 // Returns: t with added `smoothSig column
 csSmooth:{[t;halflife;cfg]
-    dc:`time`sym`sig!`time`ricRoot`rawSig;
+    dc:`time`sym`sig`invert!(`time;`ricRoot;`rawSig;0b);
     c:$[99h = type cfg; dc,cfg; dc];
-    tc:c`time; sc:c`sym; sigc:c`sig;
+    tc:c`time; sc:c`sym; sigc:c`sig; doInv:c`invert;
     t:(tc,sc) xasc t;
     raw:"f"$t sigc;
     smo:(smooth[;halflife]; raw) fby t sc;
     rawStd:(dev; raw) fby t tc;
     smoMu:(avg; smo) fby t tc;
     smoSd:(dev; smo) fby t tc;
-    t[`smoothSig]:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
+    adj:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
+    t[`smoothSig]:$[doInv; neg adj; adj];
     t}
 
 // -----------------------------------------------------------------------------
