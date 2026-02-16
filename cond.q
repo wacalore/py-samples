@@ -208,7 +208,7 @@ attackDecay:{[f;decayHL]
     {[ld;y;z] $[(abs z) >= abs y; z; (ld * y) + (1 - ld) * z]}[ld]\[first f;ffill f]}
 
 // Lag: shift signal by n periods (positive = look back)
-lag:{[f;n] $[n>0; (n#0n),neg[n]_f; (neg[n]_f),abs[n]#0n]}
+lag:{[f;n] if[0=count f; :f]; $[n>0; (n#0n),neg[n]_f; (neg[n]_f),abs[n]#0n]}
 
 // Diff: signal change (momentum of signal)
 diff:{[f;n] f - lag[f;n]}
@@ -515,6 +515,178 @@ soGsrch_:{[nn;psh;grid;gen]
     best:valid first idesc sharpes valid;
     (grid best;sharpes best;sigs best)};
 
+// --- Stateful signal helpers for sigOpt ---
+// Threshold entry/exit state machine: returns +1 (long), -1 (short), 0 (flat)
+// Enter long when indicator <= entryLo, exit long when indicator >= exitLo
+// Enter short when indicator >= entryHi, exit short when indicator <= exitHi
+soThreshHold_:{[indicator;entryLo;exitLo;entryHi;exitHi]
+    n:count indicator; if[n=0; :`float$()]; pos:n#0f; st:0f; i:0;
+    while[i<n;
+        v:indicator i;
+        if[not null v;
+            $[st = 0f;
+                $[v <= entryLo; st:1f; v >= entryHi; st:-1f; (::)];
+              st = 1f;
+                if[v >= exitLo; st:0f];
+              // st = -1f
+                if[v <= exitHi; st:0f]]];
+        pos[i]:st;
+        i+:1];
+    pos};
+// Breakout entry with time-based hold: +1 on new high, -1 on new low, hold for N bars
+soBreakHold_:{[feat;w;holdN]
+    n:count feat; if[n=0; :`float$()]; pos:n#0f;
+    hh:mmax[w;feat]; ll:mmin[w;feat];
+    cnt:0; i:w;
+    while[i<n;
+        if[not null feat i;
+            $[feat[i] >= hh i; cnt:holdN;
+              feat[i] <= ll i; cnt:neg holdN;
+              cnt > 0; cnt-:1;
+              cnt < 0; cnt+:1;
+              (::)]];
+        pos[i]:"f"$signum cnt;
+        i+:1];
+    pos};
+
+// --- Bayesian Optimization for sigOpt ---
+// Transform unit [0,1] → parameter value (handles log-scale and integer rounding)
+soToParam_:{[lo;hi;isLog;isInt;u]
+    u:0f|1f&u;
+    v:$[isLog;
+        exp (log lo) + (u * (log hi) - log lo);
+        lo + (u * (hi - lo))];
+    $[isInt; `long$ 0.5 + v; v]};
+// Unit vector → parameter dict
+soU2P_:{[space;u] space[`names]!soToParam_'[space`lo;space`hi;space`log;space`int;u]};
+// RBF kernel: single row against all rows of X2
+soKernelRow_:{[x1;X2;ls]
+    sqdists:{sum d*d:x-y}[x1;] each X2;
+    exp neg 0.5 * sqdists % ls * ls};
+// Full N1 x N2 kernel matrix
+soKernel_:{[X1;X2;ls] soKernelRow_[;X2;ls] each X1};
+// Cholesky decomposition → lower triangular L where A = L L'
+soChol_:{[A]
+    n:count A; L:(n;n)#0f; j:0;
+    while[j<n;
+        s:A[j;j] - $[j>0; sum L[j;til j] * L[j;til j]; 0f];
+        L[j;j]:sqrt 1e-10 | s;
+        i:j+1;
+        while[i<n;
+            s:A[i;j] - $[j>0; sum L[i;til j] * L[j;til j]; 0f];
+            L[i;j]:s % L[j;j];
+            i+:1];
+        j+:1];
+    L};
+// Forward substitution: solve L x = b
+soFwdSolve_:{[L;b]
+    n:count b; x:n#0f; i:0;
+    while[i<n;
+        x[i]:(b[i] - $[i>0; sum L[i;til i] * x til i; 0f]) % L[i;i];
+        i+:1];
+    x};
+// Backward substitution: solve L' x = b
+soBwdSolve_:{[L;b]
+    n:count b; x:n#0f; i:n-1;
+    while[i>=0;
+        idx:(i+1) + til (n-1) - i;
+        s:$[0 < count idx; sum L[idx;i] * x idx; 0f];
+        x[i]:(b[i] - s) % L[i;i];
+        i-:1];
+    x};
+// GP predict mean + variance at test points given training data
+soGPpred_:{[Xtrain;ytrain;Xtest;ls;noise]
+    n:count Xtrain;
+    Kxx:soKernel_[Xtrain;Xtrain;ls];
+    Kxx:Kxx + noise * (til n) =/:\: til n;
+    L:soChol_ Kxx;
+    alpha:soBwdSolve_[L; soFwdSolve_[L;ytrain]];
+    Kxs:soKernel_[Xtest;Xtrain;ls];
+    mu:{sum x*y}[;alpha] each Kxs;
+    vars:{[L;krow] v:soFwdSolve_[L;krow]; 0f | 1f - sum v*v}[L;] each Kxs;
+    (mu;vars)};
+// Expected Improvement acquisition function
+soEI_:{[mu;vars;bestY]
+    sigma:sqrt vars;
+    imp:mu - bestY;
+    z:imp % 1e-10 | sigma;
+    pdf:(exp neg 0.5 * z * z) % sqrt 2 * acos neg 1f;
+    cdf:1f % 1f + exp neg 1.7023 * z;
+    (imp * cdf) + sigma * pdf};
+// Safe signal evaluation → Sharpe
+soEvalOne_:{[nn;psh;gen;p] psh soClean_ @[gen;p;{[n;e] n#0n}[nn;]]};
+// Create parameter space: names, bounds, log/int flags, optional validator
+soMkSpace_:{[nms;lo;hi;lg;it;vf]
+    `names`lo`hi`log`int`valid!((),nms;(),"f"$lo;(),"f"$hi;(),lg;(),it;vf)};
+// Main BO search loop (replaces grid search)
+soBOsrch_:{[nn;psh;gen;space;nInit;nIter;nCand]
+    d:count space`names;
+    // 0-parameter signals: evaluate once
+    if[d=0;
+        p:space[`names]!`float$();
+        sig:soClean_ @[gen;p;{[n;e] n#0n}[nn;]];
+        :(p; psh sig; sig)];
+    ev:soEvalOne_[nn;psh;gen;];
+    vld:space`valid; hasVld:not (::) ~ vld;
+    // Phase 1: random initial points (d floats per point)
+    us:d cut (nInit * d) ? 1f;
+    ps:soU2P_[space;] each us;
+    // Rejection-sample invalid points
+    if[hasVld;
+        idx:0;
+        while[idx < nInit;
+            att:0;
+            while[(not vld ps idx) and att < 100;
+                us[idx]:d?1f; ps[idx]:soU2P_[space; us idx]; att+:1];
+            idx+:1]];
+    sharpes:ev each ps;
+    // Phase 2: BO iterations
+    boI:0;
+    while[boI < nIter;
+        ys:"f"$sharpes;
+        ys:@[ys; where null ys; :; -10f];
+        ymu:avg ys; ysd:1e-10 | dev ys;
+        yn:(ys - ymu) % ysd;
+        bestYn:max yn;
+        // Candidates
+        candU:d cut (nCand * d) ? 1f;
+        candP:soU2P_[space;] each candU;
+        // Filter by constraint
+        if[hasVld;
+            mask:vld each candP;
+            candU:candU where mask;
+            candP:candP where mask;
+            // Resample if too few valid
+            if[10 > count candU;
+                extra:d cut (200 * d) ? 1f;
+                extraP:soU2P_[space;] each extra;
+                eMask:vld each extraP;
+                candU:candU, extra where eMask;
+                candP:candP, extraP where eMask;
+                candU:(nCand & count candU) # candU;
+                candP:(nCand & count candP) # candP]];
+        if[0 = count candU; boI+:1; :boI];
+        // GP predict + EI
+        nc:count candU;
+        gpRes:@[soGPpred_[us;yn;;0.3;0.1]; candU; {[nc;e] (nc#0f;nc#1f)}[nc;]];
+        mu:gpRes 0; vars:gpRes 1;
+        ei:soEI_[mu;vars;bestYn];
+        ei:@[ei; where null ei; :; 0f];
+        bestIdx:first idesc ei;
+        bestU:candU bestIdx;
+        bestP:soU2P_[space;bestU];
+        newSharpe:ev bestP;
+        us:us,enlist bestU;
+        ps:ps,enlist bestP;
+        sharpes:sharpes,newSharpe;
+        boI+:1];
+    // Return best
+    valid:where not null sharpes;
+    if[0=count valid; :(ps 0; 0n; nn#0n)];
+    best:valid first idesc "f"$sharpes valid;
+    bestSig:soClean_ @[gen;ps best;{[n;e] n#0n}[nn;]];
+    (ps best; sharpes best; bestSig)};
+
 // sigOpt: signal optimization boilerplate
 // Generates 15 momentum/regression signals from a feature, optimizes params by Sharpe
 // t: table with dt, time, ricRoot, risk, pxDiff + feature column
@@ -543,79 +715,112 @@ sigOpt:{[t;featureCol;cfg]
     g1:{[c;p] (.cond.rzscore[p`w;];c`feat) fby c`sym}[ctx;];
     g2:{[c;p] ((.cond.rrank[p`w;];c`feat) fby c`sym)-0.5}[ctx;];
     g3:{[c;p] (.cond.diff[;p`n];c`feat) fby c`sym}[ctx;];
-    g4:{[c;p] (.cond.smooth[;p`hl];(.cond.diff[;p`n];c`feat) fby c`sym) fby c`sym}[ctx;];
+    g4:{[c;p] d:(.cond.diff[;p`n];c`feat) fby c`sym; (.cond.smooth[;p`hl];0f^d) fby c`sym}[ctx;];
     g5:{[c;p] (.cond.diff[;p`n];(.cond.diff[;p`n];c`feat) fby c`sym) fby c`sym}[ctx;];
     g6:{[c;p] ((.cond.smooth[;p`fast];c`feat) fby c`sym)-((.cond.smooth[;p`slow];c`feat) fby c`sym)}[ctx;];
     g7:{[c;p] neg(.cond.rzscore[p`w;];c`feat) fby c`sym}[ctx;];
-    g8:{[c;p] (c`feat)%1e-10|(mdev[p`w;];c`feat) fby c`sym}[ctx;];
-    g9:{[c;p] (c`feat)-(.kdbtools.rpctl[p`w;0.5];c`feat) fby c`sym}[ctx;];
+    g8:{[c;p] (c`feat)%1e-10|(mdev[`long$p`w;];c`feat) fby c`sym}[ctx;];
+    g9:{[c;p] (c`feat)-(.kdbtools.rpctl[`long$p`w;0.5];c`feat) fby c`sym}[ctx;];
     g10:{[c;p] (.cond.decay[;p`hl];c`feat) fby c`sym}[ctx;];
     g11:{[c;p]
         tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat);
-        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;p`w;p`lam];
+        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;`long$p`w;p`lam];
         res`yhat}[ctx;];
     g12:{[c;p]
         tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat);
-        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;p`w;0f];
+        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;`long$p`w;0f];
         res`yhat}[ctx;];
     g13:{[c;p] mu:(avg;c`feat) fby c`tm;sd:(dev;c`feat) fby c`tm;((c`feat)-mu)%1e-10|sd}[ctx;];
     g14:{[c;p]
         byT:0!select f:f by t:t from([]t:c`tm;f:c`feat);
         raze{r:rank x;(r%((-1+count r)|1))-0.5}each byT`f}[ctx;];
-    g15:{[c;p] (.cond.smooth[;p`hl];(.cond.rzscore[p`w;];c`feat) fby c`sym) fby c`sym}[ctx;];
+    g15:{[c;p] zs:(.cond.rzscore[p`w;];c`feat) fby c`sym; (.cond.smooth[;p`hl];0f^zs) fby c`sym}[ctx;];
     // --- 10 Additional Signal Generators ---
     // RSI centered at 0: (RSI - 50) / 50 → range [-1, 1]
-    g16:{[c;p] (((.kdbtools.rsi[p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+    g16:{[c;p] (((.kdbtools.rsi[`long$p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
     // Bollinger band position: (x - sma) / (k * mdev)
-    g17:{[c;p] (.kdbtools.bbpos[p`w;p`k;];c`feat) fby c`sym}[ctx;];
+    g17:{[c;p] (.kdbtools.bbpos[`long$p`w;p`k;];c`feat) fby c`sym}[ctx;];
     // MACD histogram: extract hist from macd dict
-    g18:{[c;p] ({(.kdbtools.macd[x;y;z;w])`hist}[p`fast;p`slow;p`sig;];c`feat) fby c`sym}[ctx;];
+    g18:{[c;p] fn:{[fa;sl;sg;d] (.kdbtools.macd[fa;sl;sg;d])`hist}[`long$p`fast;`long$p`slow;`long$p`sig;]; (fn;c`feat) fby c`sym}[ctx;];
     // Slope t-statistic (trend significance)
-    g19:{[c;p] (.kdbtools.slopeT[p`w;];c`feat) fby c`sym}[ctx;];
+    g19:{[c;p] (.kdbtools.slopeT[`long$p`w;];c`feat) fby c`sym}[ctx;];
     // CCI (Commodity Channel Index)
-    g20:{[c;p] (.kdbtools.cci[p`w;];c`feat) fby c`sym}[ctx;];
+    g20:{[c;p] (.kdbtools.cci[`long$p`w;];c`feat) fby c`sym}[ctx;];
     // Stochastic %K centered at 0: (stochK - 50) / 50 → range [-1, 1]
-    g21:{[c;p] (((.kdbtools.stochk[p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+    g21:{[c;p] (((.kdbtools.stochk[`long$p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
     // Fisher transform (normalized momentum)
-    g22:{[c;p] (.kdbtools.fisher[p`w;];c`feat) fby c`sym}[ctx;];
+    g22:{[c;p] (.kdbtools.fisher[`long$p`w;];c`feat) fby c`sym}[ctx;];
     // Chande Momentum Oscillator, scale to [-1, 1]
-    g23:{[c;p] ((.kdbtools.cmo[p`w;];c`feat) fby c`sym) % 100f}[ctx;];
+    g23:{[c;p] ((.kdbtools.cmo[`long$p`w;];c`feat) fby c`sym) % 100f}[ctx;];
     // TRIX (triple-smoothed EMA rate of change)
-    g24:{[c;p] (.kdbtools.trix[p`w;];c`feat) fby c`sym}[ctx;];
+    g24:{[c;p] (.kdbtools.trix[`long$p`w;];c`feat) fby c`sym}[ctx;];
     // Kalman residual (deviation from adaptive filter → mean-reversion)
-    g25:{[c;p] (c`feat) - (.kdbtools.kalman[p`q;p`r;];c`feat) fby c`sym}[ctx;];
-    gens:(g1;g2;g3;g4;g5;g6;g7;g8;g9;g10;g11;g12;g13;g14;g15;g16;g17;g18;g19;g20;g21;g22;g23;g24;g25);
-    // --- Parameter Grids ---
-    grids:(
-        ([]w:10 21 42 63 126);
-        ([]w:10 21 42 63 126);
-        ([]n:5 10 21 42 63);
-        ([]n:10 21 42)cross([]hl:3 5 10);
-        ([]n:5 10 21);
-        ([]fast:3 5 10)cross([]slow:21 42 63);
-        ([]w:10 21 42 63 126);
-        ([]w:10 21 42 63);
-        ([]w:21 42 63);
-        ([]hl:3 5 10 21);
-        ([]w:42 63 126)cross([]lam:0.01 0.1 1.0);
-        ([]w:42 63 126);
-        enlist(enlist`x)!enlist 0;
-        enlist(enlist`x)!enlist 0;
-        ([]w:21 42 63)cross([]hl:3 5 10);
-        ([]w:5 10 14 21);
-        ([]w:10 21 42)cross([]k:1.5 2.0 2.5);
-        ([]fast:8 12)cross([]slow:21 26)cross([]sig:5 9);
-        ([]w:10 21 42 63);
-        ([]w:10 14 21 42);
-        ([]w:5 10 14 21);
-        ([]w:5 10 21 42);
-        ([]w:5 10 14 21);
-        ([]w:5 10 15 21);
-        ([]q:0.01 0.1 1.0)cross([]r:0.1 1.0 10.0));
-    names:`zscore`rank`momentum`smoothMom`accel`emaCross`meanRev`volAdj`breakout`decay`ridge`ols`csZscore`csRank`smoothZscore`rsi`bbandPos`macdHist`slopeT`cci`stochastic`fisher`cmo`trix`kalmanResid;
-    // Run grid search
-    -1"sigOpt: searching ",string[count names]," signal types...";
-    results:gsrch'[grids;gens];
+    g25:{[c;p] kf:({$[0=count z;z;.kdbtools.kalman[x;y;z]]}[p`q;p`r;];c`feat) fby c`sym; (c`feat) - kf}[ctx;];
+    // --- 5 Stateful (entry/exit/hold) Signal Generators ---
+    // RSI retrace: enter long on oversold, short on overbought, hold until neutral
+    g26:{[c;p]
+        rsi:(.kdbtools.rsi[`long$p`w;];c`feat) fby c`sym;
+        (soThreshHold_[;p`entryLo;p`exitMid;100f - p`entryLo;100f - p`exitMid]; rsi) fby c`sym}[ctx;];
+    // Bollinger band retrace: enter on band touch, hold until mid-band
+    g27:{[c;p]
+        bb:(.kdbtools.bbpos[`long$p`w;p`k;];c`feat) fby c`sym;
+        (soThreshHold_[;neg p`entry;0f;p`entry;0f]; bb) fby c`sym}[ctx;];
+    // Z-score snap: enter on extreme z-score, hold until mean-reversion
+    g28:{[c;p]
+        zs:(.cond.rzscore[`long$p`w;];c`feat) fby c`sym;
+        (soThreshHold_[;neg p`zEntry;0f;p`zEntry;0f]; zs) fby c`sym}[ctx;];
+    // Breakout-and-hold: enter on new high/low, hold for N periods
+    g29:{[c;p] (soBreakHold_[;`long$p`w;`long$p`hold];c`feat) fby c`sym}[ctx;];
+    // Tension snapback: enter when cumulative drift is extreme, hold until reversion
+    g30:{[c;p]
+        tension:(.cond.accumTension[`long$p`w;];c`feat) fby c`sym;
+        (soThreshHold_[;neg p`thresh;0f;p`thresh;0f]; tension) fby c`sym}[ctx;];
+    gens:(g1;g2;g3;g4;g5;g6;g7;g8;g9;g10;g11;g12;g13;g14;g15;g16;g17;g18;g19;g20;g21;g22;g23;g24;g25;g26;g27;g28;g29;g30);
+    // --- Parameter Spaces (broad continuous ranges for Bayesian optimization) ---
+    mks:soMkSpace_;
+    noVld:(::);
+    spaces:(
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // zscore
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // rank
+        mks[enlist`n; 1; 126; 0b; 1b; noVld];                           // momentum
+        mks[`n`hl; 3 2; 63 63; 00b; 11b; noVld];                        // smoothMom
+        mks[enlist`n; 1; 63; 0b; 1b; noVld];                            // accel
+        mks[`fast`slow; 2 5; 42 252; 00b; 11b; {x[`fast]<x`slow}];     // emaCross
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // meanRev
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // volAdj
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // breakout
+        mks[enlist`hl; 1; 126; 0b; 1b; noVld];                          // decay
+        mks[`w`lam; 21 0.001; 252 10; 01b; 10b; noVld];                 // ridge
+        mks[enlist`w; 21; 252; 0b; 1b; noVld];                          // ols
+        mks[`$(); `float$(); `float$(); `boolean$(); `boolean$(); noVld]; // csZscore
+        mks[`$(); `float$(); `float$(); `boolean$(); `boolean$(); noVld]; // csRank
+        mks[`w`hl; 5 2; 252 63; 00b; 11b; noVld];                       // smoothZscore
+        mks[enlist`w; 2; 126; 0b; 1b; noVld];                           // rsi
+        mks[`w`k; 5 0.5; 252 5.0; 00b; 10b; noVld];                    // bbandPos
+        mks[`fast`slow`sig; 2 8 2; 26 63 26; 000b; 111b; {x[`fast]<x`slow}]; // macdHist
+        mks[enlist`w; 5; 252; 0b; 1b; noVld];                           // slopeT
+        mks[enlist`w; 5; 126; 0b; 1b; noVld];                           // cci
+        mks[enlist`w; 2; 126; 0b; 1b; noVld];                           // stochastic
+        mks[enlist`w; 2; 126; 0b; 1b; noVld];                           // fisher
+        mks[enlist`w; 2; 126; 0b; 1b; noVld];                           // cmo
+        mks[enlist`w; 3; 63; 0b; 1b; noVld];                            // trix
+        mks[`q`r; 0.001 0.01; 10 100; 11b; 00b; noVld];                // kalmanResid
+        // --- Stateful (entry/exit/hold) signals ---
+        mks[`w`entryLo`exitMid; 5 15 40; 63 40 65; 000b; 100b; {x[`entryLo]<x`exitMid}]; // rsiRetrace
+        mks[`w`k`entry; 10 1.0 0.5; 126 3.0 1.5; 000b; 100b; noVld];                     // bbRetrace
+        mks[`w`zEntry; 10 1.0; 252 4.0; 00b; 10b; noVld];                                 // zscoreSnap
+        mks[`w`hold; 5 3; 126 63; 00b; 11b; noVld];                                       // breakHold
+        mks[`w`thresh; 10 1.0; 252 4.0; 00b; 10b; noVld]);                                // tensionSnap
+    names:`zscore`rank`momentum`smoothMom`accel`emaCross`meanRev`volAdj`breakout`decay`ridge`ols`csZscore`csRank`smoothZscore`rsi`bbandPos`macdHist`slopeT`cci`stochastic`fisher`cmo`trix`kalmanResid`rsiRetrace`bbRetrace`zscoreSnap`breakHold`tensionSnap;
+    // BO config (overridable)
+    boInit:$[`boInit in key c; c`boInit; 20];
+    boIter:$[`boIter in key c; c`boIter; 25];
+    boCand:$[`boCand in key c; c`boCand; 200];
+    // Run Bayesian optimization
+    nSig:count names;
+    -1"sigOpt: optimizing ",string[nSig]," signals via Bayesian optimization (",string[boInit]," init + ",string[boIter]," BO iter each)...";
+    bosrch:soBOsrch_[nn;psh;;;boInit;boIter;boCand];
+    results:bosrch'[gens;spaces];
     bestParams:results[;0];
     bestSigs:results[;2];
     mets:fmet each bestSigs;
