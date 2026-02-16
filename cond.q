@@ -430,25 +430,32 @@ csWinsorize:{[M;loPct;hiPct] {[loPct;hiPct;row] s:asc row; lo:s `long$loPct*coun
 // csResidNeutralize: residualize each asset vs cross-sectional mean
 csResidNeutralize:{[M;window] means:avg each M; {[w;m;col] rresid[w;m;col]}[window;means] each flip M}
 
-// csSmooth: EMA per asset, then cross-sectionally demean + rescale to raw std
-// Prevents mean drift and dispersion distortion from independent per-asset smoothing
+// csSmooth: joint EMA smoothing of level and cross-sectional components
+// Decomposes signal into CS mean (level) and CS deviation, smooths each independently,
+// rescales deviations to match raw dispersion, then recombines.
 // t: table with time, sym, and signal columns
-// halflife: EMA halflife
-// cfg: dict with optional keys `time`sym`sig`invert (defaults: `time`ricRoot`rawSig, invert=0b)
+// halflife: default EMA halflife (used for both level and CS unless overridden in cfg)
+// cfg: dict with optional keys:
+//   `time`sym`sig  - column names (defaults: `time`ricRoot`rawSig)
+//   `levelHL       - halflife for level/mean smoothing (default: halflife)
+//   `csHL          - halflife for cross-sectional deviation smoothing (default: halflife)
+//   `invert        - negate CS deviations (default: 0b)
 // Returns: t with added `smoothSig column
 csSmooth:{[t;halflife;cfg]
-    dc:`time`sym`sig`invert!(`time;`ricRoot;`rawSig;0b);
+    dc:`time`sym`sig`invert`levelHL`csHL!(`time;`ricRoot;`rawSig;0b;halflife;halflife);
     c:$[99h = type cfg; dc,cfg; dc];
     tc:c`time; sc:c`sym; sigc:c`sig; doInv:c`invert;
+    lHL:c`levelHL; cHL:c`csHL;
     t:(tc,sc) xasc t;
     raw:"f"$t sigc;
-    smo:(smooth[;halflife]; raw) fby t sc;
-    rawStd:(dev; raw) fby t tc;
-    smoMu:(avg; smo) fby t tc;
-    smoSd:(dev; smo) fby t tc;
     rawMu:(avg; raw) fby t tc;
-    csdev:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
-    t[`smoothSig]:rawMu + $[doInv; neg csdev; csdev];
+    rawDev:raw - rawMu;
+    smoMu:(smooth[;lHL]; rawMu) fby t sc;
+    smoDev:(smooth[;cHL]; rawDev) fby t sc;
+    rawStd:(dev; raw) fby t tc;
+    smoDevSd:(dev; smoDev) fby t tc;
+    csdev:0f ^ smoDev * rawStd % 1e-10 | smoDevSd;
+    t[`smoothSig]:smoMu + $[doInv; neg csdev; csdev];
     t}
 
 // -----------------------------------------------------------------------------
