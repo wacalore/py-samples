@@ -1581,6 +1581,10 @@ alphaCompositeScore:{[reports;cfg]
     if[not `alpha in cols t;
         nms:`$"alpha_",/:string til count t;
         t:update alpha:nms from t];
+    corrP:acCol_[t;`corr_to_portfolio;0f];
+    corrP:@[corrP; where null corrP; :; 0f];
+    residSh:acCol_[t;`residual_sharpe;0f];
+    residSh:@[residSh; where null residSh; :; 0f];
     useAbs:(1 = count t) & not (c`single_alpha_mode) in `relative`cross_sectional;
     if[useAbs;
         edge:0.35f * acSquash_[acCol_[t;`sharpe_nw;0n];1.5f] +
@@ -1595,8 +1599,8 @@ alphaCompositeScore:{[reports;cfg]
             0.20f * acSquash_[acCol_[t;`monthly_hit_rate;0.5f] - 0.5f;0.10f] +
             0.25f * acSquash_[acCol_[t;`ic_breadth;0.5f] - 0.5f;0.12f] +
             0.25f * acSquash_[neg acCol_[t;`ic_stability;0n];0.08f];
-        divers:0.60f * acSquash_[neg abs acCol_[t;`corr_to_portfolio;0n];0.30f] +
-            0.40f * acSquash_[acCol_[t;`residual_sharpe;0n];1.0f];
+        divers:0.60f * acSquash_[neg abs corrP;0.30f] +
+            0.40f * acSquash_[residSh;1.0f];
     ];
     if[not useAbs;
         edge:0.35f * acRobustZ_[acCol_[t;`sharpe_nw;0n];1f] +
@@ -1611,8 +1615,8 @@ alphaCompositeScore:{[reports;cfg]
             0.20f * acRobustZ_[acCol_[t;`monthly_hit_rate;0n];1f] +
             0.25f * acRobustZ_[acCol_[t;`ic_breadth;0n];1f] +
             0.25f * acRobustZ_[acCol_[t;`ic_stability;0n];-1f];
-        divers:0.60f * acRobustZ_[abs acCol_[t;`corr_to_portfolio;0n];-1f] +
-            0.40f * acRobustZ_[acCol_[t;`residual_sharpe;0n];1f];
+        divers:0.60f * acRobustZ_[abs corrP;-1f] +
+            0.40f * acRobustZ_[residSh;1f];
     ];
 
     raw:(c`w_edge) * edge + (c`w_robust) * robust + (c`w_consistency) * consist + (c`w_diversification) * divers;
