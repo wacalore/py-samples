@@ -442,11 +442,11 @@ csSmooth:{[t;halflife;cfg]
     tc:c`time; sc:c`sym; sigc:c`sig;
     t:(tc,sc) xasc t;
     raw:"f"$t sigc;
-    ema:(smooth[;halflife]; raw) fby t sc;
+    smo:(smooth[;halflife]; raw) fby t sc;
     rawStd:(dev; raw) fby t tc;
-    eMu:(avg; ema) fby t tc;
-    eSd:(dev; ema) fby t tc;
-    t[`smoothSig]:0f ^ (ema - eMu) * rawStd % 1e-10 | eSd;
+    smoMu:(avg; smo) fby t tc;
+    smoSd:(dev; smo) fby t tc;
+    t[`smoothSig]:0f ^ (smo - smoMu) * rawStd % 1e-10 | smoSd;
     t}
 
 // -----------------------------------------------------------------------------
