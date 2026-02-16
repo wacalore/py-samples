@@ -430,6 +430,25 @@ csWinsorize:{[M;loPct;hiPct] {[loPct;hiPct;row] s:asc row; lo:s `long$loPct*coun
 // csResidNeutralize: residualize each asset vs cross-sectional mean
 csResidNeutralize:{[M;window] means:avg each M; {[w;m;col] rresid[w;m;col]}[window;means] each flip M}
 
+// csSmooth: EMA per asset, then cross-sectionally demean + rescale to raw std
+// Prevents mean drift and dispersion distortion from independent per-asset smoothing
+// t: table with time, sym, and signal columns
+// halflife: EMA halflife
+// cfg: dict with optional keys `time`sym`sig (defaults: `time`ricRoot`rawSig)
+// Returns: t with added `smoothSig column
+csSmooth:{[t;halflife;cfg]
+    dc:`time`sym`sig!`time`ricRoot`rawSig;
+    c:$[99h = type cfg; dc,cfg; dc];
+    tc:c`time; sc:c`sym; sigc:c`sig;
+    t:(tc,sc) xasc t;
+    raw:"f"$t sigc;
+    ema:(smooth[;halflife]; raw) fby t sc;
+    rawStd:(dev; raw) fby t tc;
+    eMu:(avg; ema) fby t tc;
+    eSd:(dev; ema) fby t tc;
+    t[`smoothSig]:0f ^ (ema - eMu) * rawStd % 1e-10 | eSd;
+    t}
+
 // -----------------------------------------------------------------------------
 // FORWARD SIMULATION
 // -----------------------------------------------------------------------------
