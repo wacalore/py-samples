@@ -1155,19 +1155,14 @@ arParseCfg_:{[t;cfg]
         (cDt;cSym;cSig;cRet;cPx;cPx in cols t;cPS;hasPS;topN;winPct;icLags;epGap;vrQ;vrW;cReg;hasReg)}
 
 arExtract_:{[t;pcfg]
-    tSorted:pcfg[`cDt] xasc t;
-    // Compute prevSig on full dt-sorted table: use table column or (prev; 0^sig) fby sym
-    ps:$[pcfg`hasPrevSig;
-        "f"$tSorted pcfg`cPrevSig;
-        (prev; 0f ^ "f"$tSorted pcfg`cSig) fby tSorted pcfg`cSym];
-    grp:group tSorted pcfg`cSym;
-    sd:{[tSorted;pcfg;ps;idx]
-        d:`dt`sig`alpha`prevSig!(tSorted[pcfg`cDt] idx; "f"$tSorted[pcfg`cSig] idx;
-            "f"$tSorted[pcfg`cRet] idx; ps idx);
-        if[pcfg`hasPx; d[`pxDiff]:"f"$tSorted[pcfg`cPx] idx];
-        if[pcfg`hasRegime; d[`regime]:"f"$tSorted[pcfg`cRegime] idx];
+    grp:group t pcfg`cSym;
+    sd:{[t;pcfg;idx]
+        sub:pcfg[`cDt] xasc t idx;
+        d:`dt`sig`alpha!(sub pcfg`cDt; "f"$sub pcfg`cSig; "f"$sub pcfg`cRet);
+        if[pcfg`hasPx; d[`pxDiff]:"f"$sub pcfg`cPx];
+        if[pcfg`hasRegime; d[`regime]:"f"$sub pcfg`cRegime];
         d
-    }[tSorted;pcfg;ps;] each value grp;
+    }[t;pcfg;] each value grp;
     `grp`symData!(grp;sd)}
 
 arPerf_:{[nzr;nzDts;n;winPct]
@@ -1259,51 +1254,55 @@ arTurnover_:{[symData]
         (avg abs 1 _ deltas vSig) % avgAbs
     } each symData}
 
-arIC_:{[symData;grp;nSyms;pcfg]
+arIC_:{[t;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
-    nullIc:`ic`ic_ir`panelIc`tsIc`ic_decay!(0n;0n;0n;(key grp)!(count symData)#0n;icLags!(count icLags)#0n);
+    syms:distinct t pcfg`cSym;
+    nullIc:`ic`ic_ir`panelIc`tsIc`ic_decay!(0n;0n;0n;syms!(count syms)#0n;icLags!(count icLags)#0n);
     if[not hasPx; :nullIc];
-    // Build flat table: prevSig per sym (computed in arExtract_ via fby)
-    tab:raze {[nm;sd]
-        ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:sd`prevSig; r:sd`pxDiff)
-    }.'flip (key grp; symData);
-    if[0 = count tab; :nullIc];
-    // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
-    pv:where (not null tab`ps) and not null tab`r;
-    rawPanel:$[5 < count pv; cor[tab[`ps] pv; tab[`r] pv]; 0n];
+    // Sort by time, compute prevSig directly: (prev; 0^sig) fby sym
+    tSorted:pcfg[`cDt] xasc t;
+    ps:$[pcfg`hasPrevSig;
+        "f"$tSorted pcfg`cPrevSig;
+        (prev; 0f ^ "f"$tSorted pcfg`cSig) fby tSorted pcfg`cSym];
+    r:"f"$tSorted pcfg`cPx;
+    dt:tSorted pcfg`cDt;
+    sym:tSorted pcfg`cSym;
+    // panelIc: pooled cor(prevSig, pxDiff) across all syms and times
+    valid:where (not null ps) and not null r;
+    rawPanel:$[5 < count valid; cor[ps valid; r valid]; 0n];
     panelIc:$[rawPanel within -1 1f; rawPanel; 0n];
-    // ic: average cross-sectional cor(prev sig, pxDiff) grouped by time
-    // Group by dt, compute cor per group, fill null->0, avg non-zero
-    icByDt:{[tab;idx]
-        ps:tab[`ps] idx; r:tab[`r] idx;
-        v:where (not null ps) and not null r;
-        $[2 > count v; 0n; cor[ps v; r v]]
-    }[tab;] each value group tab`dt;
+    // ic: average cross-sectional cor(prevSig, pxDiff) grouped by time
+    icByDt:{[ps;r;idx]
+        p:ps idx; ret:r idx;
+        v:where (not null p) and not null ret;
+        $[2 > count v; 0n; cor[p v; ret v]]
+    }[ps;r;] each value group dt;
     // Replace null/0w/-0w with 0 — valid cor is always in [-1,1]
     icByDt:@[icByDt; where not icByDt within -1 1f; :; 0f];
     icNZ:icByDt where icByDt <> 0f;
     ic:$[0 < count icNZ; avg icNZ; panelIc];
-    // Per-sym IC: cor(prevSig, pxDiff) within each sym
-    tsIcBySym:(key grp)!{[x]
-        ps:x`prevSig; r:x`pxDiff;
-        valid:where (not null ps) and not null r;
-        v:$[5 < count valid; cor[ps valid; r valid]; 0n];
-        $[v within -1 1f; v; 0n]
-    } each symData;
-    // IC decay: cor(prevSig, fwd h-day pxDiff) at each horizon
-    icDecay:{[symData;h]
-        ics:{[sd;h]
-            ps:sd`prevSig; r:sd`pxDiff; nn:count ps;
-            fwdRet:msum[h; 1 rotate r];
+    // tsIc: per-sym cor(prevSig, pxDiff)
+    symGrp:group sym;
+    tsIcBySym:(key symGrp)!{[ps;r;idx]
+        p:ps idx; ret:r idx;
+        v:where (not null p) and not null ret;
+        c:$[5 < count v; cor[p v; ret v]; 0n];
+        $[c within -1 1f; c; 0n]
+    }[ps;r;] each value symGrp;
+    // IC decay: cor(prevSig, fwd h-day pxDiff) at each horizon per sym
+    icDecay:{[ps;r;symGrp;h]
+        ics:{[ps;r;idx;h]
+            p:ps idx; ret:r idx; nn:count p;
+            fwdRet:msum[h; 1 rotate ret];
             fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
-            valid:where (not null ps) and not null fwdRet;
-            c:$[5 < count valid; cor[ps valid; fwdRet valid]; 0n];
+            v:where (not null p) and not null fwdRet;
+            c:$[5 < count v; cor[p v; fwdRet v]; 0n];
             $[c within -1 1f; c; 0n]
-        }[;h] each symData;
+        }[ps;r;;h] each value symGrp;
         v:ics where not null ics;
         $[0 < count v; avg v; 0n]
-    }[symData;] each icLags;
+    }[ps;r;symGrp;] each icLags;
     icStd:$[1 < count icNZ; dev icNZ; 0n];
     icIR:$[icStd > 1e-10; ic % icStd; 0n];
     `ic`ic_ir`panelIc`tsIc`ic_decay!(ic;icIR;panelIc;tsIcBySym;icLags!icDecay)}
@@ -1358,7 +1357,7 @@ alphaReport:{[t;cfg]
     payoff:arPayoff_[nzr;n;pcfg`topN];
     ep:arEpisodes_[nzr;nzDts;n;pcfg`topN;pcfg`epGap];
     turn:(enlist `turnover)!enlist arTurnover_ symData;
-    icm:arIC_[symData;grp;nSyms;pcfg];
+    icm:arIC_[t;pcfg];
     reg:arRegime_[symData;dts;nzr;nzDts;n;pcfg];
     (enlist[`n]!enlist n),perf,risk,payoff,turn,icm,`episodes`regime!(ep;reg)}
 
