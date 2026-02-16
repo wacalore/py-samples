@@ -1149,18 +1149,25 @@ arParseCfg_:{[t;cfg]
     vrW:$[99h=type cfg;$[`vrW in key cfg;cfg`vrW;63];63];
     cReg:$[99h=type cfg;$[`regimeCol in key cfg;cfg`regimeCol;`];`];
     hasReg:(cReg <> `) and cReg in cols t;
-    `cDt`cSym`cSig`cRet`cPx`hasPx`topN`winPct`icLags`epGap`vrQ`vrW`cRegime`hasRegime!
-        (cDt;cSym;cSig;cRet;cPx;cPx in cols t;topN;winPct;icLags;epGap;vrQ;vrW;cReg;hasReg)}
+    cPS:$[99h=type cfg;$[`prevSigCol in key cfg;cfg`prevSigCol;`prevSig];`prevSig];
+    hasPS:cPS in cols t;
+    `cDt`cSym`cSig`cRet`cPx`hasPx`cPrevSig`hasPrevSig`topN`winPct`icLags`epGap`vrQ`vrW`cRegime`hasRegime!
+        (cDt;cSym;cSig;cRet;cPx;cPx in cols t;cPS;hasPS;topN;winPct;icLags;epGap;vrQ;vrW;cReg;hasReg)}
 
 arExtract_:{[t;pcfg]
-    grp:group t pcfg`cSym;
-    sd:{[t;pcfg;idx]
-        sub:pcfg[`cDt] xasc t idx;
-        d:`dt`sig`alpha!(sub pcfg`cDt; "f"$sub pcfg`cSig; "f"$sub pcfg`cRet);
-        if[pcfg`hasPx; d[`pxDiff]:"f"$sub pcfg`cPx];
-        if[pcfg`hasRegime; d[`regime]:"f"$sub pcfg`cRegime];
+    tSorted:pcfg[`cDt] xasc t;
+    // Compute prevSig on full dt-sorted table: use table column or (prev; 0^sig) fby sym
+    ps:$[pcfg`hasPrevSig;
+        "f"$tSorted pcfg`cPrevSig;
+        (prev; 0f ^ "f"$tSorted pcfg`cSig) fby tSorted pcfg`cSym];
+    grp:group tSorted pcfg`cSym;
+    sd:{[tSorted;pcfg;ps;idx]
+        d:`dt`sig`alpha`prevSig!(tSorted[pcfg`cDt] idx; "f"$tSorted[pcfg`cSig] idx;
+            "f"$tSorted[pcfg`cRet] idx; ps idx);
+        if[pcfg`hasPx; d[`pxDiff]:"f"$tSorted[pcfg`cPx] idx];
+        if[pcfg`hasRegime; d[`regime]:"f"$tSorted[pcfg`cRegime] idx];
         d
-    }[t;pcfg;] each value grp;
+    }[tSorted;pcfg;ps;] each value grp;
     `grp`symData!(grp;sd)}
 
 arPerf_:{[nzr;nzDts;n;winPct]
@@ -1255,11 +1262,11 @@ arTurnover_:{[symData]
 arIC_:{[symData;grp;nSyms;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
-    nullIc:`ic`panelIc`tsIc`ic_decay!(0n;0n;(key grp)!(count symData)#0n;icLags!(count icLags)#0n);
+    nullIc:`ic`ic_ir`panelIc`tsIc`ic_decay!(0n;0n;0n;(key grp)!(count symData)#0n;icLags!(count icLags)#0n);
     if[not hasPx; :nullIc];
-    // Build flat table: prev sig per sym, then combine
+    // Build flat table: prevSig per sym (computed in arExtract_ via fby)
     tab:raze {[nm;sd]
-        ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:prev sd`sig; r:sd`pxDiff)
+        ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:sd`prevSig; r:sd`pxDiff)
     }.'flip (key grp; symData);
     if[0 = count tab; :nullIc];
     // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
@@ -1277,17 +1284,17 @@ arIC_:{[symData;grp;nSyms;pcfg]
     icByDt:@[icByDt; where not icByDt within -1 1f; :; 0f];
     icNZ:icByDt where icByDt <> 0f;
     ic:$[0 < count icNZ; avg icNZ; panelIc];
-    // Per-sym IC: cor(prev sig, pxDiff) within each sym
+    // Per-sym IC: cor(prevSig, pxDiff) within each sym
     tsIcBySym:(key grp)!{[x]
-        ps:prev x`sig; r:x`pxDiff;
+        ps:x`prevSig; r:x`pxDiff;
         valid:where (not null ps) and not null r;
         v:$[5 < count valid; cor[ps valid; r valid]; 0n];
         $[v within -1 1f; v; 0n]
     } each symData;
-    // IC decay: cor(prev sig, fwd h-day pxDiff) at each horizon
+    // IC decay: cor(prevSig, fwd h-day pxDiff) at each horizon
     icDecay:{[symData;h]
         ics:{[sd;h]
-            ps:prev sd`sig; r:sd`pxDiff; nn:count ps;
+            ps:sd`prevSig; r:sd`pxDiff; nn:count ps;
             fwdRet:msum[h; 1 rotate r];
             fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
             valid:where (not null ps) and not null fwdRet;
