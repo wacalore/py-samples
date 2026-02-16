@@ -1501,7 +1501,18 @@ acCfg_:{[cfg]
         m)}
 
 acCol_:{[t;c;d]
-    $[c in cols t; "f"$t c; (count t) # ("f"$d)]}
+    n:count t;
+    if[not c in cols t; :n # ("f"$d)];
+    v:@[{"f"$x}; t c; {n # ("f"$d)}];
+    if[9h <> type v; :n # ("f"$d)];
+    v}
+
+acSanitizeFinite_:{[x;fill]
+    fv:"f"$fill;
+    v:"f"$x;
+    v:@[v; where null v; :; fv];
+    bad:where (abs v) = 0w;
+    @[v; bad; :; fv]}
 
 acRobustZ_:{[x;dir]
     v:"f"$x;
@@ -1535,18 +1546,71 @@ acRowFromReport_:{[nm;d]
     vals:acMetricVal_[d;] each ks;
     flip (`alpha,ks)!((enlist nm),enlist each vals)}
 
+acDailyAlpha_:{[tb;rc]
+    pc:arParseCfg_[tb;rc];
+    td:([] dt:tb pc`cDt; alpha:"f"$tb pc`cRet);
+    `dt xasc 0!select alpha:sum alpha by dt from td}
+
+acCorrResidualFromDaily_:{[dTabs]
+    m:count dTabs;
+    if[m = 0; :`corr`resid!(() ; ())];
+    if[m = 1; :`corr`resid!((enlist 0f); (enlist 0f))];
+    allDates:asc distinct raze {x`dt} each dTabs;
+    vecs:();
+    i:0;
+    while[i < m;
+        dd:dTabs i;
+        base:([dt:allDates] alpha:(count allDates)#0n);
+        j:base lj `dt xkey dd;
+        vecs,:enlist (value j)`alpha;
+        i+:1];
+    nD:count allDates;
+    port:nD#0n;
+    j:0;
+    while[j < nD;
+        row:{[x;j] x j}[;j] each vecs;
+        v:row where not null row;
+        if[0 < count v; port[j]:avg v];
+        j+:1];
+    corrs:m#0n;
+    resids:m#0n;
+    i:0;
+    while[i < m;
+        x:vecs i;
+        v:where (not null x) & not null port;
+        if[count v >= 2;
+            c:cor[x v; port v];
+            if[c within -1 1f; corrs[i]:c]];
+        if[count v >= 3;
+            xv:x v; pv:port v;
+            mp:avg pv; mx:avg xv;
+            dp:pv - mp; dx:xv - mx;
+            varp:avg dp * dp;
+            if[varp > 1e-12;
+                beta:(avg dx * dp) % varp;
+                res:xv - beta * pv;
+                sd:dev res;
+                if[sd > 1e-10; resids[i]:(sqrt 252f) * (avg res) % sd]]];
+        i+:1];
+    `corr`resid!(acSanitizeFinite_[corrs;0f]; acSanitizeFinite_[resids;0f])}
+
 acReportsToTable_:{[x;reportCfg]
     tx:type x;
     if[98h = tx;
         if[all `alpha`n`sharpe_nw`ic`ic_ir`turnover_efficiency`sortino`calmar`max_dd`edge_fragility`hit_rate`monthly_hit_rate`ic_breadth`ic_stability`top_concentration`tail_balance`regime_balance in cols x;
             :x];
-        :acRowFromReport_[`alpha0; alphaReport[x;reportCfg]]];
+        out:acRowFromReport_[`alpha0; alphaReport[x;reportCfg]];
+        out:update corr_to_portfolio:0f, residual_sharpe:0f from out;
+        :out];
     if[99h = tx;
         ks:key x;
         vals:value x;
         if[(0 < count vals) & all 98h = type each vals;
             rows:{[nm;tb;rc] acRowFromReport_[nm;alphaReport[tb;rc]]}[;;reportCfg]'[ks;vals];
             out:raze rows;
+            dly:acDailyAlpha_[;reportCfg] each vals;
+            cr:acCorrResidualFromDaily_ dly;
+            out:update corr_to_portfolio:cr`corr, residual_sharpe:cr`resid from out;
             :out];
         if[(0 < count vals) & all 99h = type each vals;
             rows:acRowFromReport_'[ks;vals];
@@ -1559,6 +1623,9 @@ acReportsToTable_:{[x;reportCfg]
             nms:`$"alpha_",/:string til count x;
             rows:{[nm;tb;rc] acRowFromReport_[nm;alphaReport[tb;rc]]}[;;reportCfg]'[nms;x];
             out:raze rows;
+            dly:acDailyAlpha_[;reportCfg] each x;
+            cr:acCorrResidualFromDaily_ dly;
+            out:update corr_to_portfolio:cr`corr, residual_sharpe:cr`resid from out;
             :out];
         if[all 99h = type each x;
             nms:`$"alpha_",/:string til count x;
@@ -1588,10 +1655,9 @@ alphaCompositeScore:{[reports;cfg]
     if[not `alpha in cols t;
         nms:`$"alpha_",/:string til count t;
         t:update alpha:nms from t];
-    corrP:acCol_[t;`corr_to_portfolio;0f];
-    corrP:@[corrP; where null corrP; :; 0f];
-    residSh:acCol_[t;`residual_sharpe;0f];
-    residSh:@[residSh; where null residSh; :; 0f];
+    corrP:acSanitizeFinite_[acCol_[t;`corr_to_portfolio;0f];0f];
+    residSh:acSanitizeFinite_[acCol_[t;`residual_sharpe;0f];0f];
+    t:update corr_to_portfolio:corrP, residual_sharpe:residSh from t;
     useAbs:(1 = count t) & not (c`single_alpha_mode) in `relative`cross_sectional;
     if[useAbs;
         edge:0.35f * acSquash_[acCol_[t;`sharpe_nw;0n];1.5f] +
