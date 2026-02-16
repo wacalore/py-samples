@@ -471,6 +471,165 @@ csInvert:{[t;cfg]
     t[sigc]:(2 * mu) - "f"$t sigc;
     t}
 
+// sigOpt internals (namespace-level to avoid q closure scoping issues)
+// Clean infinities/nulls: replace 0w/-0w with 0n
+soClean_:{@[x;where not x within (-1e308;1e308);:;0n]};
+soPsh_:{[sym;ret;rsk;tm;ann;sig]
+    sig:soClean_ sig;
+    scaled:soClean_ sig%rsk;
+    ps:(prev;0f^scaled) fby sym;
+    pnl:ps*ret;
+    tab:([]t:tm;p:pnl);
+    byTm:0!select sp:sum p by t from tab;
+    v:byTm[`sp] where not null byTm`sp;
+    $[(1e-10<dev v)and 2<count v;((avg v)%dev v)*sqrt ann;0n]};
+soFmet_:{[sym;ret;rsk;tm;ann;sig]
+    sig:soClean_ sig;
+    if[all null sig;:`sharpe`ic`hitRate`turnover`maxDD`profitFactor!(0n;0n;0n;0n;0n;0n)];
+    scaled:soClean_ sig%rsk;
+    ps:(prev;0f^scaled) fby sym;
+    pnl:ps*ret;
+    tab:([]t:tm;p:pnl);
+    byTm:0!select sp:sum p by t from tab;
+    v:byTm[`sp] where not null byTm`sp;
+    sharpe:$[(1e-10<dev v)and 2<count v;((avg v)%dev v)*sqrt ann;0n];
+    tab2:([]t:tm;ps0:ps;r:ret);
+    byTm2:0!select ps0,r by t from tab2;
+    ics:{cor[0f^x;0f^y]}'[byTm2`ps0;byTm2`r];
+    ics:@[ics;where not ics within -1 1f;:;0n];
+    icV:ics where not null ics;
+    ic:$[0<count icV;avg icV;0n];
+    mask:(not null ps)&not null ret;
+    hr:$[0<sum mask;(sum ((signum ps)=signum ret)&mask)%sum mask;0n];
+    dlt:soClean_(deltas;0f^scaled) fby sym;
+    to:avg abs dlt where not null dlt;
+    cumPnl:sums v;mdd:min cumPnl-maxs cumPnl;
+    posP:sum v where v>0;negP:abs sum v where v<0;
+    pf:$[negP>1e-10;posP%negP;0n];
+    `sharpe`ic`hitRate`turnover`maxDD`profitFactor!(sharpe;ic;hr;to;mdd;pf)};
+soGsrch_:{[nn;psh;grid;gen]
+    sigs:{[nn;gen;p] soClean_ @[gen;p;{[n;e] n#0n}[nn;]]}[nn;gen;] each grid;
+    sharpes:psh each sigs;
+    valid:where not null sharpes;
+    if[0=count valid;:(grid 0;0n;nn#0n)];
+    best:valid first idesc sharpes valid;
+    (grid best;sharpes best;sigs best)};
+
+// sigOpt: signal optimization boilerplate
+// Generates 15 momentum/regression signals from a feature, optimizes params by Sharpe
+// t: table with dt, time, ricRoot, risk, pxDiff + feature column
+// featureCol: symbol name of feature column
+// cfg: optional config dict (`sym`time`ret`risk to override column names)
+// Returns: table with signal name, best params, sharpe, ic, hitRate, turnover, maxDD, profitFactor
+sigOpt:{[t;featureCol;cfg]
+    dc:`sym`time`ret`risk!(`ricRoot;`time;`pxDiff;`risk);
+    c:$[99h=type cfg;dc,cfg;dc];
+    symC:c`sym;tmC:c`time;retC:c`ret;rskC:c`risk;
+    t:(tmC,symC) xasc t;
+    feat:soClean_ "f"$t featureCol;
+    ret:soClean_ "f"$t retC;
+    sym:t symC;
+    tm:t tmC;
+    rsk:1e-10|soClean_ $[rskC in cols t;"f"$t rskC;1f+(0*feat)];
+    nn:count feat;
+    nT:count distinct tm;
+    ann:$[nT>500;252f;$[nT>100;52f;12f]];
+    ctx:`feat`ret`sym`tm`rsk`nn`ann!(feat;ret;sym;tm;rsk;nn;ann);
+    // Bind helpers via projection
+    psh:soPsh_[sym;ret;rsk;tm;ann;];
+    fmet:soFmet_[sym;ret;rsk;tm;ann;];
+    gsrch:soGsrch_[nn;psh;;];
+    // --- 15 Signal Generators (project ctx to capture data) ---
+    g1:{[c;p] (.cond.rzscore[p`w;];c`feat) fby c`sym}[ctx;];
+    g2:{[c;p] ((.cond.rrank[p`w;];c`feat) fby c`sym)-0.5}[ctx;];
+    g3:{[c;p] (.cond.diff[;p`n];c`feat) fby c`sym}[ctx;];
+    g4:{[c;p] (.cond.smooth[;p`hl];(.cond.diff[;p`n];c`feat) fby c`sym) fby c`sym}[ctx;];
+    g5:{[c;p] (.cond.diff[;p`n];(.cond.diff[;p`n];c`feat) fby c`sym) fby c`sym}[ctx;];
+    g6:{[c;p] ((.cond.smooth[;p`fast];c`feat) fby c`sym)-((.cond.smooth[;p`slow];c`feat) fby c`sym)}[ctx;];
+    g7:{[c;p] neg(.cond.rzscore[p`w;];c`feat) fby c`sym}[ctx;];
+    g8:{[c;p] (c`feat)%1e-10|(mdev[p`w;];c`feat) fby c`sym}[ctx;];
+    g9:{[c;p] (c`feat)-(.kdbtools.rpctl[p`w;0.5];c`feat) fby c`sym}[ctx;];
+    g10:{[c;p] (.cond.decay[;p`hl];c`feat) fby c`sym}[ctx;];
+    g11:{[c;p]
+        tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat);
+        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;p`w;p`lam];
+        res`yhat}[ctx;];
+    g12:{[c;p]
+        tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat);
+        res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;p`w;0f];
+        res`yhat}[ctx;];
+    g13:{[c;p] mu:(avg;c`feat) fby c`tm;sd:(dev;c`feat) fby c`tm;((c`feat)-mu)%1e-10|sd}[ctx;];
+    g14:{[c;p]
+        byT:0!select f:f by t:t from([]t:c`tm;f:c`feat);
+        raze{r:rank x;(r%((-1+count r)|1))-0.5}each byT`f}[ctx;];
+    g15:{[c;p] (.cond.smooth[;p`hl];(.cond.rzscore[p`w;];c`feat) fby c`sym) fby c`sym}[ctx;];
+    // --- 10 Additional Signal Generators ---
+    // RSI centered at 0: (RSI - 50) / 50 → range [-1, 1]
+    g16:{[c;p] (((.kdbtools.rsi[p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+    // Bollinger band position: (x - sma) / (k * mdev)
+    g17:{[c;p] (.kdbtools.bbpos[p`w;p`k;];c`feat) fby c`sym}[ctx;];
+    // MACD histogram: extract hist from macd dict
+    g18:{[c;p] ({(.kdbtools.macd[x;y;z;w])`hist}[p`fast;p`slow;p`sig;];c`feat) fby c`sym}[ctx;];
+    // Slope t-statistic (trend significance)
+    g19:{[c;p] (.kdbtools.slopeT[p`w;];c`feat) fby c`sym}[ctx;];
+    // CCI (Commodity Channel Index)
+    g20:{[c;p] (.kdbtools.cci[p`w;];c`feat) fby c`sym}[ctx;];
+    // Stochastic %K centered at 0: (stochK - 50) / 50 → range [-1, 1]
+    g21:{[c;p] (((.kdbtools.stochk[p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+    // Fisher transform (normalized momentum)
+    g22:{[c;p] (.kdbtools.fisher[p`w;];c`feat) fby c`sym}[ctx;];
+    // Chande Momentum Oscillator, scale to [-1, 1]
+    g23:{[c;p] ((.kdbtools.cmo[p`w;];c`feat) fby c`sym) % 100f}[ctx;];
+    // TRIX (triple-smoothed EMA rate of change)
+    g24:{[c;p] (.kdbtools.trix[p`w;];c`feat) fby c`sym}[ctx;];
+    // Kalman residual (deviation from adaptive filter → mean-reversion)
+    g25:{[c;p] (c`feat) - (.kdbtools.kalman[p`q;p`r;];c`feat) fby c`sym}[ctx;];
+    gens:(g1;g2;g3;g4;g5;g6;g7;g8;g9;g10;g11;g12;g13;g14;g15;g16;g17;g18;g19;g20;g21;g22;g23;g24;g25);
+    // --- Parameter Grids ---
+    grids:(
+        ([]w:10 21 42 63 126);
+        ([]w:10 21 42 63 126);
+        ([]n:5 10 21 42 63);
+        ([]n:10 21 42)cross([]hl:3 5 10);
+        ([]n:5 10 21);
+        ([]fast:3 5 10)cross([]slow:21 42 63);
+        ([]w:10 21 42 63 126);
+        ([]w:10 21 42 63);
+        ([]w:21 42 63);
+        ([]hl:3 5 10 21);
+        ([]w:42 63 126)cross([]lam:0.01 0.1 1.0);
+        ([]w:42 63 126);
+        enlist(enlist`x)!enlist 0;
+        enlist(enlist`x)!enlist 0;
+        ([]w:21 42 63)cross([]hl:3 5 10);
+        ([]w:5 10 14 21);
+        ([]w:10 21 42)cross([]k:1.5 2.0 2.5);
+        ([]fast:8 12)cross([]slow:21 26)cross([]sig:5 9);
+        ([]w:10 21 42 63);
+        ([]w:10 14 21 42);
+        ([]w:5 10 14 21);
+        ([]w:5 10 21 42);
+        ([]w:5 10 14 21);
+        ([]w:5 10 15 21);
+        ([]q:0.01 0.1 1.0)cross([]r:0.1 1.0 10.0));
+    names:`zscore`rank`momentum`smoothMom`accel`emaCross`meanRev`volAdj`breakout`decay`ridge`ols`csZscore`csRank`smoothZscore`rsi`bbandPos`macdHist`slopeT`cci`stochastic`fisher`cmo`trix`kalmanResid;
+    // Run grid search
+    -1"sigOpt: searching ",string[count names]," signal types...";
+    results:gsrch'[grids;gens];
+    bestParams:results[;0];
+    bestSigs:results[;2];
+    mets:fmet each bestSigs;
+    // Format params
+    pfmt:{k:key[x] except enlist`x;$[0=count k;"none";" " sv{(string x),"=",string y}'[k;x k]]};
+    ([]signal:names;
+       params:pfmt each bestParams;
+       sharpe:mets`sharpe;
+       ic:mets`ic;
+       hitRate:mets`hitRate;
+       turnover:mets`turnover;
+       maxDD:mets`maxDD;
+       profitFactor:mets`profitFactor)}
+
 // -----------------------------------------------------------------------------
 // FORWARD SIMULATION
 // -----------------------------------------------------------------------------
