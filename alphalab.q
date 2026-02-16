@@ -1255,46 +1255,51 @@ arTurnover_:{[symData]
 arIC_:{[symData;grp;nSyms;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
-    // IC uses pxDiff (independent return). If absent, all IC metrics null.
-    // Build table with prev sig computed per sym
-    tab:$[hasPx;
-        raze {[nm;sd]
-            ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:prev sd`sig; r:sd`pxDiff)
-        }.'flip (key grp; symData);
-        ([] dt:(); sym:(); ps:(); r:())];
-    // panelIc: pooled cor(prev sig, pxDiff)
-    validTab:select from tab where not null ps, not null r;
-    panelIc:$[5 < count validTab; cor[validTab`ps; validTab`r]; 0n];
+    nullIc:`ic`panelIc`tsIc`ic_decay!(0n;0n;(key grp)!(count symData)#0n;icLags!(count icLags)#0n);
+    if[not hasPx; :nullIc];
+    // Build flat table: prev sig per sym, then combine
+    tab:raze {[nm;sd]
+        ([] dt:sd`dt; sym:(count sd`dt)#nm; ps:prev sd`sig; r:sd`pxDiff)
+    }.'flip (key grp; symData);
+    if[0 = count tab; :nullIc];
+    // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
+    pv:where (not null tab`ps) and not null tab`r;
+    rawPanel:$[5 < count pv; cor[tab[`ps] pv; tab[`r] pv]; 0n];
+    panelIc:$[rawPanel within -1 1f; rawPanel; 0n];
     // ic: average cross-sectional cor(prev sig, pxDiff) grouped by time
-    icByDt:$[0 < count validTab;
-        exec cor[ps;r] by dt from validTab;
-        ()!()];
-    icVals:value 0f ^ icByDt;
-    icNonZero:icVals where icVals <> 0f;
-    ic:$[0 < count icNonZero; avg icNonZero; panelIc];
+    // Group by dt, compute cor per group, fill null->0, avg non-zero
+    icByDt:{[tab;idx]
+        ps:tab[`ps] idx; r:tab[`r] idx;
+        v:where (not null ps) and not null r;
+        $[2 > count v; 0n; cor[ps v; r v]]
+    }[tab;] each value group tab`dt;
+    // Replace null/0w/-0w with 0 — valid cor is always in [-1,1]
+    icByDt:@[icByDt; where not icByDt within -1 1f; :; 0f];
+    icNZ:icByDt where icByDt <> 0f;
+    ic:$[0 < count icNZ; avg icNZ; panelIc];
     // Per-sym IC: cor(prev sig, pxDiff) within each sym
-    tsIcBySym:$[hasPx;
-        (key grp)!{[x]
-            ps:prev x`sig; r:x`pxDiff;
-            valid:where (not null ps) and not null r;
-            $[5 < count valid; cor[ps valid; r valid]; 0n]
-        } each symData;
-        (key grp)!(count symData) # 0n];
+    tsIcBySym:(key grp)!{[x]
+        ps:prev x`sig; r:x`pxDiff;
+        valid:where (not null ps) and not null r;
+        v:$[5 < count valid; cor[ps valid; r valid]; 0n];
+        $[v within -1 1f; v; 0n]
+    } each symData;
     // IC decay: cor(prev sig, fwd h-day pxDiff) at each horizon
-    icDecay:$[hasPx;
-        {[symData;h]
-            ics:{[sd;h]
-                ps:prev sd`sig; r:sd`pxDiff; nn:count ps;
-                fwdRet:msum[h; 1 rotate r];
-                fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
-                valid:where (not null ps) and not null fwdRet;
-                $[5 < count valid; cor[ps valid; fwdRet valid]; 0n]
-            }[;h] each symData;
-            v:ics where not null ics;
-            $[0 < count v; avg v; 0n]
-        }[symData;] each icLags;
-        (count icLags) # 0n];
-    `ic`panelIc`tsIc`ic_decay!(ic;panelIc;tsIcBySym;icLags!icDecay)}
+    icDecay:{[symData;h]
+        ics:{[sd;h]
+            ps:prev sd`sig; r:sd`pxDiff; nn:count ps;
+            fwdRet:msum[h; 1 rotate r];
+            fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
+            valid:where (not null ps) and not null fwdRet;
+            c:$[5 < count valid; cor[ps valid; fwdRet valid]; 0n];
+            $[c within -1 1f; c; 0n]
+        }[;h] each symData;
+        v:ics where not null ics;
+        $[0 < count v; avg v; 0n]
+    }[symData;] each icLags;
+    icStd:$[1 < count icNZ; dev icNZ; 0n];
+    icIR:$[icStd > 1e-10; ic % icStd; 0n];
+    `ic`ic_ir`panelIc`tsIc`ic_decay!(ic;icIR;panelIc;tsIcBySym;icLags!icDecay)}
 
 arRegime_:{[symData;dts;nzr;nzDts;n;pcfg]
     hasRegime:pcfg`hasRegime; hasPx:pcfg`hasPx;
