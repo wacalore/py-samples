@@ -1255,9 +1255,27 @@ arTurnover_:{[symData]
 arIC_:{[symData;grp;nSyms;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
-    // All IC uses pxDiff (independent return), not alpha (which depends on sig).
-    // If pxDiff absent, IC metrics are null.
-    // Time-series IC per sym: cor(prev sig, pxDiff)
+    // IC uses pxDiff (independent return). If absent, all IC metrics null.
+    // Build flat table of (dt, prevSig, pxDiff) with prev computed per sym
+    flat:$[hasPx;
+        raze {[sd]
+            ps:prev sd`sig; r:sd`pxDiff;
+            valid:where (not null ps) and not null r;
+            ([] dt:sd[`dt] valid; ps:ps valid; r:r valid)
+        } each symData;
+        ([] dt:(); ps:(); r:())];
+    // ic: average cross-sectional cor(prev sig, pxDiff) grouped by time
+    icByDt:$[0 < count flat;
+        {[flat;idx]
+            ps:flat[`ps] idx; r:flat[`r] idx;
+            $[2 > count ps; 0n; cor[ps; r]]
+        }[flat;] each value group flat`dt;
+        enlist 0n];
+    icValid:icByDt where not null icByDt;
+    ic:$[0 < count icValid; avg icValid; 0n];
+    // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
+    panelIc:$[5 < count flat; cor[flat`ps; flat`r]; 0n];
+    // Per-sym IC: cor(prev sig, pxDiff) within each sym
     tsIcBySym:$[hasPx;
         (key grp)!{[x]
             ps:prev x`sig; r:x`pxDiff;
@@ -1265,41 +1283,6 @@ arIC_:{[symData;grp;nSyms;pcfg]
             $[5 < count valid; cor[ps valid; r valid]; 0n]
         } each symData;
         (key grp)!(count symData) # 0n];
-    tsIcVals:(value tsIcBySym) where not null value tsIcBySym;
-    tsIc:$[0 < count tsIcVals; avg tsIcVals; 0n];
-    // Cross-sectional IC (multi-sym) or rolling cor (single-sym)
-    // IC = rank_cor(prev sig, pxDiff) — yesterday's signal vs today's return
-    icDV:$[not hasPx; enlist 0n;
-        nSyms >= 2;
-        [icTab:raze {[nm;sd]
-            ps:prev sd`sig;
-            ([] dt:sd`dt; sym:(count sd`dt) # nm; prevSig:ps; ret:sd`pxDiff)
-         }.'flip (key grp; symData);
-         icGrp:group icTab`dt;
-         {[icTab;idx]
-            ps:icTab[`prevSig] idx; r:icTab[`ret] idx;
-            valid:where (not null ps) and not null r;
-            $[2 > count valid; 0n; cor[iasc iasc ps valid; iasc iasc r valid]]
-         }[icTab;] each value icGrp];
-        // Single sym: rolling cor(prev sig, pxDiff)
-        raze {[x]
-            ps:prev x`sig; r:x`pxDiff;
-            exy:mavg[60;ps * r]; ex:mavg[60;ps]; ey:mavg[60;r];
-            ex2:mavg[60;ps * ps]; ey2:mavg[60;r * r];
-            num:exy - (ex * ey);
-            varX:1e-6 | ex2 - (ex * ex);
-            varY:1e-6 | ey2 - (ey * ey);
-            rawCor:num % sqrt varX * varY;
-            // Clip to [-1,1] preserving nulls (| and & convert null to -1f)
-            clipped:rawCor;
-            vIdx:where not null rawCor;
-            if[0 < count vIdx; clipped[vIdx]:(-1f) | 1f & rawCor vIdx];
-            clipped
-        } each symData];
-    icValid:icDV where not null icDV;
-    ic:$[0 < count icValid; avg icValid; 0n];
-    icStd:$[1 < count icValid; dev icValid; 0n];
-    icIR:$[icStd > 1e-10; ic % icStd; 0n];
     // IC decay: cor(prev sig, fwd h-day pxDiff) at each horizon
     icDecay:$[hasPx;
         {[symData;h]
@@ -1314,7 +1297,7 @@ arIC_:{[symData;grp;nSyms;pcfg]
             $[0 < count v; avg v; 0n]
         }[symData;] each icLags;
         (count icLags) # 0n];
-    `ic`ic_ir`tsIc`ic_decay!(ic;icIR;tsIcBySym;icLags!icDecay)}
+    `ic`panelIc`tsIc`ic_decay!(ic;panelIc;tsIcBySym;icLags!icDecay)}
 
 arRegime_:{[symData;dts;nzr;nzDts;n;pcfg]
     hasRegime:pcfg`hasRegime; hasPx:pcfg`hasPx;
