@@ -763,6 +763,8 @@ help:{[]
     -1 "";
     -1 "ALPHA EVALUATION SUITE:";
     -1 "  alphaEval[t;cfg]                      - unified perf report";
+    -1 "  alphaReport[t;cfg]                    - extended report (IC, fragility, concentration)";
+    -1 "  alphaCompositeScore[reports;cfg]      - composite ranking from alphaReport outputs";
     -1 "    Returns: sharpe, winsorizedSharpe, sortino, calmar, annReturn, annVol,";
     -1 "      maxDD, skew, kurtosis, winRate, profitFactor, avgWin, avgLoss,";
     -1 "      winLossRatio, cvar95, medianMonthlySharpe, medianMonthlyHitRate,";
@@ -1131,7 +1133,9 @@ alphaEval:{[t;cfg]
 //   hit_rate, monthly_hit_rate, profit_factor, payoff_ratio,
 //   tail_ratio, return_skew, max_dd, max_dd_length, calmar,
 //   max_consec_loss, pnl_topN, turnover, ic, ic_ir, tsIc, ic_decay,
-//   episodes, regime
+//   plus diagnostics: sharpe_nw, monthly_sharpe, ic_breadth, ic_stability,
+//   edge_fragility, monthly_edge_fragility, tail_balance, turnover_efficiency,
+//   regime_balance, top_concentration, dd_recovery_days, episodes, regime
 
 // --- alphaReport helpers (private) ---
 
@@ -1254,12 +1258,117 @@ arTurnover_:{[symData]
         (avg abs 1 _ deltas vSig) % avgAbs
     } each symData}
 
+arSharpeScaled_:{[x;annualFactor]
+    v:"f"$x;
+    v:v where not null v;
+    n:count v;
+    if[n < 2; :0n];
+    mu:avg v;
+    sd:dev v;
+    $[sd > 1e-10; (sqrt annualFactor) * mu % sd; 0n]}
+
+arNWSharpe_:{[x;annualFactor]
+    v:"f"$x;
+    v:v where not null v;
+    n:count v;
+    if[n < 3; :0n];
+    mu:avg v;
+    xc:v - mu;
+    lag:`long$floor 4f * (n % 100f) xexp 0.2222222222;
+    lag:0 | (n - 2) & lag;
+    g0:avg xc * xc;
+    if[lag <= 0; :$[g0 > 1e-12; (sqrt annualFactor) * mu % sqrt g0; 0n]];
+    ks:1 + til lag;
+    ws:1f - ks % (lag + 1f);
+    gk:{[xc;k;n] avg (k _ xc) * ((n - k) # xc)}[xc;;n] each ks;
+    lrv:g0 + 2f * sum ws * gk;
+    $[lrv > 1e-12; (sqrt annualFactor) * mu % sqrt lrv; 0n]}
+
+arTrimmedSharpe_:{[x;k;annualFactor]
+    v:"f"$x;
+    v:v where not null v;
+    n:count v;
+    if[n < 3; :0n];
+    kk:0 | ((n div 2) - 1) & `long$k;
+    if[kk <= 0; :arSharpeScaled_[v;annualFactor]];
+    m:n - (2 * kk);
+    if[m < 2; :0n];
+    s:asc v;
+    core:s kk + til m;
+    arSharpeScaled_[core;annualFactor]}
+
+arDDRecovery_:{[r]
+    x:"f"$r;
+    x:x where not null x;
+    n:count x;
+    if[n < 3; :0n];
+    cum:sums x;
+    peak:maxs cum;
+    inDD:cum < (peak - 1e-10);
+    if[not any inDD; :0f];
+    d:deltas "i"$inDD;
+    sts:where d = 1i;
+    eds:where d = -1i;
+    if[inDD[0]; sts:0,sts];
+    if[(count sts) > count eds; eds:eds,count inDD];
+    lens:eds - sts;
+    $[0 < count lens; med "f"$lens; 0n]}
+
+arTopConcentration_:{[payoff]
+    ks:key payoff;
+    pks:ks where {"pnl_top" ~ 7 # string x} each ks;
+    if[0 = count pks; :0n];
+    vals:"f"$payoff pks;
+    vals:vals where not null vals;
+    $[0 < count vals; max abs vals; 0n]}
+
+arExtras_:{[r;nzr;nzDts;perf;payoff;turn;icm;xcfg]
+    monthly:0!select pnl:sum x by m from ([] m:`month$nzDts; x:nzr);
+    mr:"f"$monthly`pnl;
+    monthlySharpe:arSharpeScaled_[mr;12f];
+    nwSharpe:arNWSharpe_[nzr;252f];
+    nTop:(count nzr) & max xcfg`topN;
+    topSum:$[nTop > 0; sum nTop # desc nzr; 0n];
+    botSum:$[nTop > 0; sum nTop # asc nzr; 0n];
+    tailBalance:$[(nTop > 0) & (abs botSum > 1e-10); topSum % abs botSum; 0n];
+    tv:"f"$turn`turnover;
+    turnoverEff:$[(not null tv) & (abs tv > 1e-10); ("f"$perf`ann_return) % tv; 0n];
+    baseSharpe:"f"$perf`sharpe;
+    trimmedDailySharpe:arTrimmedSharpe_[nzr;nTop;252f];
+    edgeFrag:$[(not null baseSharpe) & (abs baseSharpe > 1e-10) & not null trimmedDailySharpe;
+        1f - (trimmedDailySharpe % baseSharpe); 0n];
+    mTrim:$[count mr > 10; 1; 0];
+    trimmedMonthlySharpe:arTrimmedSharpe_[mr;mTrim;12f];
+    monthlyFrag:$[(not null monthlySharpe) & (abs monthlySharpe > 1e-10) & not null trimmedMonthlySharpe;
+        1f - (trimmedMonthlySharpe % monthlySharpe); 0n];
+    tsVals:"f"$value icm`tsIc;
+    tsVals:tsVals where not null tsVals;
+    icBreadth:$[0 < count tsVals; avg tsVals > 0f; 0n];
+    icStability:$[`ic_stability in key icm;
+        "f"$icm`ic_stability;
+        $[(not null icm`ic_ir) & (abs icm`ic_ir > 1e-10); abs ("f"$icm`ic) % icm`ic_ir; 0n]];
+    reg:xcfg`reg;
+    trSh:0n;
+    if[`trending in key reg;
+        trD:reg`trending;
+        if[(99h = type trD) & (`sharpe in key trD); trSh:"f"$trD`sharpe]];
+    mrSh:0n;
+    if[`mr in key reg;
+        mrD:reg`mr;
+        if[(99h = type mrD) & (`sharpe in key mrD); mrSh:"f"$mrD`sharpe]];
+    regimeBalance:$[(not null trSh) & (not null mrSh); trSh & mrSh; 0n];
+    topConc:arTopConcentration_ payoff;
+    ddRecovery:arDDRecovery_ r;
+    `sharpe_nw`monthly_sharpe`ic_breadth`ic_stability`edge_fragility`monthly_edge_fragility`tail_balance`turnover_efficiency`regime_balance`top_concentration`dd_recovery_days!(
+        nwSharpe;monthlySharpe;icBreadth;icStability;edgeFrag;monthlyFrag;tailBalance;turnoverEff;regimeBalance;topConc;ddRecovery)}
+
 arIC_:{[t;pcfg]
     hasPx:pcfg`hasPx;
     icLags:pcfg`icLags;
     symCol:pcfg`cSym;
     syms:distinct t symCol;
-    nullIc:`ic`ic_ir`panelIc`tsIc`ic_decay!(0n;0n;0n;syms!(count syms)#0n;icLags!(count icLags)#0n);
+    nullIc:`ic`ic_ir`panelIc`tsIc`ic_decay`ic_stability`ic_breadth!(
+        0n;0n;0n;syms!(count syms)#0n;icLags!(count icLags)#0n;0n;0n);
     if[not hasPx; :nullIc];
     // Use `time column if available, otherwise dtCol
     tCol:$[`time in cols t; `time; pcfg`cDt];
@@ -1289,6 +1398,8 @@ arIC_:{[t;pcfg]
     tsIcRaw:{cor[0f ^ x; 0f ^ y]}'[bySym`prevSig; bySym`pxDiff];
     tsIcRaw:@[tsIcRaw; where not tsIcRaw within -1 1f; :; 0n];
     tsIcBySym:bySym[`sym]!tsIcRaw;
+    tsValid:tsIcRaw where not null tsIcRaw;
+    icBreadth:$[0 < count tsValid; avg tsValid > 0f; 0n];
     // IC decay: per sym, cor(prevSig, fwd h-day pxDiff)
     icDecay:{[bySym;h]
         ics:{[psL;rL;h]
@@ -1304,7 +1415,8 @@ arIC_:{[t;pcfg]
     }[bySym;] each icLags;
     icStd:$[1 < count icValid; dev icValid; 0n];
     icIR:$[icStd > 1e-10; ic % icStd; 0n];
-    `ic`ic_ir`panelIc`tsIc`ic_decay!(ic;icIR;panelIc;tsIcBySym;icLags!icDecay)}
+    `ic`ic_ir`panelIc`tsIc`ic_decay`ic_stability`ic_breadth!(
+        ic;icIR;panelIc;tsIcBySym;icLags!icDecay;icStd;icBreadth)}
 
 arRegime_:{[symData;dts;nzr;nzDts;n;pcfg]
     hasRegime:pcfg`hasRegime; hasPx:pcfg`hasPx;
@@ -1358,7 +1470,163 @@ alphaReport:{[t;cfg]
     turn:(enlist `turnover)!enlist arTurnover_ symData;
     icm:arIC_[t;pcfg];
     reg:arRegime_[symData;dts;nzr;nzDts;n;pcfg];
-    (enlist[`n]!enlist n),perf,risk,payoff,turn,icm,`episodes`regime!(ep;reg)}
+    extras:arExtras_[r;nzr;nzDts;perf;payoff;turn;icm;(`reg`topN)!(reg;pcfg`topN)];
+    (enlist[`n]!enlist n),perf,risk,payoff,turn,icm,extras,`episodes`regime!(ep;reg)}
+
+acCfg_:{[cfg]
+    if[99h <> type cfg; cfg:()!()];
+    m0:$[`single_alpha_mode in key cfg; cfg`single_alpha_mode; `absolute];
+    m:$[11h = type m0; `$m0; $[99h = type m0; m0; `absolute]];
+    `w_edge`w_robust`w_consistency`w_diversification`min_n_days`penalty_n`penalty_top_conc`penalty_tail_balance`penalty_regime`top_concentration_thresh`tail_balance_lo`tail_balance_hi`regime_balance_floor`single_alpha_mode!(
+        $[`w_edge in key cfg; "f"$cfg`w_edge; 0.35f];
+        $[`w_robust in key cfg; "f"$cfg`w_robust; 0.30f];
+        $[`w_consistency in key cfg; "f"$cfg`w_consistency; 0.25f];
+        $[`w_diversification in key cfg; "f"$cfg`w_diversification; 0.10f];
+        $[`min_n_days in key cfg; "f"$cfg`min_n_days; 126f];
+        $[`penalty_n in key cfg; "f"$cfg`penalty_n; 10f];
+        $[`penalty_top_conc in key cfg; "f"$cfg`penalty_top_conc; 10f];
+        $[`penalty_tail_balance in key cfg; "f"$cfg`penalty_tail_balance; 10f];
+        $[`penalty_regime in key cfg; "f"$cfg`penalty_regime; 10f];
+        $[`top_concentration_thresh in key cfg; "f"$cfg`top_concentration_thresh; 0.60f];
+        $[`tail_balance_lo in key cfg; "f"$cfg`tail_balance_lo; 0.60f];
+        $[`tail_balance_hi in key cfg; "f"$cfg`tail_balance_hi; 1.70f];
+        $[`regime_balance_floor in key cfg; "f"$cfg`regime_balance_floor; 0f];
+        m)}
+
+acCol_:{[t;c;d]
+    $[c in cols t; "f"$t c; (count t) # ("f"$d)]}
+
+acRobustZ_:{[x;dir]
+    v:"f"$x;
+    vv:v where not null v;
+    if[0 = count vv; :(count v) # 0f];
+    medv:med vv;
+    madv:med abs (vv - medv);
+    sc:$[madv > 1e-10; 1.4826f * madv; $[1 < count vv; dev vv; 1f]];
+    z:(v - medv) % (1e-10 | sc);
+    z:@[z; where null z; :; 0f];
+    dir * z}
+
+acSquash_:{[x;scale]
+    v:"f"$x;
+    v:@[v; where null v; :; 0f];
+    z:v % (1e-10 | "f"$scale);
+    (2f * (1f % (1f + exp neg z))) - 1f}
+
+acMetricKeys_:{[]
+    `n`sharpe_nw`ic`ic_ir`turnover_efficiency`sortino`calmar`max_dd`edge_fragility`hit_rate`monthly_hit_rate`ic_breadth`ic_stability`top_concentration`tail_balance`regime_balance`corr_to_portfolio`residual_sharpe}
+
+acMetricVal_:{[d;k]
+    if[not k in key d; :0n];
+    v:d k;
+    if[0 > type v; :"f"$v];
+    if[(0h = type v) & (0 < count v) & (0 > type first v); :"f"$first v];
+    0n}
+
+acRowFromReport_:{[nm;d]
+    ks:acMetricKeys_[];
+    vals:acMetricVal_[d;] each ks;
+    flip (`alpha,ks)!((enlist nm),enlist each vals)}
+
+acReportsToTable_:{[x]
+    tx:type x;
+    if[98h = tx; :x];
+    if[99h = tx;
+        ks:key x;
+        vals:value x;
+        if[(0 < count vals) & all 99h = type each vals;
+            rows:acRowFromReport_'[ks;vals];
+            out:raze rows;
+            :out];
+        :acRowFromReport_[`alpha0;x]];
+    if[0h = tx;
+        if[0 = count x; :([])];
+        if[all 99h = type each x;
+            nms:`$"alpha_",/:string til count x;
+            rows:acRowFromReport_'[nms;x];
+            out:raze rows;
+            :out]];
+    '"alphaCompositeScore expects table, report dict, dict-of-reports, or list of report dicts"}
+
+// Composite alpha score from alphaReport outputs.
+// reports: table, single report dict, dict alphaName->reportDict, or list of report dicts.
+// cfg keys:
+//   w_edge,w_robust,w_consistency,w_diversification (default 0.35/0.30/0.25/0.10)
+//   min_n_days (126), penalty_n (10), penalty_top_conc (10), penalty_tail_balance (10), penalty_regime (10)
+//   top_concentration_thresh (0.60), tail_balance_lo/hi (0.60/1.70), regime_balance_floor (0)
+alphaCompositeScore:{[reports;cfg]
+    c:acCfg_ cfg;
+    t:acReportsToTable_ reports;
+    if[0 = count t; :([])];
+    if[not `alpha in cols t;
+        nms:`$"alpha_",/:string til count t;
+        t:update alpha:nms from t];
+    useAbs:(1 = count t) & not (c`single_alpha_mode) in `relative`cross_sectional;
+    if[useAbs;
+        edge:0.35f * acSquash_[acCol_[t;`sharpe_nw;0n];1.5f] +
+            0.25f * acSquash_[acCol_[t;`ic;0n];0.03f] +
+            0.20f * acSquash_[acCol_[t;`ic_ir;0n];0.8f] +
+            0.20f * acSquash_[acCol_[t;`turnover_efficiency;0n];0.20f];
+        robust:0.30f * acSquash_[acCol_[t;`sortino;0n];1.5f] +
+            0.25f * acSquash_[acCol_[t;`calmar;0n];1.0f] +
+            0.20f * acSquash_[neg abs acCol_[t;`max_dd;0n];0.08f] +
+            0.25f * acSquash_[neg acCol_[t;`edge_fragility;0n];0.4f];
+        consist:0.30f * acSquash_[acCol_[t;`hit_rate;0.5f] - 0.5f;0.08f] +
+            0.20f * acSquash_[acCol_[t;`monthly_hit_rate;0.5f] - 0.5f;0.10f] +
+            0.25f * acSquash_[acCol_[t;`ic_breadth;0.5f] - 0.5f;0.12f] +
+            0.25f * acSquash_[neg acCol_[t;`ic_stability;0n];0.08f];
+        divers:0.60f * acSquash_[neg abs acCol_[t;`corr_to_portfolio;0n];0.30f] +
+            0.40f * acSquash_[acCol_[t;`residual_sharpe;0n];1.0f];
+    ];
+    if[not useAbs;
+        edge:0.35f * acRobustZ_[acCol_[t;`sharpe_nw;0n];1f] +
+            0.25f * acRobustZ_[acCol_[t;`ic;0n];1f] +
+            0.20f * acRobustZ_[acCol_[t;`ic_ir;0n];1f] +
+            0.20f * acRobustZ_[acCol_[t;`turnover_efficiency;0n];1f];
+        robust:0.30f * acRobustZ_[acCol_[t;`sortino;0n];1f] +
+            0.25f * acRobustZ_[acCol_[t;`calmar;0n];1f] +
+            0.20f * acRobustZ_[acCol_[t;`max_dd;0n];1f] +
+            0.25f * acRobustZ_[acCol_[t;`edge_fragility;0n];-1f];
+        consist:0.30f * acRobustZ_[acCol_[t;`hit_rate;0n];1f] +
+            0.20f * acRobustZ_[acCol_[t;`monthly_hit_rate;0n];1f] +
+            0.25f * acRobustZ_[acCol_[t;`ic_breadth;0n];1f] +
+            0.25f * acRobustZ_[acCol_[t;`ic_stability;0n];-1f];
+        divers:0.60f * acRobustZ_[abs acCol_[t;`corr_to_portfolio;0n];-1f] +
+            0.40f * acRobustZ_[acCol_[t;`residual_sharpe;0n];1f];
+    ];
+
+    raw:(c`w_edge) * edge + (c`w_robust) * robust + (c`w_consistency) * consist + (c`w_diversification) * divers;
+    score0:50f + 12f * raw;
+
+    nv:acCol_[t;`n;0n];
+    topConc:acCol_[t;`top_concentration;0n];
+    tailBal:acCol_[t;`tail_balance;1f];
+    regBal:acCol_[t;`regime_balance;0n];
+    penN:(not null nv) & (nv < c`min_n_days);
+    penTop:(not null topConc) & (abs topConc > c`top_concentration_thresh);
+    penTail:(not null tailBal) & ((tailBal < c`tail_balance_lo) | (tailBal > c`tail_balance_hi));
+    penReg:(not null regBal) & (regBal < c`regime_balance_floor);
+    penNf:("f"$penN) * c`penalty_n;
+    penTopf:("f"$penTop) * c`penalty_top_conc;
+    penTailf:("f"$penTail) * c`penalty_tail_balance;
+    penRegf:("f"$penReg) * c`penalty_regime;
+    pen:penNf + penTopf + penTailf + penRegf;
+    score:100f & (0f | score0 - pen);
+    bucket:{[s] $[s >= 80f; `excellent; s >= 65f; `good; s >= 50f; `watch; `reject]} each score;
+
+    update edge_pillar:edge,
+        robustness_pillar:robust,
+        consistency_pillar:consist,
+        diversification_pillar:divers,
+        composite_raw:raw,
+        composite_penalty:pen,
+        composite_score:score,
+        composite_bucket:bucket,
+        pen_low_sample:penN,
+        pen_top_concentration:penTop,
+        pen_tail_balance:penTail,
+        pen_regime:penReg
+        from t}
 
 example:{[]
     -1 "";
