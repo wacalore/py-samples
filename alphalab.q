@@ -1121,85 +1121,74 @@ alphaEval:{[t;cfg]
 //   `topN          - top N days for PnL concentration (default: 5 10)
 //   `winsorizePct  - winsorize percentile (default: 0.025)
 //   `icLags        - forward horizons for IC decay (default: 1 2 5 10 20)
+//   `episodeGap    - trading day gap to separate episodes (default: 5)
+//   `vrQ           - VR lag for regime detection (default: 10)
+//   `vrW           - VR rolling window for regime detection (default: 63)
+//   `regimeCol     - optional pre-computed regime column (>0.5=trending)
 //
 // Returns: dict with:
 //   n, ann_return, ann_vol, sharpe, sortino, win_sharpe,
 //   hit_rate, monthly_hit_rate, profit_factor, payoff_ratio,
 //   tail_ratio, return_skew, max_dd, max_dd_length, calmar,
-//   max_consec_loss, pnl_topN, turnover, ic, ic_ir, tsIc, ic_decay
-alphaReport:{[t;cfg]
-    // Parse config
+//   max_consec_loss, pnl_topN, turnover, ic, ic_ir, tsIc, ic_decay,
+//   episodes, regime
+
+// --- alphaReport helpers (private) ---
+
+arParseCfg_:{[t;cfg]
     cDt:$[99h=type cfg;$[`dtCol in key cfg;cfg`dtCol;`dt];`dt];
     cSym:$[99h=type cfg;$[`symCol in key cfg;cfg`symCol;`ricRoot];`ricRoot];
     cSig:$[99h=type cfg;$[`sigCol in key cfg;cfg`sigCol;`sig];`sig];
     cRet:$[99h=type cfg;$[`retCol in key cfg;cfg`retCol;`alpha];`alpha];
     cPx:$[99h=type cfg;$[`pxDiffCol in key cfg;cfg`pxDiffCol;`pxDiff];`pxDiff];
-    hasPx:cPx in cols t;
     topN:$[99h=type cfg;$[`topN in key cfg;cfg`topN;5 10];5 10];
     winPct:$[99h=type cfg;$[`winsorizePct in key cfg;cfg`winsorizePct;0.025];0.025];
     icLags:$[99h=type cfg;$[`icLags in key cfg;cfg`icLags;1 2 5 10 20];1 2 5 10 20];
+    epGap:$[99h=type cfg;$[`episodeGap in key cfg;cfg`episodeGap;5];5];
+    vrQ:$[99h=type cfg;$[`vrQ in key cfg;cfg`vrQ;10];10];
+    vrW:$[99h=type cfg;$[`vrW in key cfg;cfg`vrW;63];63];
+    cReg:$[99h=type cfg;$[`regimeCol in key cfg;cfg`regimeCol;`];`];
+    hasReg:(cReg <> `) and cReg in cols t;
+    `cDt`cSym`cSig`cRet`cPx`hasPx`topN`winPct`icLags`epGap`vrQ`vrW`cRegime`hasRegime!
+        (cDt;cSym;cSig;cRet;cPx;cPx in cols t;topN;winPct;icLags;epGap;vrQ;vrW;cReg;hasReg)}
 
-    syms:asc distinct t cSym;
-    nSyms:count syms;
-    grp:group t cSym;
-
-    // --- Per-sym data extraction ---
-    symData:{[t;cDt;cSig;cRet;cPx;hasPx;idx]
-        sub:cDt xasc t idx;
-        d:`dt`sig`alpha!(sub cDt; "f"$sub cSig; "f"$sub cRet);
-        if[hasPx; d[`pxDiff]:"f"$sub cPx];
+arExtract_:{[t;pcfg]
+    grp:group t pcfg`cSym;
+    sd:{[t;pcfg;idx]
+        sub:pcfg[`cDt] xasc t idx;
+        d:`dt`sig`alpha!(sub pcfg`cDt; "f"$sub pcfg`cSig; "f"$sub pcfg`cRet);
+        if[pcfg`hasPx; d[`pxDiff]:"f"$sub pcfg`cPx];
+        if[pcfg`hasRegime; d[`regime]:"f"$sub pcfg`cRegime];
         d
-    }[t;cDt;cSig;cRet;cPx;hasPx;] each value grp;
+    }[t;pcfg;] each value grp;
+    `grp`symData!(grp;sd)}
 
-    // --- Aggregate daily alpha (sum across symbols per date) ---
-    allRows:raze {([] dt:x`dt; alpha:x`alpha)} each symData;
-    daily:0!select alpha:sum alpha by dt from allRows;
-    daily:`dt xasc daily;
-    dts:daily`dt;
-    r:daily`alpha;
-
-    // Non-zero alpha filter
-    nzr:r where r <> 0f;
-    nzDts:dts where r <> 0f;
-    n:count nzr;
-    if[n < 3;
-        :(`n`sharpe`sortino`ann_return)!(n;0n;0n;0n)];
-
-    // --- Core performance (non-zero days) ---
+arPerf_:{[nzr;nzDts;n;winPct]
     annRet:252 * avg nzr;
     annVol:(sqrt 252f) * dev nzr;
     sharpe:$[annVol > 1e-10; annRet % annVol; 0n];
-
-    // Sortino
     downside:nzr where nzr < 0f;
-    dsVol:$[0 < count downside;
-        (sqrt 252f) * sqrt avg downside * downside; 0n];
+    dsVol:$[0 < count downside; (sqrt 252f) * sqrt avg downside * downside; 0n];
     sortino:$[(not null dsVol) and dsVol > 1e-10; annRet % dsVol; 0n];
-
-    // Winsorized Sharpe
     sorted:asc nzr;
     loIdx:1 | `long$winPct * n;
     hiIdx:(n - 2) & `long$(1f - winPct) * n;
     wRet:(sorted loIdx) | nzr & sorted hiIdx;
     wVol:(sqrt 252f) * dev wRet;
     winSharpe:$[wVol > 1e-10; (252 * avg wRet) % wVol; 0n];
-
-    // --- Hit rates ---
     wins:nzr where nzr > 0f;
     losses:nzr where nzr < 0f;
     hitRate:(count wins) % n;
-
-    // Monthly: fraction of months with positive total alpha
     mPnl:0!select mp:sum x by m from ([] m:`month$nzDts; x:nzr);
     monthlyHitRate:avg (mPnl`mp) > 0f;
+    `ann_return`ann_vol`sharpe`sortino`win_sharpe`hit_rate`monthly_hit_rate!
+        (annRet;annVol;sharpe;sortino;winSharpe;hitRate;monthlyHitRate)}
 
-    // --- Risk (max DD on full timeline for accurate duration) ---
+arRisk_:{[r;annRet]
     cumPnl:sums r;
     peak:maxs cumPnl;
     dd:cumPnl - peak;
     maxDD:min dd;
-
-    // Max DD length (days)
     inDD:dd < neg 1e-10;
     ddLens:$[any inDD;
         [d:deltas "i"$inDD;
@@ -1210,11 +1199,13 @@ alphaReport:{[t;cfg]
          $[0 < count sts; eds - sts; enlist 0]];
         enlist 0];
     maxDDLen:max ddLens;
+    calmar:$[(maxDD < neg 1e-10) and not null maxDD; neg annRet % maxDD; 0n];
+    `max_dd`max_dd_length`calmar!(maxDD;maxDDLen;calmar)}
 
-    calmar:$[(maxDD < neg 1e-10) and not null maxDD;
-        neg annRet % maxDD; 0n];
-
-    // --- Payoff ---
+arPayoff_:{[nzr;n;topN]
+    sorted:asc nzr;
+    wins:nzr where nzr > 0f;
+    losses:nzr where nzr < 0f;
     profitFactor:$[(0 < count losses) and 0 < count wins;
         (sum wins) % neg sum losses; 0n];
     payoffRatio:$[(0 < count losses) and 0 < count wins;
@@ -1224,104 +1215,154 @@ alphaReport:{[t;cfg]
          p05:sorted `long$0.05 * n;
          $[p05 < neg 1e-10; p95 % neg p05; 0n]];
         0n];
-
-    // Return skew
     mu:avg nzr; s:dev nzr;
-    returnSkew:$[(n > 3) and s > 1e-10;
-        avg ((nzr - mu) % s) xexp 3; 0n];
-
-    // --- Streaks ---
+    returnSkew:$[(n > 3) and s > 1e-10; avg ((nzr - mu) % s) xexp 3; 0n];
     maxConsecLoss:max {$[y;x+1;0]}\[0;"i"$nzr < 0f];
-
-    // --- PnL concentration ---
     totalPnl:sum nzr;
     pnlConc:{[nzr;tp;k]
         if[(k > count nzr) or (abs tp) < 1e-10; :0n];
         (sum k # desc nzr) % tp
     }[nzr;totalPnl;] each topN;
     pnlConcKeys:`$"pnl_top" ,/: string topN;
+    base:`profit_factor`payoff_ratio`tail_ratio`return_skew`max_consec_loss!
+        (profitFactor;payoffRatio;tailRatio;returnSkew;maxConsecLoss);
+    base,pnlConcKeys!pnlConc}
 
-    // --- Turnover ---
-    turnover:avg {[x]
+arEpisodes_:{[nzr;nzDts;n;topN;epGap]
+    maxTopN:n & max topN;
+    topRank:iasc neg nzr;
+    topIdx:asc topRank til maxTopN;
+    topPnls:nzr topIdx;
+    epBreaks:where epGap < 1 _ deltas topIdx;
+    epStarts:0,1 + epBreaks;
+    epEnds:(1 + epBreaks),maxTopN;
+    epSlices:epStarts,'epEnds;
+    nEp:count epSlices;
+    epPnls:{[nzr;topIdx;se] sum nzr topIdx se[0] + til se[1] - se 0}[nzr;topIdx;] each epSlices;
+    totalTopPnl:1e-10 | sum topPnls;
+    `n_episodes`largest_ep_pct`avg_ep_days!(nEp; (max epPnls) % totalTopPnl; maxTopN % 1 | nEp)}
+
+arTurnover_:{[symData]
+    avg {[x]
         sig:x`sig;
         valid:where not null sig;
         if[(count valid) < 2; :0n];
         vSig:sig valid;
         avgAbs:1e-10 | avg abs vSig;
         (avg abs 1 _ deltas vSig) % avgAbs
-    } each symData;
+    } each symData}
 
-    // --- IC ---
-    // Time-series IC per sym: cor(prev sig, alpha)
-    tsIcBySym:(key grp)!{[x]
-        ps:prev x`sig;
-        a:x`alpha;
-        valid:where (not null ps) and not null a;
-        $[5 < count valid; cor[ps valid; a valid]; 0n]
-    } each symData;
+arIC_:{[symData;grp;nSyms;pcfg]
+    hasPx:pcfg`hasPx;
+    icLags:pcfg`icLags;
+    // All IC uses pxDiff (independent return), not alpha (which depends on sig).
+    // If pxDiff absent, IC metrics are null.
+    // Time-series IC per sym: cor(prev sig, pxDiff)
+    tsIcBySym:$[hasPx;
+        (key grp)!{[x]
+            ps:prev x`sig; r:x`pxDiff;
+            valid:where (not null ps) and not null r;
+            $[5 < count valid; cor[ps valid; r valid]; 0n]
+        } each symData;
+        (key grp)!(count symData) # 0n];
     tsIcVals:(value tsIcBySym) where not null value tsIcBySym;
     tsIc:$[0 < count tsIcVals; avg tsIcVals; 0n];
-
-    // Cross-sectional IC (if multi-sym): daily rank cor(prev sig, pxDiff) across syms
-    // Uses pxDiff (raw price diff) if available; falls back to alpha
-    icDailyVals:$[nSyms >= 2;
-        [icTab:raze {[nm;sd;hasPx]
+    // Cross-sectional IC (multi-sym) or rolling cor (single-sym)
+    icDV:$[not hasPx; enlist 0n;
+        nSyms >= 2;
+        [icTab:raze {[nm;sd]
             ps:prev sd`sig;
-            ret:$[hasPx; sd`pxDiff; sd`alpha];
-            ([] dt:sd`dt; sym:(count sd`dt) # nm; prevSig:ps; ret:ret)
-         }[;;hasPx].'flip (key grp; symData);
+            ([] dt:sd`dt; sym:(count sd`dt) # nm; prevSig:ps; ret:sd`pxDiff)
+         }.'flip (key grp; symData);
          icGrp:group icTab`dt;
          {[icTab;idx]
-            ps:icTab[`prevSig] idx;
-            r:icTab[`ret] idx;
+            ps:icTab[`prevSig] idx; r:icTab[`ret] idx;
             valid:where (not null ps) and not null r;
-            $[3 > count valid; 0n;
-              cor[iasc iasc ps valid; iasc iasc r valid]]
+            $[2 > count valid; 0n; cor[iasc iasc ps valid; iasc iasc r valid]]
          }[icTab;] each value icGrp];
-        // Single sym: rolling cor(prev sig, alpha)
+        // Single sym: rolling cor(prev sig, pxDiff)
         raze {[x]
-            ps:prev x`sig; a:x`alpha;
-            exy:mavg[60;ps * a]; ex:mavg[60;ps]; ey:mavg[60;a];
-            ex2:mavg[60;ps * ps]; ey2:mavg[60;a * a];
+            ps:prev x`sig; r:x`pxDiff;
+            exy:mavg[60;ps * r]; ex:mavg[60;ps]; ey:mavg[60;r];
+            ex2:mavg[60;ps * ps]; ey2:mavg[60;r * r];
             num:exy - (ex * ey);
             varX:1e-6 | ex2 - (ex * ex);
             varY:1e-6 | ey2 - (ey * ey);
             (-1f) | 1f & num % sqrt varX * varY
         } each symData];
-    icValid:icDailyVals where not null icDailyVals;
+    icValid:icDV where not null icDV;
     ic:$[0 < count icValid; avg icValid; 0n];
     icStd:$[1 < count icValid; dev icValid; 0n];
     icIR:$[icStd > 1e-10; ic % icStd; 0n];
+    // IC decay: cor(prev sig, fwd h-day pxDiff) at each horizon
+    icDecay:$[hasPx;
+        {[symData;h]
+            ics:{[sd;h]
+                ps:prev sd`sig; r:sd`pxDiff; nn:count ps;
+                fwdRet:msum[h; 1 rotate r];
+                fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
+                valid:where (not null ps) and not null fwdRet;
+                $[5 < count valid; cor[ps valid; fwdRet valid]; 0n]
+            }[;h] each symData;
+            v:ics where not null ics;
+            $[0 < count v; avg v; 0n]
+        }[symData;] each icLags;
+        (count icLags) # 0n];
+    `ic`ic_ir`tsIc`ic_decay!(ic;icIR;tsIcBySym;icLags!icDecay)}
 
-    // IC decay: cor(prev sig, fwd h-day alpha) at each horizon
-    icDecay:{[symData;h]
-        ics:{[sd;h]
-            ps:prev sd`sig;
-            a:sd`alpha;
-            nn:count ps;
-            fwdRet:msum[h; 1 rotate a];
-            fwdRet:@[fwdRet; ((nn - h) + til h); :; 0n];
-            valid:where (not null ps) and not null fwdRet;
-            $[5 < count valid; cor[ps valid; fwdRet valid]; 0n]
-        }[;h] each symData;
-        v:ics where not null ics;
-        $[0 < count v; avg v; 0n]
-    }[symData;] each icLags;
+arRegime_:{[symData;dts;nzr;nzDts;n;pcfg]
+    hasRegime:pcfg`hasRegime; hasPx:pcfg`hasPx;
+    vrQ:pcfg`vrQ; vrW:pcfg`vrW;
+    regimeByDt:$[hasRegime;
+        [regTab:raze {([] dt:x`dt; regime:x`regime)} each symData;
+         regDaily:0!select regime:avg regime by dt from regTab;
+         regDaily:`dt xasc regDaily; regDaily`regime];
+        [vrPerSym:{[sd;hasPx;vrQ;vrW]
+            x:$[hasPx; sd`pxDiff; sd`alpha];
+            vr:.cond.varianceRatio[x; vrQ; vrW];
+            ([] dt:sd`dt; vr:vr)
+         }[;hasPx;vrQ;vrW] each symData;
+         vrTab:raze vrPerSym;
+         vrDaily:0!select vr:avg vr by dt from vrTab;
+         vrDaily:`dt xasc vrDaily; vrDaily`vr]];
+    regimeLookup:dts!regimeByDt;
+    nzRegime:regimeLookup nzDts;
+    isTrending:$[hasRegime; nzRegime > 0.5; nzRegime > 1f];
+    trendR:nzr where isTrending;
+    mrR:nzr where not isTrending;
+    rm:{[r;nAll]
+        nn:count r;
+        if[nn < 3; :`n`frac`sharpe`hit_rate`avg_daily!(nn;nn % 1 | nAll;0n;0n;0n)];
+        ar:252 * avg r; av:(sqrt 252f) * dev r;
+        sh:$[av > 1e-10; ar % av; 0n];
+        `n`frac`sharpe`hit_rate`avg_daily!(nn;nn % 1 | nAll;sh;avg r > 0f;avg r)
+    }[;n];
+    `trending`mr!(rm trendR;rm mrR)}
 
-    // --- Build result ---
-    baseKeys:`n`ann_return`ann_vol`sharpe`sortino`win_sharpe,
-        `hit_rate`monthly_hit_rate,
-        `profit_factor`payoff_ratio`tail_ratio`return_skew,
-        `max_dd`max_dd_length`calmar`max_consec_loss,
-        `turnover`ic`ic_ir`tsIc;
-    baseVals:(n;annRet;annVol;sharpe;sortino;winSharpe;
-        hitRate;monthlyHitRate;
-        profitFactor;payoffRatio;tailRatio;returnSkew;
-        maxDD;maxDDLen;calmar;maxConsecLoss;
-        turnover;ic;icIR;tsIcBySym);
-    concDict:pnlConcKeys!pnlConc;
-    decayDict:(enlist `ic_decay)!enlist icLags!icDecay;
-    (baseKeys!baseVals),concDict,decayDict}
+// --- Main alphaReport function ---
+alphaReport:{[t;cfg]
+    pcfg:arParseCfg_[t;cfg];
+    ext:arExtract_[t;pcfg];
+    grp:ext`grp; symData:ext`symData;
+    nSyms:count key grp;
+    // Aggregate daily alpha
+    allRows:raze {([] dt:x`dt; alpha:x`alpha)} each symData;
+    daily:0!select alpha:sum alpha by dt from allRows;
+    daily:`dt xasc daily;
+    dts:daily`dt; r:daily`alpha;
+    nzr:r where r <> 0f;
+    nzDts:dts where r <> 0f;
+    n:count nzr;
+    if[n < 3; :(`n`sharpe`sortino`ann_return)!(n;0n;0n;0n)];
+    // Compute all sections
+    perf:arPerf_[nzr;nzDts;n;pcfg`winPct];
+    risk:arRisk_[r;perf`ann_return];
+    payoff:arPayoff_[nzr;n;pcfg`topN];
+    ep:arEpisodes_[nzr;nzDts;n;pcfg`topN;pcfg`epGap];
+    turn:(enlist `turnover)!enlist arTurnover_ symData;
+    icm:arIC_[symData;grp;nSyms;pcfg];
+    reg:arRegime_[symData;dts;nzr;nzDts;n;pcfg];
+    (enlist[`n]!enlist n),perf,risk,payoff,turn,icm,`episodes`regime!(ep;reg)}
 
 example:{[]
     -1 "";
