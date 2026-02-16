@@ -1140,7 +1140,9 @@ alphaEval:{[t;cfg]
 // --- alphaReport helpers (private) ---
 
 arParseCfg_:{[t;cfg]
-    cDt:$[99h=type cfg;$[`dtCol in key cfg;cfg`dtCol;`dt];`dt];
+    // Use `dt for performance aggregation by default.
+    cDtDef:$[`dt in cols t;`dt;$[`time in cols t;`time;`dt]];
+    cDt:$[99h=type cfg;$[`dtCol in key cfg;cfg`dtCol;cDtDef];cDtDef];
     cSym:$[99h=type cfg;$[`symCol in key cfg;cfg`symCol;`ricRoot];`ricRoot];
     cSig:$[99h=type cfg;$[`sigCol in key cfg;cfg`sigCol;`sig];`sig];
     cRet:$[99h=type cfg;$[`retCol in key cfg;cfg`retCol;`alpha];`alpha];
@@ -1160,13 +1162,15 @@ arParseCfg_:{[t;cfg]
 
 arExtract_:{[t;pcfg]
     grp:group t pcfg`cSym;
-    sd:{[t;pcfg;idx]
-        sub:pcfg[`cDt] xasc t idx;
+    // Sort by `time when available so turnover uses true bar ordering.
+    sortCol:$[`time in cols t;`time;pcfg`cDt];
+    sd:{[t;pcfg;sortCol;idx]
+        sub:sortCol xasc t idx;
         d:`dt`sig`alpha!(sub pcfg`cDt; "f"$sub pcfg`cSig; "f"$sub pcfg`cRet);
         if[pcfg`hasPx; d[`pxDiff]:"f"$sub pcfg`cPx];
         if[pcfg`hasRegime; d[`regime]:"f"$sub pcfg`cRegime];
         d
-    }[t;pcfg;] each value grp;
+    }[t;pcfg;sortCol;] each value grp;
     `grp`symData!(grp;sd)}
 
 arPerf_:{[nzr;nzDts;n;winPct]
@@ -1425,14 +1429,17 @@ arRegime_:{[symData;dts;nzr;nzDts;n;pcfg]
         [regTab:raze {([] dt:x`dt; regime:x`regime)} each symData;
          regDaily:0!select regime:avg regime by dt from regTab;
          regDaily:`dt xasc regDaily; regDaily`regime];
-        [vrPerSym:{[sd;hasPx;vrQ;vrW]
-            x:$[hasPx; sd`pxDiff; sd`alpha];
-            vr:.cond.varianceRatio[x; vrQ; vrW];
-            ([] dt:sd`dt; vr:vr)
-         }[;hasPx;vrQ;vrW] each symData;
-         vrTab:raze vrPerSym;
-         vrDaily:0!select vr:avg vr by dt from vrTab;
-         vrDaily:`dt xasc vrDaily; vrDaily`vr]];
+        [vrFn:@[value;`.cond.varianceRatio;{::}];
+         $[vrFn~(::);
+            (count dts)#0n;
+            [vrPerSym:{[sd;hasPx;vrQ;vrW;vrFn]
+                x:$[hasPx; sd`pxDiff; sd`alpha];
+                vr:vrFn[x; vrQ; vrW];
+                ([] dt:sd`dt; vr:vr)
+             }[;hasPx;vrQ;vrW;vrFn] each symData;
+             vrTab:raze vrPerSym;
+             vrDaily:0!select vr:avg vr by dt from vrTab;
+             vrDaily:`dt xasc vrDaily; vrDaily`vr]]]];
     regimeLookup:dts!regimeByDt;
     nzRegime:regimeLookup nzDts;
     isTrending:$[hasRegime; nzRegime > 0.5; nzRegime > 1f];
