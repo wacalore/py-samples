@@ -1271,8 +1271,9 @@ arIC_:{[symData;grp;nSyms;pcfg]
             $[2 > count ps; 0n; cor[ps; r]]
         }[flat;] each value group flat`dt;
         enlist 0n];
-    icValid:icByDt where not null icByDt;
-    ic:$[0 < count icValid; avg icValid; 0n];
+    icByDt:0f ^ icByDt;
+    icNonZero:icByDt where icByDt <> 0f;
+    ic:$[0 < count icNonZero; avg icNonZero; 0n];
     // panelIc: pooled cor(prev sig, pxDiff) across all syms and times
     panelIc:$[5 < count flat; cor[flat`ps; flat`r]; 0n];
     // Per-sym IC: cor(prev sig, pxDiff) within each sym
