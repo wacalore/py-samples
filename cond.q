@@ -458,6 +458,19 @@ csSmooth:{[t;halflife;cfg]
     t[`smoothSig]:smoMu + $[doInv; neg csdev; csdev];
     t}
 
+// csInvert: invert cross-sectional deviations while preserving the level
+// At each time step: output = csMean - (sig - csMean) = 2*csMean - sig
+// t: table with time, sym, and signal columns
+// cfg: dict with optional keys `time`sym`sig (defaults: `time`ricRoot`rawSig)
+// Returns: t with sig column replaced by its cs-inverted values
+csInvert:{[t;cfg]
+    dc:`time`sym`sig!(`time;`ricRoot;`rawSig);
+    c:$[99h = type cfg; dc,cfg; dc];
+    tc:c`time; sigc:c`sig;
+    mu:(avg; "f"$t sigc) fby t tc;
+    t[sigc]:(2 * mu) - "f"$t sigc;
+    t}
+
 // -----------------------------------------------------------------------------
 // FORWARD SIMULATION
 // -----------------------------------------------------------------------------
