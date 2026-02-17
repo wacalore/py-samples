@@ -3957,9 +3957,14 @@ dtPredictOne:{[tree;x]
 
 // Vectorized tree prediction - process all rows at once
 // Uses index tracking through tree traversal
+dtLeafSeed:{[node]
+    cur:node;
+    while[not cur`leaf; cur:cur`left];
+    cur`val}
+
 dtPredictVec:{[tree;X]
     n:count X;
-    preds:n#0f;
+    preds:n#dtLeafSeed tree;
     queue:enlist (tree; til n);
     while[count queue;
         item:first queue;
@@ -4716,10 +4721,11 @@ gbHistr:{[n;X;y;nTrees;maxDepth;minLeaf;lr]
 rollingByGroup_:{[tbl;bycol;xc;yc;fn]
     nObs:count tbl;
     grpIdxs:$[(::)~bycol; enlist til nObs; value group tbl bycol];
-    proc:{[tbl;xc;yc;fn;idxs]
-        sub:tbl idxs;
-        fn[flip sub xc; `float$sub yc]
-    }[tbl;xc;yc;fn];
+    Xall:flip tbl xc;
+    yall:`float$tbl yc;
+    proc:{[Xall;yall;fn;idxs]
+        fn[Xall idxs; yall idxs]
+    }[Xall;yall;fn];
     results:proc each grpIdxs;
     allIdx:raze grpIdxs;
     allPreds:raze results;
@@ -4739,11 +4745,35 @@ gbcnrT:{[tbl;bycol;xc;yc;n;cfg]
     rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbcnr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]}[n;c]]}
 
 // Rolling GB Regression on table
-// cfg keys: `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1)
+// cfg keys:
+//   `nTrees(50) `maxDepth(3) `minLeaf(5) `lr(0.1)
+//   `mode(`exact|`fast|`batch|`warm|`stoch|`hist)
+//   `stride(5) `batch(5) `rebuildEvery(10) `subsample(0.5)
+//   `nBins(64) `lambda(0.1)  / for `hist mode
+gbrHistCfg_:{[n;c;X;y]
+    len:count y;
+    preds:len#0n;
+    i:n;
+    while[i < len;
+        idx:(i-n) + til n;
+        model:gbHistFit[X idx;y idx;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`nBins;c`lambda];
+        preds[i]:first gbPredict[model;enlist X i];
+        i+:1];
+    preds}
+
+gbrDispatch_:{[n;c;X;y]
+    mode:$[`mode in key c; c`mode; `exact];
+    $[mode~`fast;  gbrF[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`stride];
+      mode~`batch; gbrB[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`batch];
+      mode~`warm;  gbrW[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`rebuildEvery];
+      mode~`stoch; gbrS[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr;c`subsample];
+      mode~`hist;  gbrHistCfg_[n;c;X;y];
+      gbr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]]}
+
 gbrT:{[tbl;bycol;xc;yc;n;cfg]
-    defaults:`nTrees`maxDepth`minLeaf`lr!(50;3;5;0.1);
+    defaults:`nTrees`maxDepth`minLeaf`lr`mode`stride`batch`rebuildEvery`subsample`nBins`lambda!(50;3;5;0.1;`exact;5;5;10;0.5;64;0.1);
     c:$[99h=type cfg; defaults,cfg; defaults];
-    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbr[n;X;y;c`nTrees;c`maxDepth;c`minLeaf;c`lr]}[n;c]]}
+    rollingByGroup_[tbl;bycol;xc;yc;{[n;c;X;y] gbrDispatch_[n;c;X;y]}[n;c]]}
 
 // Rolling Random Forest Classification on table
 // cfg keys: `nTrees(100) `maxDepth(5) `minLeaf(10)
