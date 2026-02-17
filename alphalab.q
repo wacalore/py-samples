@@ -733,6 +733,397 @@ paramSensitivity:{[alphaName;bestParams;data;perturbPct;cfg]
     sensRows}
 
 // -----------------------------------------------------------------------------
+// STABLE ROLLING PCA COMPONENTS
+// -----------------------------------------------------------------------------
+// Build stable, tradable PCA components from a long table of asset returns.
+// Designed for intraday-indexed panels (e.g., 2 timestamps/day), with no lookahead:
+//   fit at time t  -> apply weights to returns at time t+1
+//
+// Required columns:
+//   time index (default: `time then `dt), symbol (default: `ricRoot then `sym),
+//   return (default: `ret then `alpha then `pxDiff then `pnl)
+//
+// Optional columns:
+//   carry (per-period carry forecast), dv01, vol
+//
+// Main API:
+//   pcaComponentSeries[t;cfg] -> dict with `returns`daily`summary`weights`diagnostics
+//   pcaComponentReturns[t;cfg] -> returns table only
+
+pcFirstCol_:{[t;cands;fallback]
+    cs:cols t;
+    hit:cands where cands in cs;
+    $[0 < count hit; first hit; fallback]}
+
+pcCfg_:{[t;cfg]
+    c:$[99h=type cfg;cfg;()!()];
+    cTime:$[`timeCol in key c; c`timeCol; pcFirstCol_[t;`time`tm`ts`datetime`dt;`time]];
+    cSym:$[`symCol in key c; c`symCol; pcFirstCol_[t;`ricRoot`sym`asset;`sym]];
+    cRet:$[`retCol in key c; c`retCol; pcFirstCol_[t;`ret`alpha`pxDiff`pnl;`ret]];
+    cCarry:$[`carryCol in key c; c`carryCol; pcFirstCol_[t;`carry`carry1d`carry_bps;`carry]];
+    cDv01:$[`dv01Col in key c; c`dv01Col; pcFirstCol_[t;`dv01`pv01;`dv01]];
+    cVol:$[`volCol in key c; c`volCol; pcFirstCol_[t;`vol`ewVol`sigma;`vol]];
+    if[not cTime in cols t; '"pcaComponentSeries missing time column"];
+    if[not cSym in cols t; '"pcaComponentSeries missing symbol column"];
+    if[not cRet in cols t; '"pcaComponentSeries missing return column"];
+    hasCarry:cCarry in cols t;
+    hasDv01:cDv01 in cols t;
+    hasVol:cVol in cols t;
+    k:1 | `long$ $[`k in key c; c`k; 3];
+    w:2 | `long$ $[`window in key c; c`window; 120];
+    minObs:3 | `long$ $[`minObs in key c; c`minObs; w];
+    winPct:"f"$ $[`winsorPct in key c; c`winsorPct; 0.005f];
+    winPct:0f | 0.49f & winPct;
+    shrink:"f"$ $[`shrinkage in key c; c`shrinkage; 0.25f];
+    shrink:0f | 1f & shrink;
+    covTarget:$[`covTarget in key c; c`covTarget; `diag];
+    if[10h=type covTarget; covTarget:`$covTarget];
+    if[not covTarget in `diag`identity`constcorr; covTarget:`diag];
+    useDv01:$[`scaleDv01 in key c; c`scaleDv01; hasDv01];
+    useVol:$[`scaleVol in key c; c`scaleVol; hasVol];
+    volHL:2f | "f"$ $[`volHalflife in key c; c`volHalflife; 120f];
+    stabilize:$[`stabilize in key c; c`stabilize; 1b];
+    smooth:0f | 0.95f & ("f"$ $[`smoothLoadings in key c; c`smoothLoadings; 0f]);
+    fill:"f"$ $[`fill in key c; c`fill; 0f];
+    minDenom:"f"$ $[`minDenom in key c; c`minDenom; 1e-8];
+    minDenom:1e-12 | abs minDenom;
+    minVol:"f"$ $[`minVol in key c; c`minVol; 1e-6];
+    minVol:1e-10 | abs minVol;
+    barsPerDay:0.5f | ("f"$ $[`barsPerDay in key c; c`barsPerDay; 2f]);
+    annualFactor:252f * barsPerDay;
+    `cTime`cSym`cRet`cCarry`hasCarry`cDv01`hasDv01`cVol`hasVol`k`window`minObs`winsorPct`shrinkage`covTarget`useDv01`useVol`volHalflife`stabilize`smoothLoadings`fill`minDenom`minVol`barsPerDay`annualFactor!(
+        cTime;cSym;cRet;cCarry;hasCarry;cDv01;hasDv01;cVol;hasVol;k;w;minObs;winPct;shrink;covTarget;useDv01;useVol;volHL;stabilize;smooth;fill;minDenom;minVol;barsPerDay;annualFactor)}
+
+pcSanitize_:{[x;fill]
+    fv:"f"$fill;
+    v:"f"$x;
+    v:@[v; where null v; :; fv];
+    bad:where (abs v) = 0w;
+    @[v; bad; :; fv]}
+
+pcWinsorVec_:{[x;p]
+    v:"f"$x;
+    n:count v;
+    if[(n < 8) or (p <= 0f); :v];
+    s:asc v;
+    loIdx:0 | `long$floor (p * n);
+    hiIdx:(n - 1) & `long$floor ((1f - p) * n);
+    lo:s loIdx;
+    hi:s hiIdx;
+    lo | v & hi}
+
+pcPivotLast_:{[t;cTm;cSym;cVal;times;syms;fill]
+    nT:count times;
+    cvecs:{[t;cTm;cSym;cVal;times;fill;nT;s]
+        sub:select tm:t cTm, vv:"f"$t cVal from t where (t cSym)=s;
+        if[0 = count sub; :nT # fill];
+        sub:0!select vv:last vv by tm from sub;
+        base:([tm:times] vv:nT#0n);
+        j:base lj `tm xkey sub;
+        pcSanitize_[(value j)`vv;fill]
+    }[t;cTm;cSym;cVal;times;fill;nT] each syms;
+    flip cvecs}
+
+pcLagCols_:{[M;fill]
+    cvecs:flip M;
+    lagged:{[x;fill] pcSanitize_[fills prev x;fill]}[;fill] each cvecs;
+    flip lagged}
+
+pcEwVolCols_:{[M;halflife;minVol]
+    alpha:1f - exp ((log 0.5f) % (1e-6 | "f"$halflife));
+    cvecs:flip M;
+    vcols:{[x;alpha;minVol]
+        xv:pcSanitize_[x;0f];
+        v:sqrt ema[alpha; xv * xv];
+        v:pcSanitize_[v;minVol];
+        minVol | v
+    }[;alpha;minVol] each cvecs;
+    flip vcols}
+
+pcCov_:{[X]
+    n:count X;
+    if[n < 2; :0#0#0f];
+    mu:avg each flip X;
+    Xc:X -\: mu;
+    ((flip Xc) mmu Xc) % (n - 1f)}
+
+pcDiagMatrix_:{[d]
+    n:count d;
+    M:n#enlist n#0f;
+    i:0;
+    while[i < n;
+        M[i;i]:d i;
+        i+:1];
+    M}
+
+pcDiagVec_:{[M]
+    n:count M;
+    d:n#0f;
+    i:0;
+    while[i < n;
+        d[i]:M[i;i];
+        i+:1];
+    d}
+
+pcTargetCov_:{[S;target]
+    n:count S;
+    if[n = 0; :S];
+    d:pcDiagVec_ S;
+    if[target ~ `identity;
+        mu:(sum d) % (1f * n);
+        :pcDiagMatrix_[n#mu]];
+    if[target ~ `constcorr;
+        sd:sqrt (1e-12 | d);
+        rhoSum:0f;
+        nRho:0;
+        i:0;
+        while[i < n;
+            j:i + 1;
+            while[j < n;
+                rhoSum+:S[i;j] % ((sd i) * (sd j));
+                nRho+:1;
+                j+:1];
+            i+:1];
+        rho:$[nRho > 0; rhoSum % nRho; 0f];
+        T:n#enlist n#0f;
+        i:0;
+        while[i < n;
+            T[i;i]:d i;
+            j:i + 1;
+            while[j < n;
+                v:rho * (sd i) * (sd j);
+                T[i;j]:v;
+                T[j;i]:v;
+                j+:1];
+            i+:1];
+        :T];
+    pcDiagMatrix_ d}
+
+pcShrinkCov_:{[S;delta;target]
+    d:0f | 1f & "f"$delta;
+    T:pcTargetCov_[S;target];
+    ((1f - d) * S) + (d * T)}
+
+pcNormalizeCols_:{[L]
+    if[0 = count L; :L];
+    cvecs:flip L;
+    cvecsN:{[x]
+        nr:sqrt sum x * x;
+        $[nr > 1e-12; x % nr; x]
+    } each cvecs;
+    flip cvecsN}
+
+pcEigFromCov_:{[C;k]
+    n:count C;
+    if[n = 0; :`loadings`eigenvalues`explained!(0#0#0f;0#0f;0#0f)];
+    kk:n & (1 | `long$k);
+    Cw:"f"$C;
+    evs:();
+    lds:();
+    i:0;
+    while[i < kk;
+        v:n#0f;
+        v[i mod n]:1f;
+        it:0;
+        while[it < 80;
+            v2:Cw mmu v;
+            nr:sqrt sum v2 * v2;
+            v:$[nr > 1e-12; v2 % nr; v];
+            it+:1];
+        ev:sum v * (Cw mmu v);
+        ev:0f | ev;
+        evs,:ev;
+        lds,:enlist v;
+        Cw:Cw - (ev * v */: v);
+        i+:1];
+    L:pcNormalizeCols_ flip lds;
+    ex:("f"$evs) % (1e-12 | sum "f"$evs);
+    `loadings`eigenvalues`explained!(L;"f"$evs;"f"$ex)}
+
+pcAlignLoadings_:{[prevL;currL;currEv]
+    k:count currEv;
+    if[0 = count prevL; :`loadings`eigenvalues`perm`sign!(currL;currEv;til k;k#1f)];
+    if[0 = count currL; :`loadings`eigenvalues`perm`sign!(currL;currEv;til k;k#1f)];
+    kPrev:count first prevL;
+    if[kPrev <> k; :`loadings`eigenvalues`perm`sign!(currL;currEv;til k;k#1f)];
+    used:k#0b;
+    perm:k#0N;
+    j:0;
+    while[j < k;
+        pv:prevL[;j];
+        d:abs (flip currL) mmu pv;
+        d:@[d; where used; :; -1f];
+        idx:first where d = max d;
+        if[null idx;
+            idx:first where not used;
+            if[null idx; idx:0]];
+        perm[j]:idx;
+        used[idx]:1b;
+        j+:1];
+    L:currL[;perm];
+    ev:currEv perm;
+    sg:{[a;b] d:sum a * b; $[d < 0f; -1f; 1f]}'[flip prevL; flip L];
+    L:flip sg * flip L;
+    `loadings`eigenvalues`perm`sign!(L;ev;perm;sg)}
+
+pcLoadingTurnover_:{[prevL;currL]
+    if[0 = count prevL; :0n];
+    if[0 = count currL; :0n];
+    kPrev:count first prevL;
+    kCurr:count first currL;
+    if[kPrev <> kCurr; :0n];
+    tv:{avg abs x - y}'[flip prevL; flip currL];
+    v:tv where not null tv;
+    $[0 < count v; avg v; 0n]}
+
+pcSummary_:{[retT;annualFactor]
+    if[0 = count retT; :0#([] pc:enlist `pc1; n:enlist 0i; mean:enlist 0f; vol:enlist 0f; ann_ret:enlist 0f; ann_vol:enlist 0f; sharpe:enlist 0f; carry_avg:enlist 0f; shock_avg:enlist 0f)];
+    base:0!select n:count ret, mean:avg ret, vol:dev ret, carry_avg:avg carry, shock_avg:avg shock by pc from retT where ret <> 0f;
+    annRet:annualFactor * base`mean;
+    annVol:(sqrt annualFactor) * base`vol;
+    sh:annRet % annVol;
+    bad:where null sh;
+    bad2:where (not null annVol) & annVol <= 1e-10;
+    sh:@[sh; bad, bad2; :; 0n];
+    update ann_ret:annRet, ann_vol:annVol, sharpe:sh from base}
+
+// Stable rolling PCA components for long table input.
+// Output dict keys:
+//   `returns      - per-time realized component return/carry/shock (fit at t, realized t+1)
+//   `daily        - same series aggregated by date
+//   `summary      - per-component annualized summary
+//   `weights      - component loadings and tradable weights by fit time
+//   `diagnostics  - fit diagnostics per rebalance timestamp
+//   `cfg`symbols`times
+pcaComponentSeries:{[t;cfg]
+    if[98h <> type t; '"pcaComponentSeries expects a table"];
+    p:pcCfg_[t;cfg];
+    cTm:p`cTime;
+    cSym:p`cSym;
+    cRet:p`cRet;
+    t0:(cTm,cSym) xasc t;
+    times:asc distinct t0 cTm;
+    syms:asc distinct t0 cSym;
+    nT:count times;
+    nS:count syms;
+    tm0:$[nT > 0; first times; .z.p];
+    sym0:$[nS > 0; first syms; `sym0];
+    emptyRet:0#([] time:enlist tm0; fit_time:enlist tm0; dt:enlist `date$tm0; pc:enlist `pc1; ret:enlist 0f; carry:enlist 0f; shock:enlist 0f; eigenvalue:enlist 0f; explained:enlist 0f; loading_turnover:enlist 0f; eigengap:enlist 0f);
+    emptyW:0#([] fit_time:enlist tm0; pc:enlist `pc1; sym:enlist sym0; loading:enlist 0f; weight:enlist 0f; eigenvalue:enlist 0f; explained:enlist 0f);
+    emptyD:0#([] fit_time:enlist tm0; out_time:enlist tm0; dt:enlist `date$tm0; n_obs:enlist 0i; eigengap:enlist 0f; total_var:enlist 0f; loading_turnover:enlist 0f);
+    emptyDaily:0#([] dt:enlist `date$tm0; pc:enlist `pc1; ret:enlist 0f; carry:enlist 0f; shock:enlist 0f);
+    minObs:p`minObs;
+    window:p`window;
+    fill:p`fill;
+    minDenom:p`minDenom;
+    minVol:p`minVol;
+    winsorPct:p`winsorPct;
+    shrinkage:p`shrinkage;
+    covTarget:p`covTarget;
+    k:p`k;
+    stabilize:p`stabilize;
+    smoothLoadings:p`smoothLoadings;
+    annualFactor:p`annualFactor;
+    if[nS < 2; :`returns`daily`summary`weights`diagnostics`cfg`symbols`times!(emptyRet;emptyDaily;pcSummary_[emptyRet;annualFactor];emptyW;emptyD;p;syms;times)];
+    if[nT < (minObs + 1); :`returns`daily`summary`weights`diagnostics`cfg`symbols`times!(emptyRet;emptyDaily;pcSummary_[emptyRet;annualFactor];emptyW;emptyD;p;syms;times)];
+
+    R:pcPivotLast_[t0;cTm;cSym;cRet;times;syms;fill];
+    C:$[p`hasCarry; pcPivotLast_[t0;cTm;cSym;p`cCarry;times;syms;0f]; nT#enlist nS#0f];
+    D:nT#enlist nS#1f;
+    if[p`useDv01;
+        D:pcPivotLast_[t0;cTm;cSym;p`cDv01;times;syms;1f];
+        D:pcLagCols_[D;1f];
+        D:flip {[mn;x] mn | abs x}[minDenom] each flip D];
+    RnDv:R % D;
+    V:nT#enlist nS#1f;
+    if[p`useVol;
+        if[p`hasVol;
+            V:pcPivotLast_[t0;cTm;cSym;p`cVol;times;syms;1f];
+            V:pcLagCols_[V;1f];
+            V:flip {[mv;x] mv | abs x}[minVol] each flip V;
+        ];
+        if[not p`hasVol;
+            V:pcEwVolCols_[RnDv;p`volHalflife;minVol];
+            V:pcLagCols_[V;minVol];
+            V:flip {[mv;x] mv | abs x}[minVol] each flip V;
+        ];
+    ];
+    den:nT#enlist nS#1f;
+    if[p`useDv01; den:den * D];
+    if[p`useVol; den:den * V];
+    den:flip {[mn;x] mn | abs x}[minDenom] each flip den;
+    X:R % den;
+    xCols:flip X;
+    xCols:pcSanitize_[;fill] each xCols;
+    X:flip xCols;
+
+    retTabs:();
+    wtTabs:();
+    diagTabs:();
+    prevL:0#0#0f;
+    i:0;
+    while[i < nT - 1;
+        obs:i + 1;
+        if[obs >= minObs;
+            st:0 | (obs - window);
+            idx:st + til (obs - st);
+            Xw:X idx;
+            Xw:flip pcWinsorVec_[;winsorPct] each flip Xw;
+            S:pcCov_ Xw;
+            Ccov:pcShrinkCov_[S;shrinkage;covTarget];
+            pe:pcEigFromCov_[Ccov;k];
+            L:pe`loadings;
+            ev:pe`eigenvalues;
+            ex:pe`explained;
+            if[stabilize and (0 < count prevL);
+                al:pcAlignLoadings_[prevL;L;ev];
+                L:al`loadings;
+                ev:al`eigenvalues;
+                ex:("f"$ev) % (1e-12 | sum "f"$ev)];
+            if[(smoothLoadings > 0f) and (0 < count prevL);
+                sm:smoothLoadings;
+                L:((1f - sm) * L) + (sm * prevL);
+                L:pcNormalizeCols_ L];
+            turn:pcLoadingTurnover_[prevL;L];
+            gap:$[(count ev) > 1; (ev 0) - (ev 1); 0n];
+            denI:minDenom | abs den i;
+            wCols:{[col;den] col % den}[;denI] each flip L;
+            wM:flip wCols;
+            outIdx:i + 1;
+            fitTm:times i;
+            outTm:times outIdx;
+            dtOut:`date$outTm;
+            rNext:R outIdx;
+            cNow:C i;
+            compRet:(flip wM) mmu rNext;
+            compCarry:(flip wM) mmu cNow;
+            compShock:compRet - compCarry;
+            pcs:`$"pc",/:string (1 + til count compRet);
+            rt:([] time:(count pcs)#outTm; fit_time:(count pcs)#fitTm; dt:(count pcs)#dtOut; pc:pcs; ret:"f"$compRet; carry:"f"$compCarry; shock:"f"$compShock; eigenvalue:"f"$ev; explained:"f"$ex; loading_turnover:(count pcs)#turn; eigengap:(count pcs)#gap);
+            retTabs,:enlist rt;
+            lCols:flip L;
+            wCols:flip wM;
+            wt:raze {[tm;syms;pcs;lCols;wCols;ev;ex;j]
+                ([] fit_time:(count syms)#tm; pc:(count syms)#pcs j; sym:syms; loading:"f"$lCols j; weight:"f"$wCols j; eigenvalue:(count syms)#("f"$ev j); explained:(count syms)#("f"$ex j))
+            }[fitTm;syms;pcs;lCols;wCols;ev;ex] each til count pcs;
+            wtTabs,:enlist wt;
+            dg:([] fit_time:enlist fitTm; out_time:enlist outTm; dt:enlist dtOut; n_obs:enlist count idx; eigengap:enlist gap; total_var:enlist sum "f"$ev; loading_turnover:enlist turn);
+            diagTabs,:enlist dg;
+            prevL:L;
+        ];
+        i+:1];
+
+    retT:$[0 < count retTabs; raze retTabs; emptyRet];
+    wtT:$[0 < count wtTabs; raze wtTabs; emptyW];
+    diagT:$[0 < count diagTabs; raze diagTabs; emptyD];
+    daily:$[0 < count retT; 0!select ret:sum ret, carry:sum carry, shock:sum shock by dt, pc from retT; emptyDaily];
+    summary:pcSummary_[retT;annualFactor];
+    `returns`daily`summary`weights`diagnostics`cfg`symbols`times!(
+        retT;daily;summary;wtT;diagT;p;syms;times)}
+
+pcaComponentReturns:{[t;cfg] (pcaComponentSeries[t;cfg])`returns}
+
+// -----------------------------------------------------------------------------
 // HELP & USAGE
 // -----------------------------------------------------------------------------
 
@@ -765,6 +1156,8 @@ help:{[]
     -1 "  alphaEval[t;cfg]                      - unified perf report";
     -1 "  alphaReport[t;cfg]                    - extended report (IC, fragility, concentration)";
     -1 "  alphaCompositeScore[reports;cfg]      - composite ranking from alphaReport outputs";
+    -1 "  pcaComponentSeries[t;cfg]             - stable rolling PCA components (returns/carry)";
+    -1 "  pcaComponentReturns[t;cfg]            - returns table only from pcaComponentSeries";
     -1 "    Returns: sharpe, winsorizedSharpe, sortino, calmar, annReturn, annVol,";
     -1 "      maxDD, skew, kurtosis, winRate, profitFactor, avgWin, avgLoss,";
     -1 "      winLossRatio, cvar95, medianMonthlySharpe, medianMonthlyHitRate,";
