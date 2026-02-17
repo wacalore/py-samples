@@ -217,7 +217,7 @@ fetchSecuritiesDateRange:{[secType;startDate;endDate]
     // Convert Q dates to YYYY-MM-DD format (API requires dashes, not dots)
     sd:$[10h = type startDate; startDate; ssr[string startDate;".";"-"]];
     ed:$[10h = type endDate; endDate; ssr[string endDate;".";"-"]];
-    url:apiSearchUrl,"?format=json&type=",string[secType],"&pagesize=10000&startDate=",sd,"&endDate=",ed;
+    url:apiSearchUrl,"?format=json&type=",string[secType],"&pagesize=2000&startDate=",sd,"&endDate=",ed;
     result:.j.k httpGet url;
     // API returns empty list if no results
     $[0 = count result; (); result]}
