@@ -814,14 +814,18 @@ pcWinsorVec_:{[x;p]
 
 pcPivotLast_:{[t;cTm;cSym;cVal;times;syms;fill]
     nT:count times;
-    cvecs:{[t;cTm;cSym;cVal;times;fill;nT;s]
-        sub:select tm:t cTm, vv:"f"$t cVal from t where (t cSym)=s;
-        if[0 = count sub; :nT # fill];
+    tmv:t cTm;
+    symv:t cSym;
+    valv:"f"$t cVal;
+    cvecs:{[tmv;symv;valv;times;fill;nT;s]
+        idx:where symv = s;
+        if[0 = count idx; :nT # fill];
+        sub:([] tm:tmv idx; vv:valv idx);
         sub:0!select vv:last vv by tm from sub;
         base:([tm:times] vv:nT#0n);
         j:base lj `tm xkey sub;
         pcSanitize_[(value j)`vv;fill]
-    }[t;cTm;cSym;cVal;times;fill;nT] each syms;
+    }[tmv;symv;valv;times;fill;nT] each syms;
     flip cvecs}
 
 pcLagCols_:{[M;fill]
@@ -918,25 +922,54 @@ pcEigFromCov_:{[C;k]
     if[n = 0; :`loadings`eigenvalues`explained!(0#0#0f;0#0f;0#0f)];
     kk:n & (1 | `long$k);
     Cw:"f"$C;
-    evs:();
-    lds:();
-    i:0;
-    while[i < kk;
+    qv:();
+    evs:kk#0f;
+    j:0;
+    while[j < kk;
         v:n#0f;
-        v[i mod n]:1f;
+        v[j mod n]:1f;
         it:0;
-        while[it < 80;
+        while[it < 120;
             v2:Cw mmu v;
+            if[0 < count qv;
+                m:0;
+                while[m < count qv;
+                    q:qv m;
+                    proj:sum v2 * q;
+                    v2:v2 - (proj * q);
+                    m+:1]];
             nr:sqrt sum v2 * v2;
-            v:$[nr > 1e-12; v2 % nr; v];
+            if[nr > 1e-12; v:v2 % nr];
             it+:1];
-        ev:sum v * (Cw mmu v);
-        ev:0f | ev;
-        evs,:ev;
-        lds,:enlist v;
-        Cw:Cw - (ev * v */: v);
-        i+:1];
-    L:pcNormalizeCols_ flip lds;
+        if[0 < count qv;
+            m:0;
+            while[m < count qv;
+                q:qv m;
+                proj:sum v * q;
+                v:v - (proj * q);
+                m+:1]];
+        nr:sqrt sum v * v;
+        if[nr <= 1e-12;
+            v:n#0f;
+            v[j mod n]:1f;
+            if[0 < count qv;
+                m:0;
+                while[m < count qv;
+                    q:qv m;
+                    proj:sum v * q;
+                    v:v - (proj * q);
+                    m+:1]];
+            nr:sqrt sum v * v;
+            if[nr > 1e-12; v:v % nr]];
+        if[nr > 1e-12;
+            qv,:enlist v;
+            ev:sum v * (Cw mmu v);
+            evs[j]:0f | ev];
+        if[nr <= 1e-12;
+            qv,:enlist n#0f;
+            evs[j]:0f];
+        j+:1];
+    L:pcNormalizeCols_ flip qv;
     ex:("f"$evs) % (1e-12 | sum "f"$evs);
     `loadings`eigenvalues`explained!(L;"f"$evs;"f"$ex)}
 
