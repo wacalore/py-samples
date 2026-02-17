@@ -709,7 +709,7 @@ sigOpt:{[t;featureCol;cfg]
     ctx:`feat`ret`sym`tm`rsk`nn`ann!(feat;ret;sym;tm;rsk;nn;ann);
     // Auto-detect lag convention: test zscore(20) with prev vs without prev
     noPrev:$[`noPrev in key c; c`noPrev; 0b];
-    autoLag:$[`autoLag in key c; c`autoLag; 1b];
+    autoLag:$[`autoLag in key c; c`autoLag; 0b];
     if[autoLag and not `noPrev in key c;
         testSig:soClean_ (.cond.rzscore[20;];feat) fby sym;
         shPrev:soPsh_[sym;ret;rsk;tm;ann;0b;testSig];
