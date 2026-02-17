@@ -1156,6 +1156,135 @@ pcaComponentSeries:{[t;cfg]
 
 pcaComponentReturns:{[t;cfg] (pcaComponentSeries[t;cfg])`returns}
 
+pcSignalLong_:{[sig;cfg]
+    if[98h <> type sig; '"pcSignalToFutures expects signal table"];
+    c:$[99h = type cfg; cfg; ()!()];
+    cTime:$[`timeCol in key c; c`timeCol; pcFirstCol_[sig;`time`fit_time`dt;`time]];
+    if[not cTime in cols sig; '"pcSignalToFutures missing signal time column"];
+    cPc:$[`pcCol in key c; c`pcCol; `pc];
+    cSig:$[`sigCol in key c; c`sigCol; `sig];
+    if[(cPc in cols sig) and (cSig in cols sig);
+        out:select time:sig cTime, pc:sig cPc, sig:"f"$sig cSig from sig;
+        :`time`pc xasc 0!select sig:last sig by time,pc from out];
+    cands:(cols sig) except cTime;
+    pcCols:cands where {"pc"~2#lower string x} each cands;
+    if[0 = count pcCols; '"pcSignalToFutures expects long columns (`pc,`sig) or wide pc* columns"];
+    rows:raze {[sig;cTime;pcCols;pc]
+        ([] time:sig cTime; pc:(count sig)#pc; sig:"f"$sig pc)
+    }[sig;cTime;pcCols] each pcCols;
+    `time`pc xasc 0!select sig:last sig by time,pc from rows}
+
+// Map component signals back into futures portfolio weights.
+// sig: long table (time,pc,sig) or wide table (time,pc1,pc2,...)
+// pcaRes: output dict from pcaComponentSeries
+// cfg keys:
+//   `timeCol`pcCol`sigCol      - signal column names (for long/wide parsing)
+//   `align                     - `fit (default) or `out
+//   `carryForwardWeights       - use latest fit <= signal time (default 1b)
+//   `normalizeGross            - gross-normalize by timestamp (default 1b)
+//   `targetGross               - target gross after normalize (default 1f)
+//   `maxAbsSym                 - optional cap on absolute per-symbol weight
+// Returns dict:
+//   `portfolio  -> ([] time; dt; sym; fut_weight)
+//   `contrib    -> ([] time; dt; pc; sym; sig; weight; contrib)
+//   `pcExposure -> ([] time; dt; pc; pc_weight)
+pcSignalToFutures:{[sig;pcaRes;cfg]
+    if[99h <> type pcaRes; '"pcSignalToFutures expects pcaRes dict from pcaComponentSeries"];
+    if[not `weights in key pcaRes; '"pcSignalToFutures pcaRes missing `weights"];
+    c:$[99h = type cfg; cfg; ()!()];
+    align:$[`align in key c; c`align; `fit];
+    if[10h = type align; align:`$align];
+    carryW:$[`carryForwardWeights in key c; c`carryForwardWeights; 1b];
+    normGross:$[`normalizeGross in key c; c`normalizeGross; 1b];
+    tgtGross:abs "f"$ $[`targetGross in key c; c`targetGross; 1f];
+    maxAbs:$[`maxAbsSym in key c; abs "f"$c`maxAbsSym; 0w];
+
+    s:pcSignalLong_[sig;c];
+    if[0 = count s;
+        tm0:.z.p;
+        sym0:`sym0;
+        emptyP:0#([] time:enlist tm0; dt:enlist `date$tm0; sym:enlist sym0; fut_weight:enlist 0f);
+        emptyC:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist `pc1; sym:enlist sym0; sig:enlist 0f; weight:enlist 0f; contrib:enlist 0f);
+        emptyPc:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist `pc1; pc_weight:enlist 0f);
+        :`portfolio`contrib`pcExposure!(emptyP;emptyC;emptyPc)];
+
+    w0:select fit_time,pc,sym,weight from pcaRes`weights;
+    if[0 = count w0;
+        tm0:first s`time;
+        sym0:`sym0;
+        emptyP:0#([] time:enlist tm0; dt:enlist `date$tm0; sym:enlist sym0; fut_weight:enlist 0f);
+        emptyC:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist `pc1; sym:enlist sym0; sig:enlist 0f; weight:enlist 0f; contrib:enlist 0f);
+        emptyPc:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist `pc1; pc_weight:enlist 0f);
+        :`portfolio`contrib`pcExposure!(emptyP;emptyC;emptyPc)];
+
+    // Restrict weights to PCs that exist in signals
+    pcs:distinct s`pc;
+    w0:select from w0 where pc in pcs;
+    if[0 = count w0;
+        tm0:first s`time;
+        sym0:first distinct (pcaRes`weights)`sym;
+        emptyP:0#([] time:enlist tm0; dt:enlist `date$tm0; sym:enlist sym0; fut_weight:enlist 0f);
+        emptyC:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist first pcs; sym:enlist sym0; sig:enlist 0f; weight:enlist 0f; contrib:enlist 0f);
+        emptyPc:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist first pcs; pc_weight:enlist 0f);
+        :`portfolio`contrib`pcExposure!(emptyP;emptyC;emptyPc)];
+
+    w:$[align ~ `out;
+        [if[not `diagnostics in key pcaRes; '"pcSignalToFutures align=`out requires diagnostics in pcaRes"];
+         dg:select fit_time,out_time from pcaRes`diagnostics;
+         select w_time:out_time,pc,sym,weight from (w0 lj `fit_time xkey dg)];
+        select w_time:fit_time,pc,sym,weight from w0];
+    w:`w_time`pc`sym xasc w;
+
+    sigTimes:asc distinct s`time;
+    wAt:$[carryW;
+        [gw:0!select w_time,weight by pc,sym from w;
+         raze {[gw;sigTimes;i]
+            pcc:(gw`pc) i;
+            symb:(gw`sym) i;
+            sub:`w_time xasc ([] w_time:(gw`w_time) i; weight:"f"$(gw`weight) i);
+            base:([] w_time:sigTimes);
+            j:aj[`w_time;base;sub];
+            ([] time:sigTimes; pc:(count sigTimes)#pcc; sym:(count sigTimes)#symb; weight:0f^j`weight)
+         }[gw;sigTimes] each til count gw];
+        select time:w_time,pc,sym,weight from w];
+
+    wb:0!select sym,weight by time,pc from wAt;
+    sym0:first distinct wAt`sym;
+    emptyC:0#([] time:enlist first sigTimes; pc:enlist first pcs; sym:enlist sym0; sig:enlist 0f; weight:enlist 0f; contrib:enlist 0f);
+    contribRows:raze {[s;wb;emptyC;i]
+        tm:(s`time) i;
+        pcv:(s`pc) i;
+        sg:"f"$(s`sig) i;
+        hit:select sym,weight from wb where time=tm, pc=pcv;
+        if[0 = count hit; :emptyC];
+        sy:first hit`sym;
+        wt:"f"$first hit`weight;
+        n:count sy;
+        ([] time:n#tm; pc:n#pcv; sym:sy; sig:n#sg; weight:wt; contrib:(n#sg) * wt)
+    }[s;wb;emptyC] each til count s;
+
+    if[0 = count contribRows;
+        tm0:first sigTimes;
+        emptyP:0#([] time:enlist tm0; dt:enlist `date$tm0; sym:enlist sym0; fut_weight:enlist 0f);
+        emptyCc:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist first pcs; sym:enlist sym0; sig:enlist 0f; weight:enlist 0f; contrib:enlist 0f);
+        emptyPc:0#([] time:enlist tm0; dt:enlist `date$tm0; pc:enlist first pcs; pc_weight:enlist 0f);
+        :`portfolio`contrib`pcExposure!(emptyP;emptyCc;emptyPc)];
+
+    contrib:update dt:`date$time from contribRows;
+    port:0!select fut_weight:sum contrib by time,sym from contrib;
+    if[normGross;
+        gross:0!select gross:sum abs fut_weight by time from port;
+        port:port lj `time xkey gross;
+        port:update fut_weight:fut_weight * (tgtGross % (1e-12 | gross)) from port;
+        port:delete gross from port];
+    if[maxAbs < 0w;
+        port:update fut_weight:(neg maxAbs) | maxAbs & fut_weight from port];
+    port:update dt:`date$time from port;
+    port:`time`sym xasc port;
+    pcExp:0!select pc_weight:sum contrib by time,pc from contrib;
+    pcExp:update dt:`date$time from pcExp;
+    `portfolio`contrib`pcExposure!(port;contrib;pcExp)}
+
 // -----------------------------------------------------------------------------
 // HELP & USAGE
 // -----------------------------------------------------------------------------
@@ -1191,6 +1320,7 @@ help:{[]
     -1 "  alphaCompositeScore[reports;cfg]      - composite ranking from alphaReport outputs";
     -1 "  pcaComponentSeries[t;cfg]             - stable rolling PCA components (returns/carry)";
     -1 "  pcaComponentReturns[t;cfg]            - returns table only from pcaComponentSeries";
+    -1 "  pcSignalToFutures[sig;pcaRes;cfg]     - map PC signals back to futures weights";
     -1 "    Returns: sharpe, winsorizedSharpe, sortino, calmar, annReturn, annVol,";
     -1 "      maxDD, skew, kurtosis, winRate, profitFactor, avgWin, avgLoss,";
     -1 "      winLossRatio, cvar95, medianMonthlySharpe, medianMonthlyHitRate,";
