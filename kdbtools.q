@@ -959,7 +959,7 @@ ppo:{[fast;slow;x] 100*(expma[fast;x]-expma[slow;x])%expma[slow;x]}
 stc:{[fast;slow;k;x] m:expma[fast;x]-expma[slow;x]; pf:stochk[k;m]; pff:expma[3;pf]; pfs:stochk[k;pff]; expma[3;pfs]}
 
 // Fisher Transform
-fisher:{[n;x] v:2*normalizer[n;x]-1; v:clip[-0.999;0.999;v]; 0.5*log (1+v)%1-v}
+fisher:{[n;x] v:(2*normalizer[n;x])-1; v:clip[-0.999;0.999;v]; 0.5*log (1+v)%1-v}
 
 // Ichimoku Cloud - returns dict with all 5 lines
 // @param tenkan - conversion line period (default 9)
