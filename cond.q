@@ -704,7 +704,13 @@ sigOpt:{[t;featureCol;cfg]
     tm:t tmC;
     rsk:1e-10|soClean_ $[rskC in cols t;"f"$t rskC;1f+(0*feat)];
     nn:count feat;
+    nS:count distinct sym;
     nT:count distinct tm;
+    // Sanity check: time column should group syms (not be unique per row)
+    if[(nS > 1) and nT > nn % 2;
+        -1 "sigOpt WARNING: ",string[nT]," distinct times for ",string[nn]," rows (",string[nS]," syms).";
+        -1 "  Expected ~",string[nn div nS]," distinct times. Portfolio P&L groups by time.";
+        -1 "  If time is unique per row, no cross-sym aggregation occurs — Sharpe will be wrong."];
     ann:$[nT>500;252f;$[nT>100;52f;12f]];
     ctx:`feat`ret`sym`tm`rsk`nn`ann!(feat;ret;sym;tm;rsk;nn;ann);
     // Auto-detect lag convention: test zscore(20) with prev vs without prev
@@ -845,6 +851,109 @@ sigOpt:{[t;featureCol;cfg]
        turnover:mets`turnover;
        maxDD:mets`maxDD;
        profitFactor:mets`profitFactor)}
+
+// sigOptDebug: trace every step of the signal→alpha pipeline for a single signal
+// Returns a table with ALL intermediate columns so you can compare with your own implementation
+// t: same table as sigOpt
+// featureCol: feature column name
+// sigType: `zscore`rank`momentum etc. (or index 0-29)
+// params: dict of params (e.g., (enlist`w)!enlist 20)
+// cfg: same config as sigOpt (column name overrides etc.)
+sigOptDebug:{[t;featureCol;sigType;params;cfg]
+    dc:`sym`time`ret`risk!(`ricRoot;`time;`pxDiff;`risk);
+    c:$[99h=type cfg;dc,cfg;dc];
+    symC:c`sym;tmC:c`time;retC:c`ret;rskC:c`risk;
+    noPrev:$[`noPrev in key c; c`noPrev; 0b];
+    t:(tmC,symC) xasc t;
+    feat:soClean_ "f"$t featureCol;
+    ret:soClean_ "f"$t retC;
+    sym:t symC;
+    tm:t tmC;
+    rsk:1e-10|soClean_ $[rskC in cols t;"f"$t rskC;1f+(0*feat)];
+    nn:count feat;
+    ctx:`feat`ret`sym`tm`rsk`nn`ann!(feat;ret;sym;tm;rsk;nn;252f);
+    // Build the generator
+    names:`zscore`rank`momentum`smoothMom`accel`emaCross`meanRev`volAdj`breakout`decay`ridge`ols`csZscore`csRank`smoothZscore`rsi`bbandPos`macdHist`slopeT`cci`stochastic`fisher`cmo`trix`kalmanResid`rsiRetrace`bbRetrace`zscoreSnap`breakHold`tensionSnap;
+    idx:$[-11h=type sigType; names?sigType; sigType];
+    gens:(
+        {[c;p] (.cond.rzscore[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] ((.cond.rrank[`long$p`w;];c`feat) fby c`sym)-0.5}[ctx;];
+        {[c;p] (.cond.diff[;p`n];c`feat) fby c`sym}[ctx;];
+        {[c;p] d:(.cond.diff[;p`n];c`feat) fby c`sym; (.cond.smooth[;p`hl];0f^d) fby c`sym}[ctx;];
+        {[c;p] (.cond.diff[;p`n];(.cond.diff[;p`n];c`feat) fby c`sym) fby c`sym}[ctx;];
+        {[c;p] ((.cond.smooth[;p`fast];c`feat) fby c`sym)-((.cond.smooth[;p`slow];c`feat) fby c`sym)}[ctx;];
+        {[c;p] neg(.cond.rzscore[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] (c`feat)%1e-10|(mdev[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] (c`feat)-(.kdbtools.rpctl[`long$p`w;0.5];c`feat) fby c`sym}[ctx;];
+        {[c;p] (.cond.decay[;p`hl];c`feat) fby c`sym}[ctx;];
+        {[c;p] tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat); res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;`long$p`w;p`lam]; res`yhat}[ctx;];
+        {[c;p] tb:([]t:c`tm;s:c`sym;r:c`ret;f:c`feat); res:`t`s xasc .kdbtools.rollingRidgeTable[tb;`s;enlist`f;`r;`long$p`w;0f]; res`yhat}[ctx;];
+        {[c;p] mu:(avg;c`feat) fby c`tm;sd:(dev;c`feat) fby c`tm;((c`feat)-mu)%1e-10|sd}[ctx;];
+        {[c;p] byT:0!select f:f by t:t from([]t:c`tm;f:c`feat); raze{r:rank x;(r%((-1+count r)|1))-0.5}each byT`f}[ctx;];
+        {[c;p] zs:(.cond.rzscore[`long$p`w;];c`feat) fby c`sym; (.cond.smooth[;p`hl];0f^zs) fby c`sym}[ctx;];
+        {[c;p] (((.kdbtools.rsi[`long$p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+        {[c;p] (.kdbtools.bbpos[`long$p`w;p`k;];c`feat) fby c`sym}[ctx;];
+        {[c;p] fn:{[fa;sl;sg;d] (.kdbtools.macd[fa;sl;sg;d])`hist}[`long$p`fast;`long$p`slow;`long$p`sig;]; (fn;c`feat) fby c`sym}[ctx;];
+        {[c;p] (.kdbtools.slopeT[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] (.kdbtools.cci[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] (((.kdbtools.stochk[`long$p`w;];c`feat) fby c`sym) % 50f) - 1f}[ctx;];
+        {[c;p] (.kdbtools.fisher[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] ((.kdbtools.cmo[`long$p`w;];c`feat) fby c`sym) % 100f}[ctx;];
+        {[c;p] (.kdbtools.trix[`long$p`w;];c`feat) fby c`sym}[ctx;];
+        {[c;p] kf:({$[0=count z;z;.kdbtools.kalman[x;y;z]]}[p`q;p`r;];c`feat) fby c`sym; (c`feat) - kf}[ctx;];
+        {[c;p] rsiV:(.kdbtools.rsi[`long$p`w;];c`feat) fby c`sym; (soThreshHold_[;p`entryLo;p`exitMid;100f - p`entryLo;100f - p`exitMid]; rsiV) fby c`sym}[ctx;];
+        {[c;p] bb:(.kdbtools.bbpos[`long$p`w;p`k;];c`feat) fby c`sym; (soThreshHold_[;neg p`entry;0f;p`entry;0f]; bb) fby c`sym}[ctx;];
+        {[c;p] zs:(.cond.rzscore[`long$p`w;];c`feat) fby c`sym; (soThreshHold_[;neg p`zEntry;0f;p`zEntry;0f]; zs) fby c`sym}[ctx;];
+        {[c;p] (soBreakHold_[;`long$p`w;`long$p`hold];c`feat) fby c`sym}[ctx;];
+        {[c;p] tension:(.cond.accumTension[`long$p`w;];c`feat) fby c`sym; (soThreshHold_[;neg p`thresh;0f;p`thresh;0f]; tension) fby c`sym}[ctx;]
+    );
+    gen:gens idx;
+    // Step 1: raw signal
+    rawSig:gen params;
+    sig:soClean_ rawSig;
+    // Step 2: scale by risk
+    scaled:soClean_ sig % rsk;
+    // Step 3: lag per sym
+    ps:$[noPrev; 0f^scaled; (prev;0f^scaled) fby sym];
+    // Step 4: pnl per asset
+    pnl:ps * ret;
+    // Step 5: portfolio pnl per time
+    byTm:0!select sp:sum p by t from ([]t:tm;p:pnl);
+    v:byTm[`sp] where not null byTm`sp;
+    sharpe:$[(1e-10<dev v)and 2<count v;((avg v)%dev v)*sqrt 252f;0n];
+    mask:(not null ps) & not null ret;
+    hr:$[0<sum mask;(sum ((signum ps)=signum ret) & mask) % sum mask;0n];
+    // Print summary
+    -1 "=== sigOptDebug: ",string[names idx]," params=",(.Q.s1 params)," ===";
+    -1 "noPrev: ",string noPrev;
+    -1 "rows: ",string nn;
+    -1 "signal: ",string[names idx];
+    -1 "";
+    -1 "--- Step 1: raw signal ---";
+    sigV:sig where not null sig;
+    -1 "  non-null: ",string[count sigV]," / ",string nn;
+    -1 "  min=",string[min sigV]," max=",string[max sigV]," avg=",string avg sigV;
+    -1 "";
+    -1 "--- Step 2: scaled (sig/risk) ---";
+    scv:scaled where not null scaled;
+    -1 "  min=",string[min scv]," max=",string[max scv]," avg=",string avg scv;
+    -1 "";
+    -1 "--- Step 3: position (prev per sym) ---";
+    psv:ps where not null ps;
+    -1 "  min=",string[min psv]," max=",string[max psv]," avg=",string avg psv;
+    -1 "  zeros: ",string sum ps=0f;
+    -1 "";
+    -1 "--- Step 4: pnl per asset ---";
+    -1 "  avg=",string[avg pnl]," std=",string dev pnl;
+    -1 "";
+    -1 "--- Step 5: portfolio ---";
+    -1 "  avg daily pnl=",string[avg v]," std=",string dev v;
+    -1 "  Sharpe: ",string sharpe;
+    -1 "  hitRate: ",string hr;
+    -1 "";
+    // Return the full trace table
+    result:([] tm:tm; sym:sym; feat:feat; ret:ret; rsk:rsk; sig:sig; scaled:scaled; pos:ps; pnl:pnl);
+    result}
 
 // -----------------------------------------------------------------------------
 // FORWARD SIMULATION
