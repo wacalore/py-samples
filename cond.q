@@ -474,20 +474,20 @@ csInvert:{[t;cfg]
 // sigOpt internals (namespace-level to avoid q closure scoping issues)
 // Clean infinities/nulls: replace 0w/-0w with 0n
 soClean_:{@[x;where not x within (-1e308;1e308);:;0n]};
-soPsh_:{[sym;ret;rsk;tm;ann;sig]
+soPsh_:{[sym;ret;rsk;tm;ann;noPrev;sig]
     sig:soClean_ sig;
     scaled:soClean_ sig%rsk;
-    ps:(prev;0f^scaled) fby sym;
+    ps:$[noPrev; 0f^scaled; (prev;0f^scaled) fby sym];
     pnl:ps*ret;
     tab:([]t:tm;p:pnl);
     byTm:0!select sp:sum p by t from tab;
     v:byTm[`sp] where not null byTm`sp;
     $[(1e-10<dev v)and 2<count v;((avg v)%dev v)*sqrt ann;0n]};
-soFmet_:{[sym;ret;rsk;tm;ann;sig]
+soFmet_:{[sym;ret;rsk;tm;ann;noPrev;sig]
     sig:soClean_ sig;
     if[all null sig;:`sharpe`ic`hitRate`turnover`maxDD`profitFactor!(0n;0n;0n;0n;0n;0n)];
     scaled:soClean_ sig%rsk;
-    ps:(prev;0f^scaled) fby sym;
+    ps:$[noPrev; 0f^scaled; (prev;0f^scaled) fby sym];
     pnl:ps*ret;
     tab:([]t:tm;p:pnl);
     byTm:0!select sp:sum p by t from tab;
@@ -707,9 +707,20 @@ sigOpt:{[t;featureCol;cfg]
     nT:count distinct tm;
     ann:$[nT>500;252f;$[nT>100;52f;12f]];
     ctx:`feat`ret`sym`tm`rsk`nn`ann!(feat;ret;sym;tm;rsk;nn;ann);
+    // Auto-detect lag convention: test zscore(20) with prev vs without prev
+    noPrev:$[`noPrev in key c; c`noPrev; 0b];
+    autoLag:$[`autoLag in key c; c`autoLag; 1b];
+    if[autoLag and not `noPrev in key c;
+        testSig:soClean_ (.cond.rzscore[20;];feat) fby sym;
+        shPrev:soPsh_[sym;ret;rsk;tm;ann;0b;testSig];
+        shNoPrev:soPsh_[sym;ret;rsk;tm;ann;1b;testSig];
+        noPrev:$[(not null shNoPrev) and ((shNoPrev > shPrev) or null shPrev); 1b; 0b];
+        -1 "sigOpt autoLag: prevSharpe=",string[$[null shPrev;0n;shPrev]],
+           " noPrevSharpe=",string[$[null shNoPrev;0n;shNoPrev]],
+           " -> using ",($[noPrev;"noPrev (signal[t]*ret[t])";"prev (signal[t-1]*ret[t])"])];
     // Bind helpers via projection
-    psh:soPsh_[sym;ret;rsk;tm;ann;];
-    fmet:soFmet_[sym;ret;rsk;tm;ann;];
+    psh:soPsh_[sym;ret;rsk;tm;ann;noPrev;];
+    fmet:soFmet_[sym;ret;rsk;tm;ann;noPrev;];
     gsrch:soGsrch_[nn;psh;;];
     // --- 15 Signal Generators (project ctx to capture data) ---
     g1:{[c;p] (.cond.rzscore[p`w;];c`feat) fby c`sym}[ctx;];
