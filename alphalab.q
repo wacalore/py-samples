@@ -1156,6 +1156,23 @@ pcaComponentSeries:{[t;cfg]
 
 pcaComponentReturns:{[t;cfg] (pcaComponentSeries[t;cfg])`returns}
 
+pcAsSymVec_:{[x]
+    asSymAtom:{[z]
+        tz:type z;
+        $[tz = -11h; z;
+          tz = 11h; first z;
+          tz = 10h; `$z;
+          tz = -10h; `$enlist z;
+          `$string z]};
+    tx:type x;
+    if[tx = 11h; :x];
+    if[tx = -11h; :enlist x];
+    if[tx = 10h; :enlist `$x];
+    if[tx = -10h; :enlist `$x];
+    if[tx = 0h; :asSymAtom each x];
+    if[tx > 0h; :`$string each x];
+    enlist `$string x}
+
 pcSignalLong_:{[sig;cfg]
     if[98h <> type sig; '"pcSignalToFutures expects signal table"];
     c:$[99h = type cfg; cfg; ()!()];
@@ -1164,7 +1181,10 @@ pcSignalLong_:{[sig;cfg]
     cPc:$[`pcCol in key c; c`pcCol; `pc];
     cSig:$[`sigCol in key c; c`sigCol; `sig];
     if[(cPc in cols sig) and (cSig in cols sig);
-        out:select time:sig cTime, pc:sig cPc, sig:"f"$sig cSig from sig;
+        tm:(sig cTime);
+        pc:pcAsSymVec_ (sig cPc);
+        sg:"f"$(sig cSig);
+        out:([] time:tm; pc:pc; sig:sg);
         :`time`pc xasc 0!select sig:last sig by time,pc from out];
     cands:(cols sig) except cTime;
     pcCols:cands where {"pc"~2#lower string x} each cands;
