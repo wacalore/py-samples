@@ -154,6 +154,28 @@ def _elem_to_python(elem: Any) -> Any:
         return None
 
 
+def _normalize_bbg_date(v: Any) -> Any:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        # blpapi Datetime-like object with year/month/day attributes.
+        if all(hasattr(v, x) for x in ("year", "month", "day")):
+            return date(int(v.year), int(v.month), int(v.day))
+    except Exception:
+        pass
+    try:
+        s = str(v).strip()
+        if s:
+            return pd.to_datetime(s, errors="coerce").date()
+    except Exception:
+        pass
+    return None
+
+
 def _coalesce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     if not cols:
         return pd.Series([float("nan")] * len(df), index=df.index, dtype="float64")
@@ -451,10 +473,14 @@ def _response_rows(
                 fdata = sdata.getElement("fieldData")
                 for i in range(fdata.numValues()):
                     fd = fdata.getValueAsElement(i)
-                    row: Dict[str, Any] = {"security": sec}
-                    if fd.hasElement("date"):
+                row: Dict[str, Any] = {"security": sec}
+                if fd.hasElement("date"):
+                    try:
+                        d0 = fd.getElementAsDatetime("date")
+                        row["date"] = _normalize_bbg_date(d0)
+                    except Exception:
                         try:
-                            row["date"] = fd.getElementAsDatetime("date").date()
+                            row["date"] = _normalize_bbg_date(fd.getElementAsString("date"))
                         except Exception:
                             pass
                     for f in fields:
