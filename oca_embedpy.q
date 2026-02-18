@@ -49,7 +49,7 @@ init:{[libpath; dm; ep]
   .p.e "def oca_build_strategy_book_df(analytics_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  analytics_df = oca_as_df(analytics_df)\n  widths = cfg.get('widths', (0.5, 1.0, 2.0))\n  templates = cfg.get('strategy_templates')\n  out = oca.build_strategy_book_df(analytics_df, widths=widths, strategy_templates=templates)\n  return oca_df_to_dict(out)";
   .p.e "def oca_strategy_screener_df(strategy_df, analytics_df=None, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  if analytics_df is not None:\n    analytics_df = oca_as_df(analytics_df)\n  out = oca.strategy_screener_df(\n    strategy_df,\n    analytics_df=analytics_df,\n    vol_col=cfg.get('vol_col', 'iv_atm'),\n    vol_fallback=cfg.get('vol_fallback'),\n    pop_samples=cfg.get('pop_samples', 5000),\n    pop_seed=cfg.get('pop_seed', 7),\n    mispricing_metric=cfg.get('mispricing_metric', 'edge_per_vega'),\n    mispricing_quantile=cfg.get('mispricing_quantile', 0.9),\n    pop_threshold=cfg.get('pop_threshold', 0.6),\n    ev_threshold=cfg.get('ev_threshold', 0.0),\n    upside_metric=cfg.get('upside_metric', 'upside_p95'),\n    upside_quantile=cfg.get('upside_quantile', 0.8),\n    upside_threshold=cfg.get('upside_threshold'),\n    credit_debit_tolerance=cfg.get('credit_debit_tolerance', 1.0e-8),\n    filter_only=cfg.get('filter_only', True),\n    top_n=cfg.get('top_n'),\n    weight_mispricing=cfg.get('weight_mispricing', 1.0),\n    weight_ev=cfg.get('weight_ev', 0.5),\n    weight_pop=cfg.get('weight_pop', 0.5)\n  )\n  return oca_df_to_dict(out)";
   .p.e "def oca_scenario_pnl_strategy_df(strategy_df, cfg=None):\n  cfg = {} if cfg is None else cfg\n  strategy_df = oca_as_df(strategy_df)\n  out = oca.scenario_pnl_strategy_df(\n    strategy_df,\n    dF=cfg.get('dF', 0.0),\n    dVol=cfg.get('dVol', 0.0),\n    dRate=cfg.get('dRate', 0.0),\n    dt_days=cfg.get('dt_days', 0.0)\n  )\n  return oca_df_to_dict(out)";
-  .p.e "def oca_bbg_eco_history(securities, start_date, end_date, cfg=None):\n  cfg = {} if cfg is None else cfg\n  import importlib\n  import blp_eco\n  importlib.reload(blp_eco)\n  out = blp_eco.get_eco_history(securities, start_date, end_date, cfg=cfg)\n  return oca_df_to_dict(out)";
+  .p.e "def oca_bbg_eco_history(securities, start_date, end_date, cfg=None):\n  cfg = {} if cfg is None else cfg\n  import importlib\n  import pandas as pd\n  import blp_eco\n  importlib.reload(blp_eco)\n  out = blp_eco.get_eco_history(securities, start_date, end_date, cfg=cfg)\n  if isinstance(out, pd.DataFrame) and ('date' in out.columns):\n    try:\n      ds = out['date']\n      if ds.dtype == object:\n        ds = ds.map(lambda z: None if z is None else str(z))\n        ds = ds.replace('0Nd', None).replace('0Np', None)\n        ds = ds.str.replace('D', 'T', regex=False)\n      out['date'] = pd.to_datetime(ds, errors='coerce').dt.strftime('%Y.%m.%d')\n    except Exception:\n      pass\n  return oca_df_to_dict(out)";
   opt_wrapper::.p.get[`oca_opt_wrapper];
   opt_wrapper_simple::.p.get[`oca_opt_simple_wrapper];
   opt_wrapper_cvar::.p.get[`oca_opt_cvar_wrapper];
@@ -2390,6 +2390,13 @@ bbg_eco_history:{[securities; start_date; end_date; cfg; libpath]
   res:.oca.bbg_eco_wrapper[securities; sd; ed; c];
   out:.p.py2q .oca.unwrap res;
   out:$[99h=type out; .oca.to_table out; out];
+  if[98h=type out;
+    if[`date in cols out;
+      tdc:abs type out`date;
+      if[tdc in 0 10 11h; out:update date:`date$"P"$string each date from out];
+      if[tdc in 6 7h; out:update date:.oca.epoch_date + `int$date from out];
+    ];
+  ];
   $[98h=type out; .oca.fix_dt out; out]
  }
 
