@@ -1592,6 +1592,9 @@ help:{[]
     -1 "  robustOptimize[t;exclude;params]   - Full robust pipeline";
     -1 "  robustOptimizeSimple[t;exclude]    - With default params";
     -1 "  alphaWeightProtocol[t;cfg]         - Walk-forward compare static/exp/roll/blend";
+    -1 "  weightSchedule[x;cfg]              - Expand vector schedule to wide weight table";
+    -1 "  applyWeightSchedule[wide;res;cfg]  - Apply schedule to wide alpha table";
+    -1 "  runLockedScheme[wide;res;cfg]      - Re-run best protocol scheme on new data";
     -1 "";
     -1 "  params dictionary keys:";
     -1 "    `minFill    - min fill rate (default 0.5)";
@@ -1606,7 +1609,7 @@ help:{[]
     -1 "UTILITIES:";
     -1 "  example[]                          - Run example with sample data";
     -1 "  help[]                             - Show this help";
-    -1 "  alphaWeightProtocol output keys: `summary`best`series`weights";
+    -1 "  alphaWeightProtocol output keys: `summary`best`series`weights`alphaCols`timeCol";
     -1 "";
     -1 "PARAMETERS:";
     -1 "  R      - Return matrix: n_assets rows x n_periods columns";
@@ -2044,6 +2047,14 @@ awNumericCols_:{[t;colsIn]
 
 awEnsureList_:{[x] $[0 > type x; enlist x; x]}
 
+awSymCols_:{[x]
+    y:x;
+    if[-11h=type y; :enlist y];
+    if[11h=type y; :y];
+    if[(0h=type y) & (1=count y) & 11h=type first y; :first y];
+    if[(0h=type y) & (1=count y) & -11h=type first y; :enlist first y];
+    `symbol$()}
+
 awPrepareWide_:{[t;cfg]
     if[98h <> type t; '"alphaWeightProtocol expects a table"];
     cs:cols t;
@@ -2377,6 +2388,89 @@ alphaWeightProtocol:{[t;cfg]
         prep`alphaCols;
         prep`timeCol;
         baseSharpe)}
+
+// Convert vector-form weights schedule to table with one column per alpha.
+// x: protocol result dict (preferred) or run dict from runLockedScheme/awRunWF.
+// cfg optional keys:
+//   `alphaCols - required only when x does not contain `alphaCols
+weightSchedule:{[x;cfg]
+    c:$[99h=type cfg; cfg; ()!()];
+    hasAlphaCols:(99h=type x) & (`alphaCols in key x);
+    hasWeights:(99h=type x) & (`weights in key x);
+    if[not hasWeights; '"weightSchedule expects dict with `weights"];
+    ws:x`weights;
+    if[98h <> type ws; '"weightSchedule `weights must be a table"];
+    if[not all `time`weights in cols ws; '"weightSchedule requires `weights table columns `time`weights"];
+    ac:$[hasAlphaCols; x`alphaCols; $[`alphaCols in key c; c`alphaCols; ()]];
+    ac:awSymCols_ ac;
+    if[0 = count ac;
+        nW:$[count ws`weights; count first ws`weights; 0];
+        ac:`$"w",/:string til nW];
+    if[0 = count ws; :([] time:0#ws`time),'(flip ac!((count ac;0)#0f))];
+    `time xasc (([] time:ws`time),'(flip ac!flip "f"$ws`weights))}
+
+// Apply a weights schedule onto wide alpha return table.
+// wide: table with time + alpha columns
+// protoRes: output from alphaWeightProtocol (or dict with `weights` and `alphaCols)
+// cfg optional keys:
+//   `timeCol     - override time column (default from protoRes, then `time`dt`date)
+//   `alphaCols   - override alpha columns (default from protoRes)
+//   `outCol      - output column name (default `port_alpha)
+//   `preStartVal - value before first rebalance weight (default 0n)
+applyWeightSchedule:{[wide;protoRes;cfg]
+    if[98h <> type wide; '"applyWeightSchedule expects wide table input"];
+    if[99h <> type protoRes; '"applyWeightSchedule expects protoRes dict"];
+    c:$[99h=type cfg; cfg; ()!()];
+    cs:cols wide;
+    tc:$[`timeCol in key c; c`timeCol;
+         $[`timeCol in key protoRes; protoRes`timeCol;
+           [cand:`time`dt`date inter cs; if[0=count cand; '"applyWeightSchedule requires `time, `dt or `date"]; first cand]]];
+    if[not tc in cs; '"applyWeightSchedule time column missing: ",string tc];
+    ac:$[`alphaCols in key c; c`alphaCols;
+         $[`alphaCols in key protoRes; protoRes`alphaCols; ()]];
+    ac:awSymCols_ ac;
+    if[0 = count ac; '"applyWeightSchedule requires alpha columns"];
+    if[not all ac in cs; '"applyWeightSchedule alpha columns missing in wide table"];
+    outCol:$[`outCol in key c; c`outCol; `port_alpha];
+    preStart:$[`preStartVal in key c; "f"$c`preStartVal; 0n];
+
+    ord:iasc wide tc;
+    t:wide ord;
+    ws:weightSchedule[protoRes;(enlist `alphaCols)!enlist ac];
+    ws:`time xasc ws;
+    if[0 = count ws;
+        :![t;();0b;(enlist outCol)!enlist (count[t]#preStart)]];
+
+    rv:flip "f"$value flip ac#t;
+    wmap:([] time:ws`time; widx:til count ws);
+    idx:(aj[`time;([] time:t[tc]);wmap])`widx;
+    valid:not null idx;
+    idx:0^idx;
+    wv:flip "f"$value flip ac#(ws idx);
+    p:{sum x*y}'[wv;rv];
+    p:@[p;where not valid;:;preStart];
+    ![t;();0b;(enlist outCol)!enlist p]}
+
+// Re-run the single best scheme from alphaWeightProtocol on a refreshed wide table.
+// Returns run dict compatible with weightSchedule/applyWeightSchedule.
+// cfg overrides (optional) are merged into protocol cfg.
+runLockedScheme:{[wide;protoRes;cfg]
+    if[99h <> type protoRes; '"runLockedScheme expects protoRes dict"];
+    if[not all `best`cfg`alphaCols`timeCol in key protoRes; '"runLockedScheme expects alphaWeightProtocol output"];
+    p:$[99h=type protoRes`cfg; protoRes`cfg; ()!()];
+    c:$[99h=type cfg; cfg; ()!()];
+    p:p,c;
+    best:protoRes`best;
+    prep:awPrepareWide_[wide;p];
+    run:();
+    isStatic:(best`mode)~`static_is;
+    if[isStatic;
+        run:awRunStaticIS_[prep`R;prep`times;best`mu_shrink;best`cov_shrink;p]];
+    if[not isStatic;
+        run:awRunWF_[prep`R;prep`times;
+            `mode`window`rebalance`mu_shrink`cov_shrink`blend_lambda!(
+                best`mode;best`window;best`rebalance;best`mu_shrink;best`cov_shrink;best`blend_lambda);p]];
+    run,(enlist `alphaCols)!enlist prep`alphaCols}
 
 // Alpha diagnostics report
 alphaReport:{[alphas;returns;weights]
