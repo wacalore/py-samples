@@ -109,8 +109,9 @@ cast_date_like:{[v; k; dm_str]
     :v;
   ];
   if[not .oca.is_date_key k; :v];
-  if[t=11h; : "D"$string each v];
-  if[t=0h; : "D"$v];
+  if[t in 6 7h; : .oca.epoch_date + `int$v];
+  if[t=11h; : `date$"P"$string each v];
+  if[t=0h; : `date$"P"$v];
   :v;
  }
 
