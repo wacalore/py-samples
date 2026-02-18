@@ -2382,10 +2382,17 @@ scenario_pnl_strategy_df:{[strategy_tbl; cfg; libpath]
 
 bbg_eco_history:{[securities; start_date; end_date; cfg; libpath]
   .oca.ensure_init libpath;
-  c:.oca.normalize_cfg cfg;
+  c:.oca.cfg_to_dict cfg;
+  if[0=count key c; c:.oca.normalize_cfg cfg];
+  s:securities;
+  ts:type s;
+  if[ts=-11h; s:enlist string s];
+  if[ts=11h; s:string each s];
+  if[ts=10h; s:enlist s];
+  if[ts=0h; s:string each s];
   sd:string start_date;
   ed:string end_date;
-  res:.oca.bbg_eco_wrapper[securities; sd; ed; c];
+  res:.oca.bbg_eco_wrapper[s; sd; ed; c];
   out:.p.py2q .oca.unwrap res;
   out:$[99h=type out; .oca.to_table out; out];
   $[98h=type out; .oca.fix_dt out; out]
