@@ -5,6 +5,7 @@ This module is designed to be called from q/embedPy wrappers.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -21,6 +22,7 @@ class BbgConfig:
     auth_options: Optional[str] = None
     authorize: bool = False
     uuid: Optional[Any] = None
+    emrsid: Optional[Any] = None
     username: Optional[str] = None
     ip_address: Optional[str] = None
     token: Optional[str] = None
@@ -64,6 +66,44 @@ def _as_list(x: Any) -> List[Any]:
     if isinstance(x, (list, tuple, set)):
         return list(x)
     return [x]
+
+
+def _normalize_securities(securities: Any) -> List[str]:
+    def _is_seq(x: Any) -> bool:
+        return isinstance(x, Sequence) and not isinstance(x, (str, bytes, bytearray))
+
+    def _char_seq_to_str(x: Sequence[Any]) -> Optional[str]:
+        if len(x) == 0:
+            return None
+        if all(isinstance(c, str) and len(c) == 1 for c in x):
+            s = "".join(x).strip()
+            return s or None
+        return None
+
+    def _as_tokens(x: Any) -> List[str]:
+        if x is None:
+            return []
+        if isinstance(x, str):
+            s = x.strip()
+            return [s] if s else []
+        if isinstance(x, (bytes, bytearray)):
+            s = x.decode("utf-8", errors="ignore").strip()
+            return [s] if s else []
+        if _is_seq(x):
+            seq = list(x)
+            s0 = _char_seq_to_str(seq)
+            if s0 is not None:
+                return [s0]
+            if len(seq) == 1:
+                return _as_tokens(seq[0])
+            out: List[str] = []
+            for z in seq:
+                out.extend(_as_tokens(z))
+            return out
+        s = str(x).strip()
+        return [s] if s else []
+
+    return _as_tokens(securities)
 
 
 def _date_to_yyyymmdd(x: Any) -> str:
@@ -168,6 +208,12 @@ def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
     else:
         uuid_val = str(uuid_raw).strip() if isinstance(uuid_raw, str) else uuid_raw
 
+    emrs_raw = c.get("emrsid", auth.get("emrsid", c.get("emrsId", auth.get("emrsId"))))
+    if emrs_raw in (None, ""):
+        emrs_val = None
+    else:
+        emrs_val = str(emrs_raw).strip() if isinstance(emrs_raw, str) else emrs_raw
+
     user_raw = c.get("username", auth.get("username", c.get("user", auth.get("user"))))
     username_val = None if user_raw in (None, "") else str(user_raw).strip()
 
@@ -183,6 +229,7 @@ def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
         ),
         authorize=bool(_pick("authorize", False)),
         uuid=uuid_val,
+        emrsid=emrs_val,
         username=username_val,
         ip_address=(
             None if _pick("ip_address") in (None, "") else str(_pick("ip_address"))
@@ -206,6 +253,7 @@ def _auth_needed(cfg: BbgConfig) -> bool:
     return bool(
         cfg.authorize
         or cfg.uuid is not None
+        or cfg.emrsid is not None
         or cfg.username
         or cfg.ip_address
         or cfg.token
@@ -242,53 +290,96 @@ def _authorize_identity(session: Any, cfg: BbgConfig) -> Any:
         raise RuntimeError(f"unable to open Bloomberg auth service: {cfg.auth_service}")
 
     auth_svc = session.getService(cfg.auth_service)
-    auth_req = auth_svc.createAuthorizationRequest()
+    ao = (cfg.auth_options or "").upper()
+    os_logon = "AUTHENTICATIONTYPE=OS_LOGON" in ao
+    has_user_fields = bool(
+        cfg.username or (cfg.uuid is not None) or (cfg.emrsid is not None) or cfg.ip_address
+    )
 
-    if cfg.username:
-        # Different Bloomberg deployments name this field differently.
-        _try_set_req_fields(auth_req, ("userId", "username", "userName", "user"), cfg.username)
+    def _set_auth_fields(auth_req: Any, include_user_fields: bool) -> None:
+        if include_user_fields and cfg.username:
+            # Different Bloomberg deployments name this field differently.
+            _try_set_req_fields(
+                auth_req, ("userId", "username", "userName", "user"), cfg.username
+            )
 
-    uuid_v = cfg.uuid
-    if isinstance(uuid_v, str):
-        u = uuid_v.strip()
-        if u:
-            # Bloomberg often documents UUID as integer, but some environments pass it as string.
-            if u.isdigit():
-                try:
-                    _maybe_set_req_field(auth_req, "uuid", int(u))
-                except Exception:
-                    _maybe_set_req_field(auth_req, "uuid", u)
+        if include_user_fields:
+            emrs_v = cfg.emrsid
+            if isinstance(emrs_v, str):
+                ev = emrs_v.strip()
+                if ev:
+                    if ev.isdigit():
+                        if not _try_set_req_fields(auth_req, ("emrsId", "emrsid", "EMRSID"), int(ev)):
+                            _try_set_req_fields(auth_req, ("emrsId", "emrsid", "EMRSID"), ev)
+                    else:
+                        _try_set_req_fields(auth_req, ("emrsId", "emrsid", "EMRSID"), ev)
             else:
-                _maybe_set_req_field(auth_req, "uuid", u)
+                _try_set_req_fields(auth_req, ("emrsId", "emrsid", "EMRSID"), emrs_v)
+
+            uuid_v = cfg.uuid
+            if isinstance(uuid_v, str):
+                u = uuid_v.strip()
+                if u:
+                    # Bloomberg often documents UUID as integer, but some environments pass it as string.
+                    if u.isdigit():
+                        try:
+                            _maybe_set_req_field(auth_req, "uuid", int(u))
+                        except Exception:
+                            _maybe_set_req_field(auth_req, "uuid", u)
+                    else:
+                        _maybe_set_req_field(auth_req, "uuid", u)
+            else:
+                _maybe_set_req_field(auth_req, "uuid", uuid_v)
+
+            _try_set_req_fields(auth_req, ("ipAddress", "ip_address"), cfg.ip_address)
+
+        _try_set_req_fields(auth_req, ("token",), cfg.token)
+        _try_set_req_fields(auth_req, ("appName", "applicationName"), cfg.app_name)
+
+        if cfg.auth_fields:
+            for k, v in cfg.auth_fields.items():
+                _maybe_set_req_field(auth_req, str(k), v)
+
+    def _attempt(include_user_fields: bool, label: str) -> tuple[Optional[Any], str]:
+        auth_req = auth_svc.createAuthorizationRequest()
+        _set_auth_fields(auth_req, include_user_fields=include_user_fields)
+        identity = session.createIdentity()
+        q = blpapi.EventQueue()
+        session.sendAuthorizationRequest(auth_req, identity, blpapi.CorrelationId(label), q)
+
+        last_fail: Optional[str] = None
+        while True:
+            ev = q.nextEvent(cfg.auth_timeout_ms)
+            et = ev.eventType()
+            if et == blpapi.Event.TIMEOUT:
+                return None, f"{label}: authorization timed out"
+            for msg in ev:
+                mt = str(msg.messageType())
+                if mt == "AuthorizationSuccess":
+                    return identity, ""
+                if mt in ("AuthorizationFailure", "RequestFailure"):
+                    last_fail = f"{label}: {msg}"
+            if et == blpapi.Event.RESPONSE:
+                break
+        return None, (last_fail or f"{label}: authorization failed: no success message")
+
+    # OS_LOGON usually works best with minimal authorization request fields.
+    if os_logon:
+        attempts = [("minimal", False)]
+        if has_user_fields:
+            attempts.append(("explicit", True))
     else:
-        _maybe_set_req_field(auth_req, "uuid", uuid_v)
-    _maybe_set_req_field(auth_req, "ipAddress", cfg.ip_address)
-    _maybe_set_req_field(auth_req, "token", cfg.token)
-    _maybe_set_req_field(auth_req, "appName", cfg.app_name)
+        attempts = [("explicit", True)] if has_user_fields else []
+        attempts.append(("minimal", False))
 
-    if cfg.auth_fields:
-        for k, v in cfg.auth_fields.items():
-            _maybe_set_req_field(auth_req, str(k), v)
+    errs: List[str] = []
+    for label, include_user_fields in attempts:
+        ident, err = _attempt(include_user_fields=include_user_fields, label=label)
+        if ident is not None:
+            return ident
+        errs.append(err)
 
-    identity = session.createIdentity()
-    q = blpapi.EventQueue()
-    session.sendAuthorizationRequest(auth_req, identity, blpapi.CorrelationId("auth"), q)
-
-    while True:
-        ev = q.nextEvent(cfg.auth_timeout_ms)
-        et = ev.eventType()
-        if et == blpapi.Event.TIMEOUT:
-            raise RuntimeError("authorization timed out")
-        for msg in ev:
-            mt = str(msg.messageType())
-            if mt == "AuthorizationSuccess":
-                return identity
-            if mt in ("AuthorizationFailure", "RequestFailure"):
-                raise RuntimeError(f"authorization failed: {msg}")
-        if et == blpapi.Event.RESPONSE:
-            break
-
-    raise RuntimeError("authorization failed: no success message received")
+    raise RuntimeError("authorization failed; " + " | ".join([e for e in errs if e]))
 
 
 def _response_rows(
@@ -397,7 +488,7 @@ def get_eco_history(
     """
 
     c = dict(cfg or {})
-    sec_list = [str(s).strip() for s in _as_list(securities) if str(s).strip()]
+    sec_list = _normalize_securities(securities)
     if not sec_list:
         return _empty_result()
 
