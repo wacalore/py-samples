@@ -17,6 +17,16 @@ class BbgConfig:
     host: str = "localhost"
     port: int = 8194
     service: str = "//blp/refdata"
+    auth_service: str = "//blp/apiauth"
+    auth_options: Optional[str] = None
+    authorize: bool = False
+    uuid: Optional[Any] = None
+    username: Optional[str] = None
+    ip_address: Optional[str] = None
+    token: Optional[str] = None
+    app_name: Optional[str] = None
+    auth_timeout_ms: int = 10000
+    auth_fields: Optional[Dict[str, Any]] = None
     timeout_ms: int = 10000
     periodicity_selection: str = "DAILY"
     max_data_points: Optional[int] = None
@@ -147,17 +157,138 @@ def _empty_result() -> pd.DataFrame:
 
 def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
     c = dict(cfg or {})
+    auth_raw = c.get("auth")
+    auth = dict(auth_raw) if isinstance(auth_raw, Mapping) else {}
+    def _pick(name: str, default: Any = None) -> Any:
+        return c.get(name, auth.get(name, default))
+
+    uuid_raw = _pick("uuid")
+    if uuid_raw in (None, ""):
+        uuid_val = None
+    else:
+        uuid_val = str(uuid_raw).strip() if isinstance(uuid_raw, str) else uuid_raw
+
+    user_raw = c.get("username", auth.get("username", c.get("user", auth.get("user"))))
+    username_val = None if user_raw in (None, "") else str(user_raw).strip()
+
     return BbgConfig(
-        host=str(c.get("host", "localhost")),
-        port=int(c.get("port", 8194)),
-        service=str(c.get("service", "//blp/refdata")),
-        timeout_ms=int(c.get("timeout_ms", 10000)),
-        periodicity_selection=str(c.get("periodicity_selection", "DAILY")),
+        host=str(_pick("host", "localhost")),
+        port=int(_pick("port", 8194)),
+        service=str(_pick("service", "//blp/refdata")),
+        auth_service=str(_pick("auth_service", "//blp/apiauth")),
+        auth_options=(
+            None
+            if _pick("auth_options") in (None, "")
+            else str(_pick("auth_options"))
+        ),
+        authorize=bool(_pick("authorize", False)),
+        uuid=uuid_val,
+        username=username_val,
+        ip_address=(
+            None if _pick("ip_address") in (None, "") else str(_pick("ip_address"))
+        ),
+        token=None if _pick("token") in (None, "") else str(_pick("token")),
+        app_name=None if _pick("app_name") in (None, "") else str(_pick("app_name")),
+        auth_timeout_ms=int(_pick("auth_timeout_ms", 10000)),
+        auth_fields=dict(_pick("auth_fields", {}))
+        if isinstance(_pick("auth_fields", {}), Mapping)
+        else None,
+        timeout_ms=int(_pick("timeout_ms", 10000)),
+        periodicity_selection=str(_pick("periodicity_selection", "DAILY")),
         max_data_points=None
-        if c.get("max_data_points") in (None, "")
-        else int(c.get("max_data_points")),
-        keep_raw_fields=bool(c.get("keep_raw_fields", False)),
+        if _pick("max_data_points") in (None, "")
+        else int(_pick("max_data_points")),
+        keep_raw_fields=bool(_pick("keep_raw_fields", False)),
     )
+
+
+def _auth_needed(cfg: BbgConfig) -> bool:
+    return bool(
+        cfg.authorize
+        or cfg.uuid is not None
+        or cfg.username
+        or cfg.ip_address
+        or cfg.token
+        or cfg.app_name
+        or (cfg.auth_fields and len(cfg.auth_fields) > 0)
+    )
+
+
+def _maybe_set_req_field(req: Any, key: str, value: Any) -> None:
+    if value is None:
+        return
+    try:
+        req.set(key, value)
+    except Exception as e:
+        raise RuntimeError(f"failed to set authorization field {key!r}: {e}") from e
+
+
+def _try_set_req_fields(req: Any, keys: Sequence[str], value: Any) -> bool:
+    if value is None:
+        return False
+    for k in keys:
+        try:
+            req.set(k, value)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _authorize_identity(session: Any, cfg: BbgConfig) -> Any:
+    import blpapi  # type: ignore
+
+    if not session.openService(cfg.auth_service):
+        raise RuntimeError(f"unable to open Bloomberg auth service: {cfg.auth_service}")
+
+    auth_svc = session.getService(cfg.auth_service)
+    auth_req = auth_svc.createAuthorizationRequest()
+
+    if cfg.username:
+        # Different Bloomberg deployments name this field differently.
+        _try_set_req_fields(auth_req, ("userId", "username", "userName", "user"), cfg.username)
+
+    uuid_v = cfg.uuid
+    if isinstance(uuid_v, str):
+        u = uuid_v.strip()
+        if u:
+            # Bloomberg often documents UUID as integer, but some environments pass it as string.
+            if u.isdigit():
+                try:
+                    _maybe_set_req_field(auth_req, "uuid", int(u))
+                except Exception:
+                    _maybe_set_req_field(auth_req, "uuid", u)
+            else:
+                _maybe_set_req_field(auth_req, "uuid", u)
+    else:
+        _maybe_set_req_field(auth_req, "uuid", uuid_v)
+    _maybe_set_req_field(auth_req, "ipAddress", cfg.ip_address)
+    _maybe_set_req_field(auth_req, "token", cfg.token)
+    _maybe_set_req_field(auth_req, "appName", cfg.app_name)
+
+    if cfg.auth_fields:
+        for k, v in cfg.auth_fields.items():
+            _maybe_set_req_field(auth_req, str(k), v)
+
+    identity = session.createIdentity()
+    q = blpapi.EventQueue()
+    session.sendAuthorizationRequest(auth_req, identity, blpapi.CorrelationId("auth"), q)
+
+    while True:
+        ev = q.nextEvent(cfg.auth_timeout_ms)
+        et = ev.eventType()
+        if et == blpapi.Event.TIMEOUT:
+            raise RuntimeError("authorization timed out")
+        for msg in ev:
+            mt = str(msg.messageType())
+            if mt == "AuthorizationSuccess":
+                return identity
+            if mt in ("AuthorizationFailure", "RequestFailure"):
+                raise RuntimeError(f"authorization failed: {msg}")
+        if et == blpapi.Event.RESPONSE:
+            break
+
+    raise RuntimeError("authorization failed: no success message received")
 
 
 def _response_rows(
@@ -177,68 +308,75 @@ def _response_rows(
     opts = blpapi.SessionOptions()
     opts.setServerHost(cfg.host)
     opts.setServerPort(cfg.port)
+    if cfg.auth_options:
+        opts.setAuthenticationOptions(cfg.auth_options)
     session = blpapi.Session(opts)
     if not session.start():
         raise RuntimeError("unable to start Bloomberg session")
-    if not session.openService(cfg.service):
+    try:
+        identity = _authorize_identity(session, cfg) if _auth_needed(cfg) else None
+
+        if not session.openService(cfg.service):
+            raise RuntimeError(f"unable to open Bloomberg service: {cfg.service}")
+
+        svc = session.getService(cfg.service)
+        req = svc.createRequest("HistoricalDataRequest")
+
+        sec_el = req.getElement("securities")
+        for sec in securities:
+            sec_el.appendValue(sec)
+
+        fld_el = req.getElement("fields")
+        for f in fields:
+            fld_el.appendValue(f)
+
+        req.set("startDate", start_date)
+        req.set("endDate", end_date)
+        req.set("periodicitySelection", cfg.periodicity_selection)
+        if cfg.max_data_points is not None:
+            req.set("maxDataPoints", cfg.max_data_points)
+
+        if identity is None:
+            session.sendRequest(req)
+        else:
+            session.sendRequest(req, identity)
+
+        rows: List[Dict[str, Any]] = []
+        while True:
+            event = session.nextEvent(cfg.timeout_ms)
+            et = event.eventType()
+            for msg in event:
+                if msg.hasElement("responseError"):
+                    raise RuntimeError(str(msg.getElement("responseError")))
+
+                if msg.messageType() != blpapi.Name("HistoricalDataResponse"):
+                    continue
+
+                sdata = msg.getElement("securityData")
+                sec = sdata.getElementAsString("security")
+                if sdata.hasElement("securityError"):
+                    continue
+
+                fdata = sdata.getElement("fieldData")
+                for i in range(fdata.numValues()):
+                    fd = fdata.getValueAsElement(i)
+                    row: Dict[str, Any] = {"security": sec}
+                    if fd.hasElement("date"):
+                        try:
+                            row["date"] = fd.getElementAsDatetime("date").date()
+                        except Exception:
+                            pass
+                    for f in fields:
+                        if not fd.hasElement(f):
+                            continue
+                        row[f] = _elem_to_python(fd.getElement(f))
+                    rows.append(row)
+            if et == blpapi.Event.RESPONSE:
+                break
+
+        return rows
+    finally:
         session.stop()
-        raise RuntimeError(f"unable to open Bloomberg service: {cfg.service}")
-
-    svc = session.getService(cfg.service)
-    req = svc.createRequest("HistoricalDataRequest")
-
-    sec_el = req.getElement("securities")
-    for sec in securities:
-        sec_el.appendValue(sec)
-
-    fld_el = req.getElement("fields")
-    for f in fields:
-        fld_el.appendValue(f)
-
-    req.set("startDate", start_date)
-    req.set("endDate", end_date)
-    req.set("periodicitySelection", cfg.periodicity_selection)
-    if cfg.max_data_points is not None:
-        req.set("maxDataPoints", cfg.max_data_points)
-
-    session.sendRequest(req)
-
-    rows: List[Dict[str, Any]] = []
-    while True:
-        event = session.nextEvent(cfg.timeout_ms)
-        et = event.eventType()
-        for msg in event:
-            if msg.hasElement("responseError"):
-                session.stop()
-                raise RuntimeError(str(msg.getElement("responseError")))
-
-            if msg.messageType() != blpapi.Name("HistoricalDataResponse"):
-                continue
-
-            sdata = msg.getElement("securityData")
-            sec = sdata.getElementAsString("security")
-            if sdata.hasElement("securityError"):
-                continue
-
-            fdata = sdata.getElement("fieldData")
-            for i in range(fdata.numValues()):
-                fd = fdata.getValueAsElement(i)
-                row: Dict[str, Any] = {"security": sec}
-                if fd.hasElement("date"):
-                    try:
-                        row["date"] = fd.getElementAsDatetime("date").date()
-                    except Exception:
-                        pass
-                for f in fields:
-                    if not fd.hasElement(f):
-                        continue
-                    row[f] = _elem_to_python(fd.getElement(f))
-                rows.append(row)
-        if et == blpapi.Event.RESPONSE:
-            break
-
-    session.stop()
-    return rows
 
 
 def get_eco_history(
