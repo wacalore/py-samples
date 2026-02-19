@@ -260,7 +260,7 @@ mi:{[x;y;J;K]
     i+:1];
   // Marginals
   mx:(sum each jnt) % n;
-  my:(sum flip jnt) % n;
+  my:(sum jnt) % n;
   // MI accumulation
   s:0f; m:0;
   j:0; while[j < J;
@@ -289,7 +289,7 @@ localMI:{[x;y;J;K]
     jnt[bx i;by i]+:1;
     i+:1];
   // Marginal of Y
-  my:(sum flip jnt) % n;
+  my:(sum jnt) % n;
   // Local MI for each x-bin
   nj:sum each jnt;
   lmi:J#0f;
@@ -334,7 +334,7 @@ miProfile:{[x;y;J;K]
     i+:1];
   nj:sum each jnt;
   // Local MI
-  my:(sum flip jnt) % n;
+  my:(sum jnt) % n;
   lmi:J#0f;
   j:0; while[j < J;
     if[nj[j] > 0;
