@@ -242,7 +242,7 @@ pacf:{[n;x] r:x; do[n-1;r:olsresid[prev r;r]]; cor[n xprev x;r]}
 // -----------------------------------------------------------------------------
 
 // Quantile binning: assign each value to one of J equal-frequency bins (0 to J-1)
-qbin:{[J;x] (`long$(J * (rnk[x] - 1)) % count x) & J - 1}
+qbin:{[J;x] (J * (rnk[x] - 1)) div count x}
 
 // Mutual information (bin-based) with Miller-Madow bias correction
 // x: feature vector, y: outcome vector, J: x-bins, K: y-bins
