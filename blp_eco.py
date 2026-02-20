@@ -5,6 +5,7 @@ This module is designed to be called from q/embedPy wrappers.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -31,7 +32,9 @@ class BbgConfig:
     auth_fields: Optional[Dict[str, Any]] = None
     timeout_ms: int = 10000
     periodicity_selection: str = "DAILY"
+    periodicity_adjustment: Optional[str] = None
     max_data_points: Optional[int] = None
+    overrides: Optional[Dict[str, Any]] = None
     keep_raw_fields: bool = False
 
 
@@ -85,6 +88,14 @@ def _normalize_securities(securities: Any) -> List[str]:
             return []
         if isinstance(x, str):
             s = x.strip()
+            if s and ((s[0] == "[" and s[-1] == "]") or (s[0] == "(" and s[-1] == ")")):
+                try:
+                    parsed = ast.literal_eval(s)
+                    # If this was a serialized list/tuple from q conversion, recurse into it.
+                    if _is_seq(parsed):
+                        return _as_tokens(parsed)
+                except Exception:
+                    pass
             return [s] if s else []
         if isinstance(x, (bytes, bytearray)):
             s = x.decode("utf-8", errors="ignore").strip()
@@ -239,6 +250,32 @@ def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
     user_raw = c.get("username", auth.get("username", c.get("user", auth.get("user"))))
     username_val = None if user_raw in (None, "") else str(user_raw).strip()
 
+    ov_raw = c.get("overrides")
+    overrides_val: Optional[Dict[str, Any]] = None
+    if isinstance(ov_raw, Mapping):
+        overrides_val = dict(ov_raw)
+    elif isinstance(ov_raw, Sequence) and not isinstance(ov_raw, (str, bytes, bytearray)):
+        tmp: Dict[str, Any] = {}
+        for it in ov_raw:
+            if isinstance(it, Mapping):
+                k = it.get("fieldId", it.get("field", it.get("name")))
+                v = it.get("value")
+                if k is not None:
+                    tmp[str(k)] = v
+            elif isinstance(it, Sequence) and not isinstance(it, (str, bytes, bytearray)) and len(it) >= 2:
+                tmp[str(it[0])] = it[1]
+        overrides_val = tmp if tmp else None
+
+    if overrides_val is None:
+        of = c.get("override_fields")
+        ov = c.get("override_values")
+        if isinstance(of, Sequence) and not isinstance(of, (str, bytes, bytearray)):
+            fields = list(of)
+            values = list(ov) if isinstance(ov, Sequence) and not isinstance(ov, (str, bytes, bytearray)) else []
+            n = min(len(fields), len(values))
+            if n > 0:
+                overrides_val = {str(fields[i]): values[i] for i in range(n)}
+
     return BbgConfig(
         host=str(_pick("host", "localhost")),
         port=int(_pick("port", 8194)),
@@ -264,9 +301,15 @@ def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
         else None,
         timeout_ms=int(_pick("timeout_ms", 10000)),
         periodicity_selection=str(_pick("periodicity_selection", "DAILY")),
+        periodicity_adjustment=(
+            None
+            if _pick("periodicity_adjustment") in (None, "")
+            else str(_pick("periodicity_adjustment"))
+        ),
         max_data_points=None
         if _pick("max_data_points") in (None, "")
         else int(_pick("max_data_points")),
+        overrides=overrides_val,
         keep_raw_fields=bool(_pick("keep_raw_fields", False)),
     )
 
@@ -404,6 +447,24 @@ def _authorize_identity(session: Any, cfg: BbgConfig) -> Any:
     raise RuntimeError("authorization failed; " + " | ".join([e for e in errs if e]))
 
 
+def _apply_overrides(req: Any, overrides: Optional[Mapping[str, Any]]) -> None:
+    if not overrides:
+        return
+    try:
+        ovs = req.getElement("overrides")
+    except Exception:
+        return
+    for k, v in overrides.items():
+        if v is None:
+            continue
+        fld = str(k).strip()
+        if not fld:
+            continue
+        ov = ovs.appendElement()
+        ov.setElement("fieldId", fld)
+        ov.setElement("value", str(v))
+
+
 def _response_rows(
     securities: Sequence[str],
     start_date: str,
@@ -446,8 +507,11 @@ def _response_rows(
         req.set("startDate", start_date)
         req.set("endDate", end_date)
         req.set("periodicitySelection", cfg.periodicity_selection)
-        if cfg.max_data_points is not None:
+        if cfg.periodicity_adjustment:
+            req.set("periodicityAdjustment", cfg.periodicity_adjustment)
+        if (cfg.max_data_points is not None) and (cfg.max_data_points > 0):
             req.set("maxDataPoints", cfg.max_data_points)
+        _apply_overrides(req, cfg.overrides)
 
         if identity is None:
             session.sendRequest(req)
