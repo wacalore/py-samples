@@ -244,6 +244,17 @@ pacf:{[n;x] r:x; do[n-1;r:olsresid[prev r;r]]; cor[n xprev x;r]}
 // Quantile binning: assign each value to one of J equal-frequency bins (0 to J-1)
 qbin:{[J;x] (J * (rnk[x] - 1)) div count x}
 
+// Rolling quantile bin: assign bin using only trailing w observations (no lookahead)
+// Returns n-length long vector with nulls for first w-1 positions
+rqbin:{[J;w;x]
+  n:count x;
+  r:n#0Nj;
+  i:w; while[i <= n;
+    win:x (i-w)+til w;
+    r[i-1]:(J * (sum win <= x[i-1])-1) div w;
+    i+:1];
+  r}
+
 // Mutual information (bin-based) with Miller-Madow bias correction
 // x: feature vector, y: outcome vector, J: x-bins, K: y-bins
 // Returns scalar in nats
