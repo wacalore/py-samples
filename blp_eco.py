@@ -224,6 +224,33 @@ def _collect_field_list(field_map: Mapping[str, Sequence[str]], cfg: Mapping[str
     return fields
 
 
+def _normalize_name_list(x: Any) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, str):
+        s = x.strip()
+        return [s] if s else []
+    if isinstance(x, (bytes, bytearray)):
+        s = x.decode("utf-8", errors="ignore").strip()
+        return [s] if s else []
+    if isinstance(x, Sequence):
+        out: List[str] = []
+        for v in x:
+            if v is None:
+                continue
+            if isinstance(v, str):
+                s = v.strip()
+                if s:
+                    out.append(s)
+            else:
+                s = str(v).strip()
+                if s:
+                    out.append(s)
+        return out
+    s = str(x).strip()
+    return [s] if s else []
+
+
 def _empty_result() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "security", "realized", "survey", "surprise", "revision"])
 
@@ -593,9 +620,37 @@ def get_eco_history(
         s0 = _date_to_yyyymmdd(start_date)
         e0 = _date_to_yyyymmdd(end_date)
         field_map = _normalize_field_map(c)
-        fields = _collect_field_list(field_map, c)
-        rows = _response_rows(sec_list, s0, e0, fields, _parse_cfg(c))
-        raw_df = pd.DataFrame(rows)
+        req_fields = _normalize_name_list(c.get("request_fields"))
+        fields = req_fields if req_fields else _collect_field_list(field_map, c)
+        req_cfg = _parse_cfg(c)
+
+        anchor_field = str(c.get("anchor_field", "PX_LAST")).strip()
+        force_anchor_history = bool(c.get("force_anchor_history", True))
+        if force_anchor_history and anchor_field:
+            anchor_rows = _response_rows(sec_list, s0, e0, [anchor_field], req_cfg)
+            anchor_df = pd.DataFrame(anchor_rows)
+
+            extra_fields = [f for f in fields if f != anchor_field]
+            if extra_fields:
+                extra_rows = _response_rows(sec_list, s0, e0, extra_fields, req_cfg)
+                extra_df = pd.DataFrame(extra_rows)
+            else:
+                extra_df = pd.DataFrame()
+
+            if anchor_df.empty:
+                raw_df = extra_df
+            elif extra_df.empty:
+                raw_df = anchor_df
+            else:
+                # Keep full history from anchor field and enrich with extras where available.
+                join_keys = [k for k in ("date", "security") if (k in anchor_df.columns and k in extra_df.columns)]
+                if join_keys:
+                    raw_df = anchor_df.merge(extra_df, on=join_keys, how="left")
+                else:
+                    raw_df = anchor_df
+        else:
+            rows = _response_rows(sec_list, s0, e0, fields, req_cfg)
+            raw_df = pd.DataFrame(rows)
 
     if raw_df.empty:
         return _empty_result()
