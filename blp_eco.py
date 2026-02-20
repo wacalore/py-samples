@@ -60,6 +60,13 @@ DEFAULT_FIELD_MAP: Dict[str, List[str]] = {
         "ECO_RELEASE_REVISION",
         "BN_REVISION",
     ],
+    "release_dt": [
+        "ECO_RELEASE_DT",
+        "RELEASE_DT",
+        "RELEASE_DATE",
+        "ANNOUNCEMENT_DT",
+        "EVENT_DATETIME",
+    ],
 }
 
 
@@ -199,6 +206,28 @@ def _coalesce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     return out
 
 
+def _coalesce_datetime(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    out = pd.Series([pd.NaT] * len(df), index=df.index, dtype="datetime64[ns]")
+    if not cols:
+        return out
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            dt = pd.to_datetime(s, unit="D", origin="2000-01-01", errors="coerce")
+        else:
+            if s.dtype == object:
+                ss = s.map(lambda z: None if z is None else str(z))
+                ss = ss.replace("0Nd", None).replace("0Np", None)
+                ss = ss.str.replace("D", "T", regex=False)
+                dt = pd.to_datetime(ss, errors="coerce")
+            else:
+                dt = pd.to_datetime(s, errors="coerce")
+        out = out.where(~out.isna(), dt)
+    return out
+
+
 def _normalize_field_map(cfg: Mapping[str, Any]) -> Dict[str, List[str]]:
     fmap = DEFAULT_FIELD_MAP.copy()
     raw = cfg.get("field_map")
@@ -252,7 +281,9 @@ def _normalize_name_list(x: Any) -> List[str]:
 
 
 def _empty_result() -> pd.DataFrame:
-    return pd.DataFrame(columns=["date", "security", "realized", "survey", "surprise", "revision"])
+    return pd.DataFrame(
+        columns=["date", "release_dt", "security", "realized", "survey", "surprise", "revision"]
+    )
 
 
 def _parse_cfg(cfg: Optional[Mapping[str, Any]]) -> BbgConfig:
@@ -564,16 +595,16 @@ def _response_rows(
                 fdata = sdata.getElement("fieldData")
                 for i in range(fdata.numValues()):
                     fd = fdata.getValueAsElement(i)
-                row: Dict[str, Any] = {"security": sec}
-                if fd.hasElement("date"):
-                    try:
-                        d0 = fd.getElementAsDatetime("date")
-                        row["date"] = _normalize_bbg_date(d0)
-                    except Exception:
+                    row: Dict[str, Any] = {"security": sec}
+                    if fd.hasElement("date"):
                         try:
-                            row["date"] = _normalize_bbg_date(fd.getElementAsString("date"))
+                            d0 = fd.getElementAsDatetime("date")
+                            row["date"] = _normalize_bbg_date(d0)
                         except Exception:
-                            pass
+                            try:
+                                row["date"] = _normalize_bbg_date(fd.getElementAsString("date"))
+                            except Exception:
+                                pass
                     for f in fields:
                         if not fd.hasElement(f):
                             continue
@@ -597,6 +628,7 @@ def get_eco_history(
 
     Output columns:
     - date
+    - release_dt
     - security
     - realized
     - survey
@@ -682,6 +714,7 @@ def get_eco_history(
     out = pd.DataFrame(
         {
             "date": raw_df["date"],
+            "release_dt": _coalesce_datetime(raw_df, field_map.get("release_dt", [])),
             "security": raw_df["security"].astype(str),
             "realized": _coalesce_numeric(raw_df, field_map.get("realized", [])),
             "survey": _coalesce_numeric(raw_df, field_map.get("survey", [])),
@@ -691,7 +724,7 @@ def get_eco_history(
     )
 
     if bool(c.get("keep_raw_fields", False)):
-        canon = {"date", "security", "realized", "survey", "surprise", "revision"}
+        canon = {"date", "release_dt", "security", "realized", "survey", "surprise", "revision"}
         keep_cols = [x for x in raw_df.columns if x not in canon]
         if keep_cols:
             out = out.join(raw_df[keep_cols], how="left")
