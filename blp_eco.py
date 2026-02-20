@@ -60,7 +60,20 @@ DEFAULT_FIELD_MAP: Dict[str, List[str]] = {
         "ECO_RELEASE_REVISION",
         "BN_REVISION",
     ],
-    "release_dt": [
+    "eco_release_dt": [
+        "ECO_RELEASE_DT",
+        "RELEASE_DT",
+        "RELEASE_DATE",
+    ],
+    "eco_release_time": [
+        "ECO_RELEASE_TIME",
+        "RELEASE_TIME",
+        "ANNOUNCEMENT_TIME",
+    ],
+    "eco_future_release_date": [
+        "ECO_FUTURE_RELEASE_DATE",
+        "ECO_FUTURE_RELEASE_DT",
+        "FUTURE_RELEASE_DATE",
         "ECO_RELEASE_DT",
         "RELEASE_DT",
         "RELEASE_DATE",
@@ -206,6 +219,29 @@ def _coalesce_numeric(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     return out
 
 
+def _coalesce_date(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    out = pd.Series([pd.NaT] * len(df), index=df.index, dtype="object")
+    if not cols:
+        return out
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            dt = pd.to_datetime(s, unit="D", origin="2000-01-01", errors="coerce").dt.date
+        else:
+            if s.dtype == object:
+                ss = s.map(lambda z: None if z is None else str(z))
+                ss = ss.replace("0Nd", None).replace("0Np", None)
+                ss = ss.str.replace("D", "T", regex=False)
+                dt = pd.to_datetime(ss, errors="coerce").dt.date
+            else:
+                dt = pd.to_datetime(s, errors="coerce").dt.date
+        mask = out.isna() & pd.notna(dt)
+        out = out.where(~mask, dt)
+    return out
+
+
 def _coalesce_datetime(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
     out = pd.Series([pd.NaT] * len(df), index=df.index, dtype="datetime64[ns]")
     if not cols:
@@ -225,6 +261,69 @@ def _coalesce_datetime(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
             else:
                 dt = pd.to_datetime(s, errors="coerce")
         out = out.where(~out.isna(), dt)
+    return out
+
+
+def _parse_hour(v: Any) -> float:
+    if v is None:
+        return float("nan")
+    try:
+        if pd.isna(v):
+            return float("nan")
+    except Exception:
+        pass
+
+    if isinstance(v, (int, float)):
+        x = float(v)
+        if 0.0 <= x < 24.0:
+            return float(int(x))
+        if 0.0 <= x <= 2400.0:
+            hh = int(x // 100.0)
+            mm = int(round(x - 100.0 * hh))
+            if 0 <= hh < 24 and 0 <= mm < 60:
+                return float(hh)
+        return float("nan")
+
+    s = str(v).strip()
+    if not s:
+        return float("nan")
+    s = s.replace("D", "T")
+
+    try:
+        ts = pd.to_datetime(s, errors="raise")
+        return float(int(ts.hour))
+    except Exception:
+        pass
+
+    if ":" in s:
+        p = s.split(":", 1)[0].strip()
+        if p.isdigit():
+            hh = int(p)
+            if 0 <= hh < 24:
+                return float(hh)
+    if s.isdigit():
+        if len(s) <= 2:
+            hh = int(s)
+            if 0 <= hh < 24:
+                return float(hh)
+        if len(s) in (3, 4):
+            hh = int(s[:-2])
+            mm = int(s[-2:])
+            if 0 <= hh < 24 and 0 <= mm < 60:
+                return float(hh)
+
+    return float("nan")
+
+
+def _coalesce_release_hour(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    out = pd.Series([float("nan")] * len(df), index=df.index, dtype="float64")
+    if not cols:
+        return out
+    for c in cols:
+        if c not in df.columns:
+            continue
+        h = df[c].map(_parse_hour).astype("float64")
+        out = out.where(~out.isna(), h)
     return out
 
 
@@ -282,7 +381,17 @@ def _normalize_name_list(x: Any) -> List[str]:
 
 def _empty_result() -> pd.DataFrame:
     return pd.DataFrame(
-        columns=["date", "release_dt", "security", "realized", "survey", "surprise", "revision"]
+        columns=[
+            "date",
+            "eco_release_dt",
+            "eco_release_time",
+            "eco_future_release_date",
+            "security",
+            "realized",
+            "survey",
+            "surprise",
+            "revision",
+        ]
     )
 
 
@@ -628,7 +737,9 @@ def get_eco_history(
 
     Output columns:
     - date
-    - release_dt
+    - eco_release_dt
+    - eco_release_time
+    - eco_future_release_date
     - security
     - realized
     - survey
@@ -711,10 +822,23 @@ def get_eco_history(
             raw_df["security"] = sec_list[0]
 
     field_map = _normalize_field_map(c)
+    eco_future_release_date = _coalesce_datetime(raw_df, field_map.get("eco_future_release_date", []))
+    eco_release_dt = _coalesce_date(raw_df, field_map.get("eco_release_dt", []))
+    eco_release_time = _coalesce_release_hour(raw_df, field_map.get("eco_release_time", []))
+    if not eco_future_release_date.isna().all():
+        eco_release_dt = eco_release_dt.where(
+            ~eco_release_dt.isna(), eco_future_release_date.dt.date
+        )
+        eco_release_time = eco_release_time.where(
+            ~eco_release_time.isna(), eco_future_release_date.dt.hour.astype("float64")
+        )
+
     out = pd.DataFrame(
         {
             "date": raw_df["date"],
-            "release_dt": _coalesce_datetime(raw_df, field_map.get("release_dt", [])),
+            "eco_release_dt": eco_release_dt,
+            "eco_release_time": eco_release_time,
+            "eco_future_release_date": eco_future_release_date,
             "security": raw_df["security"].astype(str),
             "realized": _coalesce_numeric(raw_df, field_map.get("realized", [])),
             "survey": _coalesce_numeric(raw_df, field_map.get("survey", [])),
@@ -724,7 +848,17 @@ def get_eco_history(
     )
 
     if bool(c.get("keep_raw_fields", False)):
-        canon = {"date", "release_dt", "security", "realized", "survey", "surprise", "revision"}
+        canon = {
+            "date",
+            "eco_release_dt",
+            "eco_release_time",
+            "eco_future_release_date",
+            "security",
+            "realized",
+            "survey",
+            "surprise",
+            "revision",
+        }
         keep_cols = [x for x in raw_df.columns if x not in canon]
         if keep_cols:
             out = out.join(raw_df[keep_cols], how="left")
